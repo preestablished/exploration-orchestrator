@@ -1,0 +1,9 @@
+[package]
+name = "orch-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orch-core = { path = "../orch-core" }
+orch-proto = { path = "../orch-proto" }
