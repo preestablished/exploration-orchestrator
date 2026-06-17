@@ -176,6 +176,9 @@ dependencies = [
 [[package]]
 name = "orch-clients"
 version = "0.1.0"
+dependencies = [
+ "orch-core",
+]
 
 [[package]]
 name = "orch-core"

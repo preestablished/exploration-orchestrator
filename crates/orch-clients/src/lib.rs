@@ -102,17 +102,7 @@ pub mod hypervisor {
     //! exposing a bespoke orchestrator job API.
 }
 
-pub mod input_synth {
-    //! Input synthesizer client boundary.
-    //!
-    //! Owner docs: service-local API doc is pending; current traceable anchors are
-    //! `../determinism-hypervisor/.agents/docs/phases/phase-4-scoring-and-inputs.md`
-    //! for input-synthesizer scope and
-    //! `../control-plane/proto/determinism/inputsynth/v1/synthesizer.proto` for the
-    //! skeletal v1 proto surface.
-    //! This module will mirror macro-pack loading, health, burst proposal, macro
-    //! mining, provenance, and degraded-mode shapes from the owner API.
-}
+pub mod input_synth;
 
 pub mod scorer {
     //! State scorer client boundary.
