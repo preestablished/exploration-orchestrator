@@ -178,6 +178,8 @@ name = "orch-clients"
 version = "0.1.0"
 dependencies = [
  "orch-core",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
