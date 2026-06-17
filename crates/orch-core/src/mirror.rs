@@ -108,7 +108,12 @@ impl SeenMap {
     }
 
     pub fn insert(&mut self, state_hash: StateHash, node: NodeId) -> Option<NodeId> {
-        self.map.insert(state_hash, node)
+        if let Some(existing) = self.map.get(&state_hash).copied() {
+            Some(existing)
+        } else {
+            self.map.insert(state_hash, node);
+            None
+        }
     }
 
     pub fn get(&self, state_hash: StateHash) -> Option<NodeId> {
@@ -222,10 +227,10 @@ mod tests {
         assert_eq!(seen.get(first), Some(NodeId::new(11)));
         assert!(seen.contains(second));
         assert_eq!(seen.insert(first, NodeId::new(33)), Some(NodeId::new(11)));
-        assert_eq!(seen.get(first), Some(NodeId::new(33)));
+        assert_eq!(seen.get(first), Some(NodeId::new(11)));
         assert_eq!(
             seen.sorted_entries(),
-            vec![(first, NodeId::new(33)), (second, NodeId::new(22))]
+            vec![(first, NodeId::new(11)), (second, NodeId::new(22))]
         );
     }
 
