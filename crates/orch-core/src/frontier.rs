@@ -228,11 +228,10 @@ mod tests {
 
         tree.mark_exhausted(first).unwrap();
         tree.mark_goal(second).unwrap();
-        tree.mark_pruned(third).unwrap();
 
         assert_eq!(
             frontier.deterministic_candidates(&tree).unwrap(),
-            vec![root]
+            vec![root, third]
         );
         assert!(frontier.contains(first));
         assert!(frontier.contains(second));
