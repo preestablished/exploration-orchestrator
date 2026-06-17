@@ -118,11 +118,13 @@ pub struct CommitState {
 impl CommitState {
     pub fn from_root(payload: NodePayload) -> Self {
         let mut seen = SeenMap::new();
+        let mut cell_mirror = CellMirror::new();
         seen.insert(payload.state_hash, NodeId::ROOT);
+        cell_mirror.bump(payload.cell);
         Self {
             tree: Tree::from_root(payload),
             frontier: Frontier::with_root(),
-            cell_mirror: CellMirror::new(),
+            cell_mirror,
             seen,
             all_duplicate_streaks: vec![0],
         }
@@ -192,7 +194,11 @@ pub fn commit_batch(
 
     for child in children {
         let commit = commit_child(state, parent, parent_score.get(), *child, rules)?;
-        if child.goal {
+        if child.goal
+            && commit.disposition == CommitDisposition::Keep
+            && commit.node_id.is_some()
+            && goal_node.is_none()
+        {
             goal_node = commit.node_id;
         }
         child_commits.push(commit);
@@ -233,6 +239,8 @@ fn commit_child(
                 let child_id = state.tree.insert_child(parent, child.payload)?;
                 state.ensure_tracking(child_id);
                 state.tree.mark_pruned(child_id)?;
+                state.seen.insert(child.payload.state_hash, child_id);
+                state.cell_mirror.bump(child.payload.cell);
                 Ok(ChildCommit::new(
                     CommitDisposition::PrunedExhausted,
                     Some(child_id),
@@ -246,7 +254,9 @@ fn commit_child(
         state.cell_mirror.bump(child.payload.cell);
         let route = state.seen.get(child.payload.state_hash);
         if let Some(existing) = route {
-            state.tree.increment_visits(existing)?;
+            if existing != parent {
+                state.tree.increment_visits(existing)?;
+            }
         }
         return Ok(ChildCommit::new(
             CommitDisposition::Discard(DiscardReason::Duplicate),
@@ -443,12 +453,11 @@ mod tests {
     #[test]
     fn commit_regression_discards_only_when_cell_is_known() {
         let mut state = state();
-        state.cell_mirror.bump(CellKey::new(5));
 
         let regression = commit_batch(
             &mut state,
             NodeId::ROOT,
-            &[ScoredChild::new(payload(1, 9.0, 5))],
+            &[ScoredChild::new(payload(1, 9.0, 0))],
             &rules(),
         )
         .unwrap();
@@ -506,6 +515,73 @@ mod tests {
                 .unwrap(),
             vec![NodeId::ROOT]
         );
+    }
+
+    #[test]
+    fn commit_pruned_exhausted_updates_mirrors_and_goal_does_not_win() {
+        let mut state = state();
+        let prune_payload = payload(1, 12.0, 12);
+
+        let outcome = commit_batch(
+            &mut state,
+            NodeId::ROOT,
+            &[ScoredChild::new(prune_payload).prune().goal()],
+            &rules(),
+        )
+        .unwrap();
+        let pruned = outcome.child_commits[0].node_id.unwrap();
+
+        assert_eq!(outcome.goal_node, None);
+        assert_eq!(state.seen.get(prune_payload.state_hash), Some(pruned));
+        assert_eq!(state.cell_mirror.count(prune_payload.cell), 1);
+
+        let duplicate = ScoredChild::new(prune_payload).duplicate();
+        let duplicate_outcome =
+            commit_batch(&mut state, NodeId::ROOT, &[duplicate], &rules()).unwrap();
+
+        assert_eq!(
+            duplicate_outcome.child_commits[0].duplicate_route,
+            Some(pruned)
+        );
+        assert_eq!(state.tree.get(pruned).unwrap().visits, 1);
+        assert_eq!(state.cell_mirror.count(prune_payload.cell), 2);
+    }
+
+    #[test]
+    fn commit_later_non_kept_goal_does_not_clear_earlier_kept_goal() {
+        let mut state = state();
+        let outcome = commit_batch(
+            &mut state,
+            NodeId::ROOT,
+            &[
+                ScoredChild::new(payload(1, 12.0, 1)).goal(),
+                ScoredChild::new(payload(2, 0.0, 2)).prune().goal(),
+            ],
+            &rules(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.goal_node, Some(NodeId::new(1)));
+        assert_eq!(
+            outcome.child_commits[0].disposition,
+            CommitDisposition::Keep
+        );
+        assert_eq!(
+            outcome.child_commits[1].disposition,
+            CommitDisposition::PrunedExhausted
+        );
+    }
+
+    #[test]
+    fn commit_duplicate_route_to_parent_does_not_double_count_parent_visit() {
+        let mut state = state();
+        let duplicate_root = ScoredChild::new(payload(0, 10.0, 0)).duplicate();
+
+        let outcome = commit_batch(&mut state, NodeId::ROOT, &[duplicate_root], &rules()).unwrap();
+
+        assert_eq!(outcome.child_commits[0].duplicate_route, Some(NodeId::ROOT));
+        assert_eq!(outcome.parent_visits, 1);
+        assert_eq!(state.tree.root().visits, 1);
     }
 
     #[test]
