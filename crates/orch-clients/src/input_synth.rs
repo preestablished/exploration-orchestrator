@@ -137,14 +137,76 @@ pub struct ProvenancedBurst {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Burst {
     pub format_version: u32,
-    pub pad_segments: Vec<PadSegment>,
+    pub burst_id: BurstId,
+    pub body: BurstBody,
+}
+
+pub const BURST_ID_LEN: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct BurstId(pub [u8; BURST_ID_LEN]);
+
+impl BurstId {
+    #[must_use]
+    pub const fn new(bytes: [u8; BURST_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; BURST_ID_LEN] {
+        &self.0
+    }
+
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; BURST_ID_LEN] {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BurstBody {
+    Pad(PadBurst),
+    Event(EventBurst),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadBurst {
+    pub segments: Vec<PadSegment>,
+    pub button_alphabet: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadSegment {
-    pub start_frame: FrameCount,
-    pub frames: FrameCount,
     pub buttons: u32,
+    pub hold_frames: FrameCount,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBurst {
+    pub events: Vec<GrammarEvent>,
+    pub grammar_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrammarEvent {
+    pub event_type: String,
+    pub at_offset_ns: u64,
+    pub fields: Vec<GrammarField>,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrammarField {
+    pub name: String,
+    pub value: FieldValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FieldValue {
+    Int(i64),
+    Enum(String),
+    DurationNs(u64),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -395,11 +457,63 @@ mod tests {
         assert_eq!(response.bursts[0].provenance.slot, 3);
         assert_eq!(response.bursts[0].provenance.rng_stream, "slot/3/macro");
         assert_eq!(response.bursts[0].provenance.config_fingerprint, FP_A);
+        assert_eq!(response.bursts[0].burst.burst_id, BurstId::new([9; 32]));
         assert_eq!(
             response.bursts[0].provenance.fallback_from,
             Some(GeneratorKind::Policy)
         );
         assert_eq!(response.degraded[0].generator, GeneratorKind::Policy);
+    }
+
+    #[test]
+    fn input_synth_pad_burst_preserves_id_and_button_alphabet() {
+        let burst = sample_burst();
+
+        assert_eq!(burst.burst_id, BurstId::new([9; 32]));
+        let BurstBody::Pad(pad) = &burst.body else {
+            panic!("sample burst should use pad body");
+        };
+        assert_eq!(pad.button_alphabet, "console16-12btn-v1");
+        assert_eq!(pad.segments[0].buttons, 0b0011);
+        assert_eq!(pad.segments[0].hold_frames, FrameCount::new(12));
+    }
+
+    #[test]
+    fn input_synth_event_grammar_burst_round_trips() {
+        let event_burst = Burst {
+            format_version: 1,
+            burst_id: BurstId::new([7; 32]),
+            body: BurstBody::Event(EventBurst {
+                grammar_id: "grammar-a5".to_owned(),
+                events: vec![GrammarEvent {
+                    event_type: "tcp_connect".to_owned(),
+                    at_offset_ns: 20_000_000,
+                    fields: vec![
+                        GrammarField {
+                            name: "port".to_owned(),
+                            value: FieldValue::Int(443),
+                        },
+                        GrammarField {
+                            name: "mode".to_owned(),
+                            value: FieldValue::Enum("fast".to_owned()),
+                        },
+                    ],
+                    payload: vec![0xde, 0xad, 0xbe, 0xef],
+                }],
+            }),
+        };
+        let encoded = postcard::to_allocvec(&event_burst).expect("serialize event burst");
+        let decoded: Burst = postcard::from_bytes(&encoded).expect("deserialize event burst");
+
+        assert_eq!(decoded, event_burst);
+        let BurstBody::Event(event) = &decoded.body else {
+            panic!("decoded burst should use event body");
+        };
+        assert_eq!(event.grammar_id, "grammar-a5");
+        assert_eq!(
+            event.events[0].fields[1].value,
+            FieldValue::Enum("fast".to_owned())
+        );
     }
 
     #[test]
@@ -550,11 +664,14 @@ mod tests {
     fn sample_burst() -> Burst {
         Burst {
             format_version: 1,
-            pad_segments: vec![PadSegment {
-                start_frame: FrameCount::new(0),
-                frames: FrameCount::new(12),
-                buttons: 0b0011,
-            }],
+            burst_id: BurstId::new([9; 32]),
+            body: BurstBody::Pad(PadBurst {
+                segments: vec![PadSegment {
+                    buttons: 0b0011,
+                    hold_frames: FrameCount::new(12),
+                }],
+                button_alphabet: "console16-12btn-v1".to_owned(),
+            }),
         }
     }
 
