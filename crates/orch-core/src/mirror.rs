@@ -141,7 +141,7 @@ impl SeenMap {
     pub fn from_sorted_entries(entries: impl IntoIterator<Item = (StateHash, NodeId)>) -> Self {
         let mut seen = Self::new();
         for (hash, node) in entries {
-            seen.map.insert(hash, node);
+            seen.insert(hash, node);
         }
         seen
     }
@@ -275,5 +275,26 @@ mod tests {
         assert!(rebinned_cells.is_empty());
         assert_eq!(persistent_seen.get(hash(1)), Some(NodeId::new(1)));
         assert_eq!(persistent_seen.get(hash(7)), Some(NodeId::new(7)));
+    }
+
+    #[test]
+    fn mirror_snapshot_reconstruction_preserves_first_seen_route() {
+        let snapshot = MirrorSnapshot {
+            cell_counts: Vec::new(),
+            seen: vec![
+                (hash(5), NodeId::new(5)),
+                (hash(5), NodeId::new(55)),
+                (hash(9), NodeId::new(9)),
+            ],
+        };
+
+        let (_cells, seen) = snapshot.into_parts();
+
+        assert_eq!(seen.get(hash(5)), Some(NodeId::new(5)));
+        assert_eq!(seen.get(hash(9)), Some(NodeId::new(9)));
+        assert_eq!(
+            seen.sorted_entries(),
+            vec![(hash(5), NodeId::new(5)), (hash(9), NodeId::new(9))]
+        );
     }
 }
