@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+orch-core = { path = "../orch-core" }
+serde.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true
