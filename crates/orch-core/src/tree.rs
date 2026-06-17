@@ -125,6 +125,7 @@ pub enum TreeError {
     DepthOverflow { parent: NodeId },
     ChildCountOverflow { parent: NodeId },
     VisitOverflow { id: NodeId },
+    TerminalGoalNode { id: NodeId },
     TerminalPrunedNode { id: NodeId },
 }
 
@@ -158,6 +159,9 @@ impl fmt::Display for TreeError {
                 write!(formatter, "child count overflow under {:?}", parent)
             }
             Self::VisitOverflow { id } => write!(formatter, "visit count overflow for {:?}", id),
+            Self::TerminalGoalNode { id } => {
+                write!(formatter, "goal node {:?} cannot transition", id)
+            }
             Self::TerminalPrunedNode { id } => {
                 write!(formatter, "pruned node {:?} cannot transition", id)
             }
@@ -291,6 +295,9 @@ impl Tree {
 
     pub fn mark_exhausted(&mut self, id: NodeId) -> Result<(), TreeError> {
         let record = self.record_mut(id)?;
+        if record.status == NodeStatus::Goal || record.goal {
+            return Err(TreeError::TerminalGoalNode { id });
+        }
         record.exhausted = true;
         if !record.goal && record.status != NodeStatus::Pruned {
             record.status = NodeStatus::Expanded;
@@ -585,6 +592,14 @@ mod tests {
         tree.mark_goal(goal).unwrap();
         assert!(tree.get(goal).unwrap().goal);
         assert_eq!(tree.get(goal).unwrap().status, NodeStatus::Goal);
+        assert!(!tree.get(goal).unwrap().exhausted);
+        assert_eq!(
+            tree.mark_exhausted(goal),
+            Err(TreeError::TerminalGoalNode { id: goal })
+        );
+        assert!(tree.get(goal).unwrap().goal);
+        assert_eq!(tree.get(goal).unwrap().status, NodeStatus::Goal);
+        assert!(!tree.get(goal).unwrap().exhausted);
 
         tree.mark_pruned(pruned).unwrap();
         assert!(tree.get(pruned).unwrap().exhausted);
