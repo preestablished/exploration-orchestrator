@@ -318,6 +318,9 @@ impl Tree {
 
     pub fn mark_pruned(&mut self, id: NodeId) -> Result<(), TreeError> {
         let record = self.record_mut(id)?;
+        if record.status == NodeStatus::Goal || record.goal {
+            return Err(TreeError::TerminalGoalNode { id });
+        }
         record.exhausted = true;
         record.goal = false;
         record.status = NodeStatus::Pruned;
@@ -595,6 +598,13 @@ mod tests {
         assert!(!tree.get(goal).unwrap().exhausted);
         assert_eq!(
             tree.mark_exhausted(goal),
+            Err(TreeError::TerminalGoalNode { id: goal })
+        );
+        assert!(tree.get(goal).unwrap().goal);
+        assert_eq!(tree.get(goal).unwrap().status, NodeStatus::Goal);
+        assert!(!tree.get(goal).unwrap().exhausted);
+        assert_eq!(
+            tree.mark_pruned(goal),
             Err(TreeError::TerminalGoalNode { id: goal })
         );
         assert!(tree.get(goal).unwrap().goal);
