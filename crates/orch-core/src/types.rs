@@ -275,7 +275,9 @@ impl GuestInstructions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum NodeStatus {
     #[default]
     Frontier,
@@ -284,21 +286,27 @@ pub enum NodeStatus {
     Goal,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum PruneAction {
     #[default]
     Exhausted,
     Drop,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum OnGoal {
     #[default]
     Stop,
     Continue,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum PolicyKind {
     #[default]
     Softmax,
@@ -306,28 +314,30 @@ pub enum PolicyKind {
     Staged,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum SchedMode {
     #[default]
     Fast,
     Deterministic,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CommitDisposition {
     Keep,
     Discard(DiscardReason),
     PrunedExhausted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DiscardReason {
     Duplicate,
     Regression,
     PruneDrop,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum FrontierEvictReason {
     MaxVisits,
     AllDuplicateExpansions,
@@ -566,10 +576,39 @@ impl ExperimentConfig {
         if !finite_positive(self.selection.temperature) {
             return Err(ConfigError::OutOfRange("selection.temperature"));
         }
+        let non_negative_selection_weights = [
+            ("selection.alpha", self.selection.alpha),
+            ("selection.beta", self.selection.beta),
+            ("selection.gamma", self.selection.gamma),
+            ("selection.delta", self.selection.delta),
+            ("selection.ucb_c", self.selection.ucb_c),
+        ];
+        for (field, value) in non_negative_selection_weights {
+            if !finite_non_negative(value) {
+                return Err(ConfigError::OutOfRange(field));
+            }
+        }
+        if !finite_unit_interval(self.selection.staged.epsilon_regress) {
+            return Err(ConfigError::OutOfRange("selection.staged.epsilon_regress"));
+        }
+        if self.selection.max_visits_per_node == 0 {
+            return Err(ConfigError::OutOfRange("selection.max_visits_per_node"));
+        }
+        if self.selection.exhaust_after_dup_expansions == 0 {
+            return Err(ConfigError::OutOfRange(
+                "selection.exhaust_after_dup_expansions",
+            ));
+        }
         if self.selection.policy == PolicyKind::Staged
             && self.selection.staged.inner == PolicyKind::Staged
         {
             return Err(ConfigError::InvalidStagedInnerPolicy);
+        }
+        if self.burst.base_burst_len_frames == 0 {
+            return Err(ConfigError::OutOfRange("burst.base_burst_len_frames"));
+        }
+        if self.burst.max_burst_len_frames == 0 {
+            return Err(ConfigError::OutOfRange("burst.max_burst_len_frames"));
         }
         if self.plateau.window_n < 10 {
             return Err(ConfigError::OutOfRange("plateau.window_n"));
@@ -579,6 +618,23 @@ impl ExperimentConfig {
         }
         if self.plateau.ladder.max_level > 4 {
             return Err(ConfigError::OutOfRange("plateau.ladder.max_level"));
+        }
+        if self.scheduling.mode == SchedMode::Deterministic
+            && self.scheduling.max_inflight_batches != 1
+        {
+            return Err(ConfigError::OutOfRange("scheduling.max_inflight_batches"));
+        }
+        if self.scheduling.mode == SchedMode::Fast && self.scheduling.max_inflight_batches == 0 {
+            return Err(ConfigError::OutOfRange("scheduling.max_inflight_batches"));
+        }
+        if self.scheduling.job_timeout_s == 0 {
+            return Err(ConfigError::OutOfRange("scheduling.job_timeout_s"));
+        }
+        if self.checkpoint.every_commits == 0 {
+            return Err(ConfigError::OutOfRange("checkpoint.every_commits"));
+        }
+        if self.checkpoint.every_seconds == 0 {
+            return Err(ConfigError::OutOfRange("checkpoint.every_seconds"));
         }
 
         let ladder_factors_at_least_one = [
@@ -743,6 +799,32 @@ mod tests {
     }
 
     #[test]
+    fn types_score_and_novelty_reject_non_finite_deserialization() {
+        let nan = postcard::to_allocvec(&f64::NAN).unwrap();
+        let infinity = postcard::to_allocvec(&f64::INFINITY).unwrap();
+
+        assert!(postcard::from_bytes::<Score>(&nan).is_err());
+        assert!(postcard::from_bytes::<Score>(&infinity).is_err());
+        assert!(postcard::from_bytes::<Novelty>(&nan).is_err());
+        assert!(postcard::from_bytes::<Novelty>(&infinity).is_err());
+    }
+
+    #[test]
+    fn types_enums_have_stable_ordering() {
+        assert!(NodeStatus::Frontier < NodeStatus::Expanded);
+        assert!(PruneAction::Exhausted < PruneAction::Drop);
+        assert!(OnGoal::Stop < OnGoal::Continue);
+        assert!(PolicyKind::Softmax < PolicyKind::Ucb);
+        assert!(SchedMode::Fast < SchedMode::Deterministic);
+        assert!(
+            CommitDisposition::Discard(DiscardReason::Duplicate)
+                < CommitDisposition::PrunedExhausted
+        );
+        assert!(DiscardReason::Duplicate < DiscardReason::Regression);
+        assert!(FrontierEvictReason::MaxVisits < FrontierEvictReason::AllDuplicateExpansions);
+    }
+
+    #[test]
     fn types_config_defaults_match_api_schema() {
         let config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
 
@@ -789,6 +871,64 @@ mod tests {
         );
 
         let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.alpha = f64::NAN;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.alpha"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.beta = f64::INFINITY;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.beta"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.gamma = f64::NEG_INFINITY;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.gamma"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.delta = f64::NAN;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.delta"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.ucb_c = f64::NAN;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.ucb_c"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.staged.epsilon_regress = 2.0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.staged.epsilon_regress"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.max_visits_per_node = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("selection.max_visits_per_node"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.selection.exhaust_after_dup_expansions = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange(
+                "selection.exhaust_after_dup_expansions"
+            ))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
         config.selection.policy = PolicyKind::Staged;
         config.selection.staged.inner = PolicyKind::Staged;
         assert_eq!(
@@ -801,6 +941,41 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(ConfigError::OutOfRange("plateau.ladder.radius_factor"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.scheduling.mode = SchedMode::Deterministic;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("scheduling.max_inflight_batches"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.scheduling.max_inflight_batches = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("scheduling.max_inflight_batches"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.scheduling.job_timeout_s = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("scheduling.job_timeout_s"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.checkpoint.every_commits = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("checkpoint.every_commits"))
+        );
+
+        let mut config = ExperimentConfig::new(123, "image", "features", "scoring", "synth");
+        config.checkpoint.every_seconds = 0;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::OutOfRange("checkpoint.every_seconds"))
         );
     }
 
