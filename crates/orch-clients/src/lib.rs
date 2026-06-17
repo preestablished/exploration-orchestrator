@@ -1,0 +1,179 @@
+#![forbid(unsafe_code)]
+
+//! Transport-free client trait and DTO boundary for orchestrator-side service use.
+//!
+//! This crate intentionally owns only platform-independent request, response, and
+//! error shapes. It must not contain tonic clients, async transports, or direct
+//! dependencies on the real service crates.
+//!
+//! Owner-doc citation convention: each service module starts with an `Owner docs`
+//! line naming the traceable API, integration, proto, or planning artifact that its
+//! future trait and DTO shapes mirror. Service-specific DTOs should keep those
+//! citations near the type or method they model.
+
+use std::{error::Error, fmt};
+
+/// Result alias shared by all transport-free orchestrator client traits.
+pub type ClientResult<T> = Result<T, ClientError>;
+
+/// Broad error classes that fake clients and later transport adapters can map into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ClientErrorKind {
+    /// Request fields are malformed, missing, or outside the accepted schema.
+    InvalidRequest,
+    /// Request is well-formed, but the target service state cannot accept it.
+    FailedPrecondition,
+    /// Referenced experiment, slot, snapshot, node, macro pack, or archive is absent.
+    NotFound,
+    /// Create-if-absent request collided with an existing resource.
+    AlreadyExists,
+    /// Service-side capacity, quota, queue, or slot pool is exhausted.
+    ResourceExhausted,
+    /// Service is temporarily unreachable or not ready to serve the request.
+    Unavailable,
+    /// Unexpected service or adapter failure that does not fit a stable category.
+    Internal,
+}
+
+impl ClientErrorKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid request",
+            Self::FailedPrecondition => "failed precondition",
+            Self::NotFound => "not found",
+            Self::AlreadyExists => "already exists",
+            Self::ResourceExhausted => "resource exhausted",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Transport-independent client error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientError {
+    kind: ClientErrorKind,
+    message: String,
+}
+
+impl ClientError {
+    #[must_use]
+    pub fn new(kind: ClientErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ClientErrorKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.message.is_empty() {
+            f.write_str(self.kind.as_str())
+        } else {
+            write!(f, "{}: {}", self.kind.as_str(), self.message)
+        }
+    }
+}
+
+impl Error for ClientError {}
+
+pub mod hypervisor {
+    //! Hypervisor worker client boundary.
+    //!
+    //! Owner docs: `../determinism-hypervisor/.agents/docs/determinism-hypervisor/API.md`
+    //! section 2 and `../determinism-hypervisor/.agents/docs/determinism-hypervisor/INTEGRATION.md`
+    //! sections 1-2; current skeletal proto lives at
+    //! `../control-plane/proto/determinism/hypervisor/v1/hypervisor.proto`.
+    //! This module will mirror the slot lease, VM lifecycle, input injection, run,
+    //! snapshot, worker-info, and slot-watch shapes from the owner API without
+    //! exposing a bespoke orchestrator job API.
+}
+
+pub mod input_synth {
+    //! Input synthesizer client boundary.
+    //!
+    //! Owner docs: service-local API doc is pending; current traceable anchors are
+    //! `../determinism-hypervisor/.agents/docs/phases/phase-4-scoring-and-inputs.md`
+    //! for input-synthesizer scope and
+    //! `../control-plane/proto/determinism/inputsynth/v1/synthesizer.proto` for the
+    //! skeletal v1 proto surface.
+    //! This module will mirror macro-pack loading, health, burst proposal, macro
+    //! mining, provenance, and degraded-mode shapes from the owner API.
+}
+
+pub mod scorer {
+    //! State scorer client boundary.
+    //!
+    //! Owner docs: service-local API doc is pending; current traceable anchors are
+    //! `../determinism-hypervisor/.agents/docs/phases/phase-4-scoring-and-inputs.md`
+    //! for state-scorer scope and
+    //! `../control-plane/proto/determinism/scorer/v1/scorer.proto` for the skeletal
+    //! v1 proto surface.
+    //! This module will mirror feature-map loading, scoring program loading,
+    //! batch scoring, archive checkpoint/restore, replay, novelty, and decoded
+    //! component shapes from the owner API.
+}
+
+pub mod snapshot_store {
+    //! Snapshot-store client boundary.
+    //!
+    //! Owner docs: `../determinism-hypervisor/.agents/docs/snapshot-store/API.md`
+    //! sections 1.4-1.5 and
+    //! `../determinism-hypervisor/.agents/docs/snapshot-store/INTEGRATION.md`
+    //! sections 2.2-2.3; current skeletal proto lives at
+    //! `../control-plane/proto/determinism/snapstore/v1/snapshot_store.proto`.
+    //! This module will mirror tree node, subtree prune, path/query, metadata CAS,
+    //! checkpoint, WAL, and private node-attribute shapes from the owner API.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientError, ClientErrorKind, ClientResult};
+
+    #[test]
+    fn error_exposes_kind_and_message() {
+        let error = ClientError::new(ClientErrorKind::Unavailable, "hypervisor offline");
+
+        assert_eq!(error.kind(), ClientErrorKind::Unavailable);
+        assert_eq!(error.message(), "hypervisor offline");
+        assert_eq!(error.to_string(), "unavailable: hypervisor offline");
+    }
+
+    #[test]
+    fn error_display_omits_empty_separator() {
+        let error = ClientError::new(ClientErrorKind::Internal, "");
+
+        assert_eq!(error.to_string(), "internal");
+    }
+
+    #[test]
+    fn result_alias_accepts_client_error() {
+        fn validate(flag: bool) -> ClientResult<()> {
+            if flag {
+                Ok(())
+            } else {
+                Err(ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    "missing experiment id",
+                ))
+            }
+        }
+
+        assert!(validate(true).is_ok());
+        let error = validate(false).expect_err("invalid input should fail");
+        assert_eq!(error.kind(), ClientErrorKind::InvalidRequest);
+    }
+}
