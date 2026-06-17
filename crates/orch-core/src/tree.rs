@@ -117,9 +117,15 @@ pub enum TreeError {
     RootDepthNotZero { depth: u32 },
     MissingParent { parent: NodeId },
     NodeNotFound { id: NodeId },
+    RootHasChildren { children: u32 },
+    RootHasVisits { visits: u32 },
+    RootIsExhausted,
+    RootIsGoal,
+    RootStatusNotFrontier { status: NodeStatus },
     DepthOverflow { parent: NodeId },
     ChildCountOverflow { parent: NodeId },
     VisitOverflow { id: NodeId },
+    TerminalPrunedNode { id: NodeId },
 }
 
 impl fmt::Display for TreeError {
@@ -134,6 +140,17 @@ impl fmt::Display for TreeError {
             }
             Self::MissingParent { parent } => write!(formatter, "missing parent {:?}", parent),
             Self::NodeNotFound { id } => write!(formatter, "node {:?} not found", id),
+            Self::RootHasChildren { children } => {
+                write!(formatter, "root child count must be 0, got {children}")
+            }
+            Self::RootHasVisits { visits } => {
+                write!(formatter, "root visit count must be 0, got {visits}")
+            }
+            Self::RootIsExhausted => write!(formatter, "root cannot start exhausted"),
+            Self::RootIsGoal => write!(formatter, "root cannot start as goal"),
+            Self::RootStatusNotFrontier { status } => {
+                write!(formatter, "root status must be Frontier, got {:?}", status)
+            }
             Self::DepthOverflow { parent } => {
                 write!(formatter, "depth overflow under {:?}", parent)
             }
@@ -141,6 +158,9 @@ impl fmt::Display for TreeError {
                 write!(formatter, "child count overflow under {:?}", parent)
             }
             Self::VisitOverflow { id } => write!(formatter, "visit count overflow for {:?}", id),
+            Self::TerminalPrunedNode { id } => {
+                write!(formatter, "pruned node {:?} cannot transition", id)
+            }
         }
     }
 }
@@ -154,7 +174,7 @@ pub struct NodeContext<'a> {
     pub children: &'a [NodeId],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Tree {
     records: Vec<NodeRecord>,
     children_by_node: Vec<Vec<NodeId>>,
@@ -280,7 +300,11 @@ impl Tree {
 
     pub fn mark_goal(&mut self, id: NodeId) -> Result<(), TreeError> {
         let record = self.record_mut(id)?;
+        if record.status == NodeStatus::Pruned {
+            return Err(TreeError::TerminalPrunedNode { id });
+        }
         record.goal = true;
+        record.exhausted = false;
         record.status = NodeStatus::Goal;
         Ok(())
     }
@@ -329,6 +353,27 @@ fn validate_root(root: &NodeRecord) -> Result<(), TreeError> {
     }
     if root.depth != 0 {
         return Err(TreeError::RootDepthNotZero { depth: root.depth });
+    }
+    if root.children != 0 {
+        return Err(TreeError::RootHasChildren {
+            children: root.children,
+        });
+    }
+    if root.visits != 0 {
+        return Err(TreeError::RootHasVisits {
+            visits: root.visits,
+        });
+    }
+    if root.exhausted {
+        return Err(TreeError::RootIsExhausted);
+    }
+    if root.goal {
+        return Err(TreeError::RootIsGoal);
+    }
+    if root.status != NodeStatus::Frontier {
+        return Err(TreeError::RootStatusNotFrontier {
+            status: root.status,
+        });
     }
     Ok(())
 }
@@ -406,6 +451,40 @@ mod tests {
         assert_eq!(
             Tree::from_root_record(invalid_depth),
             Err(TreeError::RootDepthNotZero { depth: 2 })
+        );
+
+        let mut stale_children = NodeRecord::root(payload(0, 0.0, 1.0, 0, 10));
+        stale_children.children = 1;
+        assert_eq!(
+            Tree::from_root_record(stale_children),
+            Err(TreeError::RootHasChildren { children: 1 })
+        );
+
+        let mut stale_visits = NodeRecord::root(payload(0, 0.0, 1.0, 0, 10));
+        stale_visits.visits = 1;
+        assert_eq!(
+            Tree::from_root_record(stale_visits),
+            Err(TreeError::RootHasVisits { visits: 1 })
+        );
+
+        let mut exhausted = NodeRecord::root(payload(0, 0.0, 1.0, 0, 10));
+        exhausted.exhausted = true;
+        assert_eq!(
+            Tree::from_root_record(exhausted),
+            Err(TreeError::RootIsExhausted)
+        );
+
+        let mut goal = NodeRecord::root(payload(0, 0.0, 1.0, 0, 10));
+        goal.goal = true;
+        assert_eq!(Tree::from_root_record(goal), Err(TreeError::RootIsGoal));
+
+        let mut expanded = NodeRecord::root(payload(0, 0.0, 1.0, 0, 10));
+        expanded.status = NodeStatus::Expanded;
+        assert_eq!(
+            Tree::from_root_record(expanded),
+            Err(TreeError::RootStatusNotFrontier {
+                status: NodeStatus::Expanded,
+            })
         );
     }
 
@@ -508,6 +587,13 @@ mod tests {
         assert_eq!(tree.get(goal).unwrap().status, NodeStatus::Goal);
 
         tree.mark_pruned(pruned).unwrap();
+        assert!(tree.get(pruned).unwrap().exhausted);
+        assert!(!tree.get(pruned).unwrap().goal);
+        assert_eq!(tree.get(pruned).unwrap().status, NodeStatus::Pruned);
+        assert_eq!(
+            tree.mark_goal(pruned),
+            Err(TreeError::TerminalPrunedNode { id: pruned })
+        );
         assert!(tree.get(pruned).unwrap().exhausted);
         assert!(!tree.get(pruned).unwrap().goal);
         assert_eq!(tree.get(pruned).unwrap().status, NodeStatus::Pruned);
