@@ -104,18 +104,7 @@ pub mod hypervisor {
 
 pub mod input_synth;
 
-pub mod scorer {
-    //! State scorer client boundary.
-    //!
-    //! Owner docs: service-local API doc is pending; current traceable anchors are
-    //! `../determinism-hypervisor/.agents/docs/phases/phase-4-scoring-and-inputs.md`
-    //! for state-scorer scope and
-    //! `../control-plane/proto/determinism/scorer/v1/scorer.proto` for the skeletal
-    //! v1 proto surface.
-    //! This module will mirror feature-map loading, scoring program loading,
-    //! batch scoring, archive checkpoint/restore, replay, novelty, and decoded
-    //! component shapes from the owner API.
-}
+pub mod scorer;
 
 pub mod snapshot_store {
     //! Snapshot-store client boundary.
