@@ -1,6 +1,6 @@
 //! Fake hypervisor worker surface over the deterministic grid world.
 
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap};
 
 use orch_clients::{
     hypervisor::{
@@ -36,6 +36,8 @@ const BUTTON_UP: u32 = 0b0100_0000;
 const BUTTON_DOWN: u32 = 0b1000_0000;
 const BUTTON_LEFT: u32 = 0b1_0000_0000;
 const BUTTON_RIGHT: u32 = 0b10_0000_0000;
+const GRID_REGION: &str = "grid";
+const GRID_LAYOUT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FakeHypervisor {
@@ -46,6 +48,7 @@ pub struct FakeHypervisor {
     slots: BTreeMap<SlotId, Slot>,
     snapshots: BTreeMap<SnapshotRef, SnapshotRecord>,
     watch_events: Vec<SlotEvent>,
+    watch_cursor: Cell<usize>,
 }
 
 impl Default for FakeHypervisor {
@@ -70,6 +73,7 @@ impl FakeHypervisor {
             slots: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             watch_events: Vec::new(),
+            watch_cursor: Cell::new(0),
         }
     }
 
@@ -154,6 +158,21 @@ impl FakeHypervisor {
             live_children,
         }
     }
+
+    fn maybe_unfreeze_parent(&mut self, parent_id: SlotId) {
+        let has_live_children = self
+            .slots
+            .values()
+            .any(|slot| slot.parent == Some(parent_id));
+        if !has_live_children {
+            if let Some(parent) = self.slots.get_mut(&parent_id) {
+                if parent.state_kind == SlotState::Frozen {
+                    parent.state_kind = SlotState::Paused;
+                }
+            }
+            self.push_slot_event(parent_id);
+        }
+    }
 }
 
 impl HypervisorWorkerClient for FakeHypervisor {
@@ -198,16 +217,23 @@ impl HypervisorWorkerClient for FakeHypervisor {
         request.validate()?;
         self.ensure_capacity(request.count)?;
         let parent = self.slot(request.parent)?.clone();
+        ensure_paused(&parent, "fork")?;
         let mut children = Vec::with_capacity(request.entropy_seeds.len());
 
         for entropy_seed in request.entropy_seeds {
             let lease = self.allocate_lease(&parent.config, entropy_seed);
             let child = parent.clone_as_child(lease, request.parent.slot_id);
             self.slots.insert(lease.slot_id, child);
-            self.push_slot_event(lease.slot_id);
             children.push(lease);
         }
+        self.slots
+            .get_mut(&request.parent.slot_id)
+            .expect("parent slot was validated")
+            .state_kind = SlotState::Frozen;
         self.push_slot_event(request.parent.slot_id);
+        for lease in &children {
+            self.push_slot_event(lease.slot_id);
+        }
 
         Ok(ForkResponse { children })
     }
@@ -220,6 +246,10 @@ impl HypervisorWorkerClient for FakeHypervisor {
             ClientError::new(ClientErrorKind::InvalidRequest, "too many scheduled events")
         })?;
         let slot = self.slot_mut(request.lease)?;
+        ensure_paused(slot, "inject inputs")?;
+        for event in &request.events {
+            validate_scheduled_event(slot, event)?;
+        }
 
         for event in request.events {
             let action = event_to_action(&event.event);
@@ -241,19 +271,43 @@ impl HypervisorWorkerClient for FakeHypervisor {
     }
 
     fn run(&mut self, request: RunRequest) -> ClientResult<RunResponse> {
+        let lease = request.lease;
         let capture = request.capture;
-        let slot = self.slot_mut(request.lease)?;
-        slot.state_kind = SlotState::Running;
-        let (reason, frames_elapsed, sdk_event) =
-            run_slot(slot, request.until, request.hard_icount_cap)?;
-        slot.state_kind = SlotState::Paused;
-        let capture = capture_response(slot.state, slot.frame_counter, capture.as_ref());
+        validate_capture_spec(capture.as_ref())?;
+        {
+            let slot = self.slot_mut(lease)?;
+            ensure_paused(slot, "run")?;
+            slot.state_kind = SlotState::Running;
+        }
+        self.push_slot_event(lease.slot_id);
+
+        let run_result = {
+            let slot = self.slot_mut(lease)?;
+            run_slot(slot, request.until, request.hard_icount_cap)
+        };
+        let (reason, frames_elapsed, sdk_event) = match run_result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Ok(slot) = self.slot_mut(lease) {
+                    slot.state_kind = SlotState::Paused;
+                }
+                self.push_slot_event(lease.slot_id);
+                return Err(error);
+            }
+        };
+        let (icount, vns, state, frame_counter) = {
+            let slot = self.slot_mut(lease)?;
+            slot.state_kind = SlotState::Paused;
+            (slot.icount, slot.vns, slot.state, slot.frame_counter)
+        };
+        self.push_slot_event(lease.slot_id);
+        let capture = capture_response(state, frame_counter, capture.as_ref())?;
 
         Ok(RunResponse {
             reason,
-            icount: slot.icount,
-            vns: slot.vns,
-            state_hash: slot.state.state_hash(),
+            icount,
+            vns,
+            state_hash: state.state_hash(),
             frames_elapsed,
             sdk_event,
             feature_bytes: capture.feature_bytes,
@@ -267,6 +321,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
         request: TakeSnapshotRequest,
     ) -> ClientResult<TakeSnapshotResponse> {
         let slot = self.slot(request.lease)?.clone();
+        ensure_paused(&slot, "take snapshot")?;
         let machine_config_hash = machine_config_hash(&slot.config);
         let input_log_id = request
             .seal_input_log
@@ -279,7 +334,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
             slot.frame_counter,
             &slot.input_log,
         );
-        let capture = capture_response(slot.state, slot.frame_counter, request.capture.as_ref());
+        let capture = capture_response(slot.state, slot.frame_counter, request.capture.as_ref())?;
         let dirty_pages = 1u32
             .checked_add(u32::try_from(slot.input_log.len()).unwrap_or(u32::MAX - 1))
             .unwrap_or(u32::MAX);
@@ -317,6 +372,22 @@ impl HypervisorWorkerClient for FakeHypervisor {
 
     fn destroy_vm(&mut self, request: DestroyVmRequest) -> ClientResult<DestroyVmResponse> {
         let slot = self.slot(request.lease)?.clone();
+        if slot.state_kind == SlotState::Running {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                "cannot destroy a running slot",
+            ));
+        }
+        let live_children = self
+            .slots
+            .values()
+            .any(|candidate| candidate.parent == Some(request.lease.slot_id));
+        if live_children {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                "cannot destroy a slot with live children",
+            ));
+        }
         self.slots.remove(&request.lease.slot_id);
         self.watch_events.push(SlotEvent {
             slot: SlotInfo {
@@ -327,6 +398,9 @@ impl HypervisorWorkerClient for FakeHypervisor {
                 live_children: 0,
             },
         });
+        if let Some(parent_id) = slot.parent {
+            self.maybe_unfreeze_parent(parent_id);
+        }
         Ok(DestroyVmResponse)
     }
 
@@ -341,9 +415,10 @@ impl HypervisorWorkerClient for FakeHypervisor {
     }
 
     fn watch_slots(&self, _request: WatchSlotsRequest) -> ClientResult<WatchSlotsResponse> {
-        Ok(WatchSlotsResponse {
-            events: self.watch_events.clone(),
-        })
+        let start = self.watch_cursor.get().min(self.watch_events.len());
+        let events = self.watch_events[start..].to_vec();
+        self.watch_cursor.set(self.watch_events.len());
+        Ok(WatchSlotsResponse { events })
     }
 
     fn worker_info(&self, _request: GetWorkerInfoRequest) -> ClientResult<GetWorkerInfoResponse> {
@@ -474,19 +549,12 @@ fn run_slot(
             Ok((reason, u64::from(frames_elapsed), None))
         }
         RunUntil::IcountBudget(budget) => {
-            let frame_count = budget
-                .get()
-                .div_ceil(ICOUNT_PER_FRAME)
-                .min(u64::from(u32::MAX));
-            let (frames_elapsed, reason) =
-                advance_frames(slot, frame_count as u32, hard_icount_cap)?;
-            Ok((reason, u64::from(frames_elapsed), None))
+            let reason = advance_icount_budget(slot, budget, hard_icount_cap)?;
+            Ok((reason, 0, None))
         }
         RunUntil::VnsBudget(budget) => {
-            let frame_count = budget.div_ceil(VNS_PER_FRAME).min(u64::from(u32::MAX));
-            let (frames_elapsed, reason) =
-                advance_frames(slot, frame_count as u32, hard_icount_cap)?;
-            Ok((reason, u64::from(frames_elapsed), None))
+            let reason = advance_vns_budget(slot, budget)?;
+            Ok((reason, 0, None))
         }
         RunUntil::Goal(_) if slot.state.goal_reached() => Ok((StopReason::GoalSatisfied, 0, None)),
         RunUntil::Goal(_) => {
@@ -546,6 +614,48 @@ fn advance_frames(
     Ok((frames, reason))
 }
 
+fn advance_icount_budget(
+    slot: &mut Slot,
+    budget: GuestInstructions,
+    hard_icount_cap: Option<GuestInstructions>,
+) -> ClientResult<StopReason> {
+    let mut amount = budget.get();
+    let mut reason = StopReason::BudgetReached;
+    if let Some(cap) = hard_icount_cap {
+        let current = slot.icount.get();
+        if cap.get() <= current {
+            amount = 0;
+            reason = StopReason::HardCap;
+        } else {
+            let remaining = cap.get() - current;
+            if amount > remaining {
+                amount = remaining;
+                reason = StopReason::HardCap;
+            }
+        }
+    }
+
+    slot.icount = GuestInstructions::new(
+        slot.icount
+            .get()
+            .checked_add(amount)
+            .ok_or_else(|| ClientError::new(ClientErrorKind::Internal, "icount overflow"))?,
+    );
+    slot.vns = slot
+        .vns
+        .checked_add(amount)
+        .ok_or_else(|| ClientError::new(ClientErrorKind::Internal, "vns overflow"))?;
+    Ok(reason)
+}
+
+fn advance_vns_budget(slot: &mut Slot, budget: u64) -> ClientResult<StopReason> {
+    slot.vns = slot
+        .vns
+        .checked_add(budget)
+        .ok_or_else(|| ClientError::new(ClientErrorKind::Internal, "vns overflow"))?;
+    Ok(StopReason::BudgetReached)
+}
+
 fn drain_due_actions(
     pending_actions: &mut Vec<PendingAction>,
     end_frame: u32,
@@ -568,13 +678,13 @@ fn capture_response(
     state: GridState,
     frame_counter: FrameCount,
     capture: Option<&CaptureSpec>,
-) -> CaptureResponse {
+) -> ClientResult<CaptureResponse> {
     let Some(capture) = capture else {
-        return CaptureResponse::default();
+        return Ok(CaptureResponse::default());
     };
 
-    CaptureResponse {
-        feature_bytes: Some(pack_capture_ranges(state, capture)),
+    Ok(CaptureResponse {
+        feature_bytes: Some(pack_capture_ranges(state, capture)?),
         fb_lz4: capture
             .framebuffer
             .then(|| inline_framebuffer(state, frame_counter)),
@@ -585,24 +695,74 @@ fn capture_response(
             format: PixelFormat::Xrgb8888,
             frame_counter,
         }),
-    }
+    })
 }
 
-fn pack_capture_ranges(state: GridState, capture: &CaptureSpec) -> Vec<u8> {
+fn pack_capture_ranges(state: GridState, capture: &CaptureSpec) -> ClientResult<Vec<u8>> {
+    validate_capture_spec(Some(capture))?;
     let grid = encode_grid_features(state);
     let mut packed = Vec::new();
     for range in &capture.ranges {
+        let start = usize::try_from(range.offset).map_err(|_| {
+            ClientError::new(ClientErrorKind::InvalidRequest, "capture offset too large")
+        })?;
         let len = range.len as usize;
-        let start = usize::try_from(range.offset).unwrap_or(usize::MAX);
-        let mut bytes = vec![0; len];
-        if range.region == "grid" && start < grid.len() {
-            let available = grid.len() - start;
-            let copy_len = available.min(len);
-            bytes[..copy_len].copy_from_slice(&grid[start..start + copy_len]);
-        }
-        packed.extend_from_slice(&bytes);
+        let end = start.checked_add(len).ok_or_else(|| {
+            ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "capture range end overflow",
+            )
+        })?;
+        let bytes = grid.get(start..end).ok_or_else(|| {
+            ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "capture range out of fake grid bounds",
+            )
+        })?;
+        packed.extend_from_slice(bytes);
     }
-    packed
+    Ok(packed)
+}
+
+fn validate_capture_spec(capture: Option<&CaptureSpec>) -> ClientResult<()> {
+    let Some(capture) = capture else {
+        return Ok(());
+    };
+
+    let grid_len = encode_grid_features(GridState::new()).len();
+    for range in &capture.ranges {
+        if range.region != GRID_REGION {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                format!("unknown fake capture region '{}'", range.region),
+            ));
+        }
+        if range.layout_version != GRID_LAYOUT_VERSION {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                format!(
+                    "fake capture layout version must be {GRID_LAYOUT_VERSION}, got {}",
+                    range.layout_version
+                ),
+            ));
+        }
+        let start = usize::try_from(range.offset).map_err(|_| {
+            ClientError::new(ClientErrorKind::InvalidRequest, "capture offset too large")
+        })?;
+        let end = start.checked_add(range.len as usize).ok_or_else(|| {
+            ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "capture range end overflow",
+            )
+        })?;
+        if end > grid_len {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "capture range out of fake grid bounds",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn inline_framebuffer(state: GridState, frame_counter: FrameCount) -> Vec<u8> {
@@ -623,6 +783,36 @@ fn event_frame(event: &ScheduledEvent) -> FrameCount {
             FrameCount::new((vns / VNS_PER_FRAME).min(u64::from(u32::MAX)) as u32)
         }
     }
+}
+
+fn validate_scheduled_event(slot: &Slot, event: &ScheduledEvent) -> ClientResult<()> {
+    match event.at {
+        ScheduleAt::Frame(frame) if frame.get() <= slot.frame_counter.get() => {
+            Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "input frame is not in the future",
+            ))
+        }
+        ScheduleAt::Icount(icount) if icount.get() <= slot.icount.get() => Err(ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            "input icount is not in the future",
+        )),
+        ScheduleAt::Vns(vns) if vns <= slot.vns => Err(ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            "input vns is not in the future",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn ensure_paused(slot: &Slot, operation: &str) -> ClientResult<()> {
+    if slot.state_kind != SlotState::Paused {
+        return Err(ClientError::new(
+            ClientErrorKind::FailedPrecondition,
+            format!("{operation} requires a paused slot"),
+        ));
+    }
+    Ok(())
 }
 
 fn event_to_action(event: &InputEvent) -> GridAction {
@@ -835,13 +1025,6 @@ mod tests {
                 entropy_seed: Some(EntropySeed::new([0x31; 32])),
             })
             .expect("restore");
-        let forked = fake
-            .fork(ForkRequest::new(restored.lease, vec![EntropySeed::new([0x32; 32])]).unwrap())
-            .expect("fork")
-            .children
-            .pop()
-            .expect("child");
-
         let restored_snapshot = fake
             .take_snapshot(TakeSnapshotRequest {
                 lease: restored.lease,
@@ -849,6 +1032,20 @@ mod tests {
                 capture: Some(grid_capture(false)),
             })
             .expect("restored snapshot");
+        let forked = fake
+            .fork(ForkRequest::new(restored.lease, vec![EntropySeed::new([0x32; 32])]).unwrap())
+            .expect("fork")
+            .children
+            .pop()
+            .expect("child");
+
+        let frozen_snapshot = fake
+            .take_snapshot(TakeSnapshotRequest {
+                lease: restored.lease,
+                seal_input_log: true,
+                capture: Some(grid_capture(false)),
+            })
+            .expect_err("frozen parent cannot snapshot");
         let fork_snapshot = fake
             .take_snapshot(TakeSnapshotRequest {
                 lease: forked,
@@ -859,6 +1056,7 @@ mod tests {
 
         assert_eq!(restored.state_hash, parent_snapshot.state_hash);
         assert_eq!(restored.frame_counter, FrameCount::new(2));
+        assert_eq!(frozen_snapshot.kind(), ClientErrorKind::FailedPrecondition);
         assert_eq!(restored_snapshot.snapshot, fork_snapshot.snapshot);
         assert_eq!(restored_snapshot.state_hash, fork_snapshot.state_hash);
         assert_eq!(restored_snapshot.frame_counter, fork_snapshot.frame_counter);
@@ -899,6 +1097,11 @@ mod tests {
             watched.events.last().expect("destroy event").slot.state,
             SlotState::Empty
         );
+        assert!(fake
+            .watch_slots(WatchSlotsRequest)
+            .expect("watch drained")
+            .events
+            .is_empty());
     }
 
     #[test]
@@ -940,6 +1143,233 @@ mod tests {
         assert_eq!(snapshot.feature_bytes, Some(vec![0, 2, 0, 3]));
         assert_eq!(snapshot.fb_lz4, None);
         assert_eq!(snapshot.fb_info, None);
+    }
+
+    #[test]
+    fn hypervisor_rejects_invalid_capture_specs() {
+        let mut fake = FakeHypervisor::new();
+        let created = create_sample_vm(&mut fake, 0x51);
+
+        let unknown_region = fake
+            .take_snapshot(TakeSnapshotRequest {
+                lease: created.lease,
+                seal_input_log: false,
+                capture: Some(CaptureSpec {
+                    ranges: vec![ExtractRange {
+                        region: "wram".to_owned(),
+                        layout_version: GRID_LAYOUT_VERSION,
+                        offset: 0,
+                        len: 1,
+                    }],
+                    framebuffer: false,
+                }),
+            })
+            .expect_err("unknown region");
+        let wrong_layout = fake
+            .take_snapshot(TakeSnapshotRequest {
+                lease: created.lease,
+                seal_input_log: false,
+                capture: Some(CaptureSpec {
+                    ranges: vec![ExtractRange {
+                        region: GRID_REGION.to_owned(),
+                        layout_version: GRID_LAYOUT_VERSION + 1,
+                        offset: 0,
+                        len: 1,
+                    }],
+                    framebuffer: false,
+                }),
+            })
+            .expect_err("wrong layout");
+        let out_of_bounds = fake
+            .take_snapshot(TakeSnapshotRequest {
+                lease: created.lease,
+                seal_input_log: false,
+                capture: Some(CaptureSpec {
+                    ranges: vec![ExtractRange {
+                        region: GRID_REGION.to_owned(),
+                        layout_version: GRID_LAYOUT_VERSION,
+                        offset: 4,
+                        len: 2,
+                    }],
+                    framebuffer: false,
+                }),
+            })
+            .expect_err("out of bounds");
+
+        assert_eq!(unknown_region.kind(), ClientErrorKind::FailedPrecondition);
+        assert_eq!(wrong_layout.kind(), ClientErrorKind::FailedPrecondition);
+        assert_eq!(out_of_bounds.kind(), ClientErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn hypervisor_fork_freezes_parent_and_last_child_destroy_unfreezes() {
+        let mut fake = FakeHypervisor::new();
+        let parent = create_sample_vm(&mut fake, 0x52);
+        let children = fake
+            .fork(
+                ForkRequest::new(
+                    parent.lease,
+                    vec![EntropySeed::new([0x53; 32]), EntropySeed::new([0x54; 32])],
+                )
+                .unwrap(),
+            )
+            .expect("fork")
+            .children;
+
+        let listed = fake.list_slots(ListSlotsRequest).expect("list frozen");
+        let parent_info = listed
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == parent.lease.slot_id)
+            .expect("parent");
+        assert_eq!(parent_info.state, SlotState::Frozen);
+        assert_eq!(parent_info.live_children, 2);
+        assert_eq!(
+            fake.run(RunRequest {
+                lease: parent.lease,
+                until: RunUntil::FrameBudget(FrameCount::new(1)),
+                hard_icount_cap: None,
+                capture: None,
+            })
+            .expect_err("cannot run frozen parent")
+            .kind(),
+            ClientErrorKind::FailedPrecondition
+        );
+
+        fake.destroy_vm(DestroyVmRequest { lease: children[0] })
+            .expect("destroy first child");
+        let parent_still_frozen = fake
+            .list_slots(ListSlotsRequest)
+            .expect("list one child")
+            .slots
+            .into_iter()
+            .find(|slot| slot.slot_id == parent.lease.slot_id)
+            .expect("parent");
+        assert_eq!(parent_still_frozen.state, SlotState::Frozen);
+        assert_eq!(parent_still_frozen.live_children, 1);
+
+        fake.destroy_vm(DestroyVmRequest { lease: children[1] })
+            .expect("destroy last child");
+        let parent_unfrozen = fake
+            .list_slots(ListSlotsRequest)
+            .expect("list no children")
+            .slots
+            .into_iter()
+            .find(|slot| slot.slot_id == parent.lease.slot_id)
+            .expect("parent");
+        assert_eq!(parent_unfrozen.state, SlotState::Paused);
+        assert_eq!(parent_unfrozen.live_children, 0);
+    }
+
+    #[test]
+    fn hypervisor_rejects_past_scheduled_inputs() {
+        let mut fake = FakeHypervisor::new();
+        let created = create_sample_vm(&mut fake, 0x55);
+        fake.run(RunRequest {
+            lease: created.lease,
+            until: RunUntil::FrameBudget(FrameCount::new(2)),
+            hard_icount_cap: None,
+            capture: None,
+        })
+        .expect("advance slot");
+
+        let frame_error = fake
+            .inject_inputs(InjectInputsRequest {
+                lease: created.lease,
+                events: vec![pad_event(2, BUTTON_RIGHT)],
+            })
+            .expect_err("stale frame");
+        let icount_error = fake
+            .inject_inputs(InjectInputsRequest {
+                lease: created.lease,
+                events: vec![ScheduledEvent {
+                    at: ScheduleAt::Icount(GuestInstructions::new(ICOUNT_PER_FRAME)),
+                    event: InputEvent::PadSet(PadSet {
+                        port: 0,
+                        buttons: BUTTON_RIGHT,
+                    }),
+                }],
+            })
+            .expect_err("stale icount");
+        let vns_error = fake
+            .inject_inputs(InjectInputsRequest {
+                lease: created.lease,
+                events: vec![ScheduledEvent {
+                    at: ScheduleAt::Vns(VNS_PER_FRAME),
+                    event: InputEvent::PadSet(PadSet {
+                        port: 0,
+                        buttons: BUTTON_RIGHT,
+                    }),
+                }],
+            })
+            .expect_err("stale vns");
+
+        assert_eq!(frame_error.kind(), ClientErrorKind::InvalidRequest);
+        assert_eq!(icount_error.kind(), ClientErrorKind::InvalidRequest);
+        assert_eq!(vns_error.kind(), ClientErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn hypervisor_watch_drains_and_run_emits_slot_transitions() {
+        let mut fake = FakeHypervisor::new();
+        let created = create_sample_vm(&mut fake, 0x56);
+        let created_events = fake.watch_slots(WatchSlotsRequest).expect("created watch");
+        assert_eq!(created_events.events.len(), 1);
+        assert!(fake
+            .watch_slots(WatchSlotsRequest)
+            .expect("created watch drained")
+            .events
+            .is_empty());
+
+        fake.run(RunRequest {
+            lease: created.lease,
+            until: RunUntil::NextSdkEvent(NextSdkEvent { stream: None }),
+            hard_icount_cap: None,
+            capture: None,
+        })
+        .expect("run ready");
+        let run_events = fake.watch_slots(WatchSlotsRequest).expect("run watch");
+
+        assert_eq!(run_events.events.len(), 2);
+        assert_eq!(run_events.events[0].slot.state, SlotState::Running);
+        assert_eq!(run_events.events[1].slot.state, SlotState::Paused);
+        assert!(fake
+            .watch_slots(WatchSlotsRequest)
+            .expect("run watch drained")
+            .events
+            .is_empty());
+    }
+
+    #[test]
+    fn hypervisor_non_frame_budgets_do_not_advance_whole_frames() {
+        let mut fake = FakeHypervisor::new();
+        let created = create_sample_vm(&mut fake, 0x57);
+
+        let icount = fake
+            .run(RunRequest {
+                lease: created.lease,
+                until: RunUntil::IcountBudget(GuestInstructions::new(1)),
+                hard_icount_cap: None,
+                capture: None,
+            })
+            .expect("icount budget");
+        let vns = fake
+            .run(RunRequest {
+                lease: created.lease,
+                until: RunUntil::VnsBudget(5),
+                hard_icount_cap: None,
+                capture: None,
+            })
+            .expect("vns budget");
+
+        assert_eq!(icount.reason, StopReason::BudgetReached);
+        assert_eq!(icount.frames_elapsed, 0);
+        assert_eq!(icount.icount, GuestInstructions::new(1));
+        assert_eq!(icount.vns, 1);
+        assert_eq!(vns.reason, StopReason::BudgetReached);
+        assert_eq!(vns.frames_elapsed, 0);
+        assert_eq!(vns.icount, GuestInstructions::new(1));
+        assert_eq!(vns.vns, 6);
     }
 
     #[test]
@@ -986,8 +1416,8 @@ mod tests {
     fn grid_capture(framebuffer: bool) -> CaptureSpec {
         CaptureSpec {
             ranges: vec![ExtractRange {
-                region: "grid".to_owned(),
-                layout_version: 1,
+                region: GRID_REGION.to_owned(),
+                layout_version: GRID_LAYOUT_VERSION,
                 offset: 0,
                 len: 5,
             }],
