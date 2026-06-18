@@ -5,7 +5,8 @@ use super::{
     SelectionChoice, SelectionPolicy,
 };
 use crate::rng::DeterministicRng;
-use crate::types::Stage;
+use crate::tree::Tree;
+use crate::types::{NodeId, Stage};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StagedPolicy {
@@ -46,8 +47,10 @@ impl SelectionPolicy for StagedPolicy {
         rng: &mut DeterministicRng,
     ) -> PolicyResult<SelectionChoice> {
         let candidates = context.candidate_snapshots()?;
+        let target_stage = target_stage_from_tree(context.tree)?;
         select_from_candidates(
             &candidates,
+            target_stage,
             context.selection.staged.inner,
             context.selection.staged.epsilon_regress,
             context.selection.temperature,
@@ -60,6 +63,7 @@ impl SelectionPolicy for StagedPolicy {
 
 pub(crate) fn select_from_candidates(
     candidates: &[CandidateSnapshot],
+    target_stage: Stage,
     inner: PolicyKind,
     epsilon_regress: f64,
     temperature: f64,
@@ -68,7 +72,6 @@ pub(crate) fn select_from_candidates(
     rng: &mut DeterministicRng,
 ) -> PolicyResult<SelectionChoice> {
     validate_staged_config(inner, epsilon_regress)?;
-    let target_stage = target_stage(candidates)?;
     let partition = partition_candidates(candidates, target_stage);
     let regress_mix = rng.next_unit_f64() < epsilon_regress;
     let selected = match (
@@ -102,12 +105,14 @@ pub(crate) fn select_from_candidates(
     })
 }
 
-pub(crate) fn target_stage(candidates: &[CandidateSnapshot]) -> PolicyResult<Stage> {
-    candidates
-        .iter()
-        .map(|candidate| candidate.stage)
-        .max()
-        .ok_or(PolicyError::EmptyCandidateSet)
+pub(crate) fn target_stage_from_tree(tree: &Tree) -> PolicyResult<Stage> {
+    let mut target = None;
+    for raw_id in 0..tree.next_id().get() {
+        if let Some(record) = tree.get(NodeId::new(raw_id)) {
+            target = Some(target.map_or(record.stage, |current: Stage| current.max(record.stage)));
+        }
+    }
+    target.ok_or(PolicyError::EmptyCandidateSet)
 }
 
 fn validate_staged_config(inner: PolicyKind, epsilon_regress: f64) -> PolicyResult<()> {
@@ -196,11 +201,18 @@ mod tests {
         ];
         let mut rng = DeterministicRng::selection(123, 0);
 
-        let choice =
-            select_from_candidates(&candidates, PolicyKind::Ucb, 0.0, 1.0, 0.0, 64, &mut rng)
-                .unwrap();
+        let choice = select_from_candidates(
+            &candidates,
+            Stage::new(2),
+            PolicyKind::Ucb,
+            0.0,
+            1.0,
+            0.0,
+            64,
+            &mut rng,
+        )
+        .unwrap();
 
-        assert_eq!(target_stage(&candidates).unwrap(), Stage::new(2));
         assert_eq!(choice.selected, NodeId::new(3));
         assert_eq!(choice.candidate_index, 2);
         assert_eq!(rng.draw_count(), 1);
@@ -215,12 +227,64 @@ mod tests {
         ];
         let mut rng = DeterministicRng::selection(123, 0);
 
-        let choice =
-            select_from_candidates(&candidates, PolicyKind::Ucb, 1.0, 1.0, 0.0, 64, &mut rng)
-                .unwrap();
+        let choice = select_from_candidates(
+            &candidates,
+            Stage::new(2),
+            PolicyKind::Ucb,
+            1.0,
+            1.0,
+            0.0,
+            64,
+            &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(choice.selected, NodeId::new(1));
         assert_eq!(choice.candidate_index, 0);
+        assert_eq!(rng.draw_count(), 1);
+    }
+
+    #[test]
+    fn staged_default_epsilon_regress_takes_regress_branch_below_threshold() {
+        let candidates = [candidate(1, 100.0, 1), candidate(2, 1.0, 2)];
+        let mut rng = DeterministicRng::selection(13, 0);
+
+        let choice = select_from_candidates(
+            &candidates,
+            Stage::new(2),
+            PolicyKind::Ucb,
+            0.05,
+            1.0,
+            0.0,
+            64,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(choice.selected, NodeId::new(1));
+        assert_eq!(choice.candidate_index, 0);
+        assert_eq!(rng.draw_count(), 1);
+    }
+
+    #[test]
+    fn staged_default_epsilon_regress_takes_leading_branch_above_threshold() {
+        let candidates = [candidate(1, 100.0, 1), candidate(2, 1.0, 2)];
+        let mut rng = DeterministicRng::selection(0, 0);
+
+        let choice = select_from_candidates(
+            &candidates,
+            Stage::new(2),
+            PolicyKind::Ucb,
+            0.05,
+            1.0,
+            0.0,
+            64,
+            &mut rng,
+        )
+        .unwrap();
+
+        assert_eq!(choice.selected, NodeId::new(2));
+        assert_eq!(choice.candidate_index, 1);
         assert_eq!(rng.draw_count(), 1);
     }
 
@@ -229,9 +293,17 @@ mod tests {
         let candidates = [candidate(1, 1.0, 2), candidate(2, 2.0, 2)];
         let mut rng = DeterministicRng::selection(123, 0);
 
-        let choice =
-            select_from_candidates(&candidates, PolicyKind::Ucb, 1.0, 1.0, 0.0, 64, &mut rng)
-                .unwrap();
+        let choice = select_from_candidates(
+            &candidates,
+            Stage::new(2),
+            PolicyKind::Ucb,
+            1.0,
+            1.0,
+            0.0,
+            64,
+            &mut rng,
+        )
+        .unwrap();
 
         assert_eq!(choice.selected, NodeId::new(2));
         assert_eq!(choice.candidate_index, 1);
@@ -246,6 +318,7 @@ mod tests {
         assert_eq!(
             select_from_candidates(
                 &candidates,
+                Stage::new(1),
                 PolicyKind::Staged,
                 0.05,
                 1.0,
@@ -281,10 +354,36 @@ mod tests {
         let choice = policy.select(&context, &mut rng).unwrap();
 
         assert_eq!(policy.kind(), PolicyKind::Staged);
-        assert_eq!(choice.selected, ids[1]);
-        assert_eq!(choice.candidate_index, 1);
+        assert_eq!(choice.selected, ids[2]);
+        assert_eq!(choice.candidate_index, 2);
         assert_eq!(rng.draw_count(), 1);
         assert_eq!(policy.total_expansions(), 64);
+    }
+
+    #[test]
+    fn staged_target_stage_uses_committed_tree_when_leading_frontier_is_empty() {
+        let (tree, ids) = sample_tree();
+        let mut frontier = Frontier::new();
+        for id in [ids[1], ids[0]] {
+            frontier.insert(id).unwrap();
+        }
+        let mirror = CellMirror::new();
+        let plateau = plateau_knobs();
+        let mut selection = SelectionConfig::default();
+        selection.policy = PolicyKind::Staged;
+        selection.staged.inner = PolicyKind::Ucb;
+        selection.staged.epsilon_regress = 0.0;
+        selection.ucb_c = 0.0;
+        let context = PolicyContext::new(&tree, &frontier, &mirror, &plateau, &selection);
+        let mut rng = DeterministicRng::selection(0, 0);
+        let mut policy = StagedPolicy::with_total_expansions(64);
+
+        assert_eq!(target_stage_from_tree(&tree).unwrap(), Stage::new(3));
+        let choice = policy.select(&context, &mut rng).unwrap();
+
+        assert_eq!(choice.selected, ids[0]);
+        assert_eq!(choice.candidate_index, 0);
+        assert_eq!(rng.draw_count(), 1);
     }
 
     #[test]
@@ -294,6 +393,7 @@ mod tests {
 
         let _choice = select_from_candidates(
             &candidates,
+            Stage::new(2),
             PolicyKind::Softmax,
             0.0,
             1.0,
@@ -329,7 +429,7 @@ mod tests {
         let second = tree
             .insert_child(NodeId::ROOT, payload(2, 10.0, 2))
             .unwrap();
-        let third = tree.insert_child(NodeId::ROOT, payload(3, 5.0, 2)).unwrap();
+        let third = tree.insert_child(NodeId::ROOT, payload(3, 5.0, 3)).unwrap();
         (tree, [first, second, third])
     }
 
