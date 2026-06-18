@@ -355,7 +355,7 @@ impl EscalationLadder {
     }
 
     fn set_level(&mut self, requested: EscalationLevel) {
-        let next = requested.min(self.knobs.max_level);
+        let next = self.level.max(requested.min(self.knobs.max_level));
         if self.level < EscalationLevel::L4 && next >= EscalationLevel::L4 {
             self.feature_map_version = self.feature_map_version.saturating_add(1);
         }
@@ -403,6 +403,20 @@ mod tests {
         assert_eq!(improved.observations_since_improvement, 0);
         assert_eq!(improved.completed_stall_windows, 0);
         assert!(!improved.stalled);
+    }
+
+    #[test]
+    fn plateau_improvement_boundary_is_strictly_greater_than_epsilon() {
+        let mut detector = StallDetector::new(10, 1.0);
+
+        assert!(detector.observe(score(10.0)).improved);
+        let boundary = detector.observe(score(11.0));
+        assert!(!boundary.improved);
+        assert_eq!(boundary.best_score, score(10.0));
+
+        let improved = detector.observe(score(11.000_001));
+        assert!(improved.improved);
+        assert_eq!(improved.best_score, score(11.000_001));
     }
 
     #[test]
@@ -490,6 +504,28 @@ mod tests {
         assert_eq!(
             ladder.set_completed_stall_windows(4).level,
             EscalationLevel::L4
+        );
+        assert_eq!(ladder.feature_map_version(), 1);
+
+        let stale_lower_count = ladder.set_completed_stall_windows(2);
+        assert_eq!(stale_lower_count.level, EscalationLevel::L4);
+        assert_eq!(
+            stale_lower_count
+                .l4_rebin
+                .expect("l4 remains active")
+                .feature_map_version,
+            1
+        );
+        assert_eq!(ladder.feature_map_version(), 1);
+
+        let repeated_l4 = ladder.set_completed_stall_windows(4);
+        assert_eq!(repeated_l4.level, EscalationLevel::L4);
+        assert_eq!(
+            repeated_l4
+                .l4_rebin
+                .expect("l4 remains active")
+                .feature_map_version,
+            1
         );
         assert_eq!(ladder.feature_map_version(), 1);
 
