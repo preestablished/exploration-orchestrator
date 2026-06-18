@@ -33,7 +33,7 @@ impl SelectionPolicy for SoftmaxPolicy {
     }
 }
 
-pub fn select_from_candidates(
+pub(crate) fn select_from_candidates(
     candidates: &[CandidateSnapshot],
     temperature: f64,
     rng: &mut DeterministicRng,
@@ -171,6 +171,23 @@ mod tests {
             .iter()
             .any(|candidate| candidate.id == choice.selected));
         assert_eq!(rng.draw_count() - before, 1);
+    }
+
+    #[test]
+    fn softmax_handles_extreme_finite_priorities_with_max_subtracted_exp() {
+        let candidates = [
+            candidate(1, 1000.0),
+            candidate(2, 1001.0),
+            candidate(3, 1002.0),
+        ];
+        let mut rng = DeterministicRng::selection(123, 0);
+
+        let choice = select_from_candidates(&candidates, 1.0, &mut rng).unwrap();
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.id == choice.selected));
+        assert_eq!(rng.draw_count(), 1);
     }
 
     #[test]
