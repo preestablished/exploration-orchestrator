@@ -99,6 +99,7 @@ impl FaultRate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultConfigError {
     RateOutOfRange { per_million: u32 },
+    InvalidSynthFingerprintFlip { byte_index: u8, bit_index: u8 },
 }
 
 impl fmt::Display for FaultConfigError {
@@ -108,6 +109,13 @@ impl fmt::Display for FaultConfigError {
                 formatter,
                 "fault rate {per_million} is greater than {} per million",
                 FaultRate::DENOMINATOR
+            ),
+            Self::InvalidSynthFingerprintFlip {
+                byte_index,
+                bit_index,
+            } => write!(
+                formatter,
+                "invalid synth fingerprint flip at byte {byte_index}, bit {bit_index}"
             ),
         }
     }
@@ -211,15 +219,39 @@ pub enum FaultTerminal {
 /// Deterministic synthesizer fingerprint bit flip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SynthFingerprintFlip {
-    pub byte_index: u8,
-    pub bit_mask: u8,
+    byte_index: u8,
+    bit_mask: u8,
 }
 
 impl SynthFingerprintFlip {
+    pub fn new(byte_index: u8, bit_index: u8) -> Result<Self, FaultConfigError> {
+        if usize::from(byte_index) >= CONFIG_FINGERPRINT_LEN || bit_index >= 8 {
+            return Err(FaultConfigError::InvalidSynthFingerprintFlip {
+                byte_index,
+                bit_index,
+            });
+        }
+
+        Ok(Self {
+            byte_index,
+            bit_mask: 1u8 << u32::from(bit_index),
+        })
+    }
+
+    #[must_use]
+    pub const fn byte_index(self) -> u8 {
+        self.byte_index
+    }
+
+    #[must_use]
+    pub const fn bit_mask(self) -> u8 {
+        self.bit_mask
+    }
+
     #[must_use]
     pub fn apply(self, fingerprint: ConfigFingerprint) -> ConfigFingerprint {
         let mut bytes = fingerprint.into_bytes();
-        bytes[usize::from(self.byte_index) % CONFIG_FINGERPRINT_LEN] ^= self.bit_mask;
+        bytes[usize::from(self.byte_index)] ^= self.bit_mask;
         ConfigFingerprint::new(bytes)
     }
 }
@@ -321,6 +353,11 @@ impl FaultPlan {
         self
     }
 
+    /// Adds error probability to the shared terminal-fault denominator.
+    ///
+    /// Timeout faults, when configured, own the first interval. Error faults
+    /// use the next interval and are capped when `timeout_rate + error_rate`
+    /// exceeds one million.
     #[must_use]
     pub const fn with_error(mut self, rate: FaultRate, kind: ClientErrorKind) -> Self {
         self.error_rate = rate;
@@ -328,6 +365,11 @@ impl FaultPlan {
         self
     }
 
+    /// Adds timeout probability to the shared terminal-fault denominator.
+    ///
+    /// Timeout has first priority in that denominator. Error faults use the
+    /// next interval and are capped when `timeout_rate + error_rate` exceeds
+    /// one million.
     #[must_use]
     pub const fn with_timeout(mut self, rate: FaultRate) -> Self {
         self.timeout_rate = rate;
@@ -371,21 +413,12 @@ impl FaultInjector {
                 .latency
                 .decide(draw_u64(self.plan.seed, request, FaultChannel::Latency));
 
-        let terminal = if self.plan.timeout_rate.fires(draw_u64(
-            self.plan.seed,
-            request,
-            FaultChannel::Timeout,
-        )) {
-            FaultTerminal::Timeout
-        } else if self
-            .plan
-            .error_rate
-            .fires(draw_u64(self.plan.seed, request, FaultChannel::Error))
-        {
-            FaultTerminal::Error(self.plan.error_kind)
-        } else {
-            FaultTerminal::None
-        };
+        let terminal = decide_terminal(
+            self.plan.timeout_rate,
+            self.plan.error_rate,
+            self.plan.error_kind,
+            draw_u64(self.plan.seed, request, FaultChannel::Terminal),
+        );
 
         let has_response = matches!(terminal, FaultTerminal::None);
         let partial = has_response
@@ -411,10 +444,11 @@ impl FaultInjector {
                 request,
                 FaultChannel::SynthFingerprintFlipBit,
             );
-            SynthFingerprintFlip {
-                byte_index: (draw % CONFIG_FINGERPRINT_LEN as u64) as u8,
-                bit_mask: 1u8 << ((draw >> 8) % 8) as u32,
-            }
+            SynthFingerprintFlip::new(
+                (draw % CONFIG_FINGERPRINT_LEN as u64) as u8,
+                ((draw >> 8) % 8) as u8,
+            )
+            .expect("generated synth fingerprint flip is in range")
         });
 
         FaultDecision {
@@ -429,8 +463,7 @@ impl FaultInjector {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FaultChannel {
     Latency,
-    Error,
-    Timeout,
+    Terminal,
     PartialResponse,
     PartialResponseLen,
     SynthFingerprintFlip,
@@ -441,8 +474,7 @@ impl FaultChannel {
     const fn tag(self) -> &'static [u8] {
         match self {
             Self::Latency => b"latency",
-            Self::Error => b"error",
-            Self::Timeout => b"timeout",
+            Self::Terminal => b"terminal",
             Self::PartialResponse => b"partial_response",
             Self::PartialResponseLen => b"partial_response_len",
             Self::SynthFingerprintFlip => b"synth_fingerprint_flip",
@@ -451,12 +483,33 @@ impl FaultChannel {
     }
 }
 
+fn decide_terminal(
+    timeout_rate: FaultRate,
+    error_rate: FaultRate,
+    error_kind: ClientErrorKind,
+    draw: u64,
+) -> FaultTerminal {
+    let terminal_draw = draw % u64::from(FaultRate::DENOMINATOR);
+    let timeout_cutoff = u64::from(timeout_rate.get());
+    let error_cutoff = timeout_cutoff
+        .saturating_add(u64::from(error_rate.get()))
+        .min(u64::from(FaultRate::DENOMINATOR));
+
+    if terminal_draw < timeout_cutoff {
+        FaultTerminal::Timeout
+    } else if terminal_draw < error_cutoff {
+        FaultTerminal::Error(error_kind)
+    } else {
+        FaultTerminal::None
+    }
+}
+
 fn draw_u64(seed: u64, request: FaultRequest<'_>, channel: FaultChannel) -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"orch-fakes/fault/v1");
     hasher.update(&seed.to_le_bytes());
-    hasher.update(channel.tag());
-    hasher.update(request.target.tag());
+    update_len_prefixed(&mut hasher, channel.tag());
+    update_len_prefixed(&mut hasher, request.target.tag());
     update_len_prefixed(&mut hasher, request.operation.as_bytes());
     update_len_prefixed(&mut hasher, request.request_identity);
 
@@ -567,6 +620,98 @@ mod tests {
         assert!(partial.truncate_len(12) < 12);
         assert_eq!(too_small.partial, None);
         assert_eq!(too_small.truncate_len(1), 1);
+    }
+
+    #[test]
+    fn fault_partial_response_covers_boundary_lengths() {
+        let min_zero = FaultInjector::new(
+            FaultPlan::disabled(42)
+                .with_partial_response(PartialResponseFault::new(FaultRate::always(), 0)),
+        )
+        .decide(REQUEST_A, 1);
+        let min_plus_one = FaultInjector::new(
+            FaultPlan::disabled(42)
+                .with_partial_response(PartialResponseFault::new(FaultRate::always(), 4)),
+        )
+        .decide(REQUEST_A, 5);
+
+        assert_eq!(
+            min_zero.partial.expect("single item can truncate to empty"),
+            PartialResponse { keep_items: 0 }
+        );
+        assert_eq!(min_zero.truncate_len(1), 0);
+        assert_eq!(
+            min_plus_one.partial.expect("min plus one can truncate"),
+            PartialResponse { keep_items: 4 }
+        );
+        assert_eq!(min_plus_one.truncate_len(5), 4);
+    }
+
+    #[test]
+    fn fault_terminal_rates_share_one_denominator() {
+        let half = FaultRate::per_million(500_000).expect("valid rate");
+        let quarter = FaultRate::per_million(250_000).expect("valid rate");
+
+        assert_eq!(
+            decide_terminal(half, half, ClientErrorKind::DataLoss, 499_999),
+            FaultTerminal::Timeout
+        );
+        assert_eq!(
+            decide_terminal(half, half, ClientErrorKind::DataLoss, 500_000),
+            FaultTerminal::Error(ClientErrorKind::DataLoss)
+        );
+        assert_eq!(
+            decide_terminal(half, half, ClientErrorKind::DataLoss, 999_999),
+            FaultTerminal::Error(ClientErrorKind::DataLoss)
+        );
+        assert_eq!(
+            decide_terminal(quarter, quarter, ClientErrorKind::DataLoss, 500_000),
+            FaultTerminal::None
+        );
+    }
+
+    #[test]
+    fn fault_synth_fingerprint_flip_is_synth_only() {
+        let injector = FaultInjector::new(
+            FaultPlan::disabled(7).with_synth_fingerprint_flip(FaultRate::always()),
+        );
+        let non_synth = FaultRequest::new(FaultTarget::Scorer, "score_batch", b"batch=99");
+
+        let synth_decision = injector.decide(REQUEST_A, 4);
+        let scorer_decision = injector.decide(non_synth, 4);
+
+        assert_ne!(
+            synth_decision.apply_synth_fingerprint(FINGERPRINT),
+            FINGERPRINT
+        );
+        assert_eq!(scorer_decision.synth_fingerprint_flip, None);
+        assert_eq!(
+            scorer_decision.apply_synth_fingerprint(FINGERPRINT),
+            FINGERPRINT
+        );
+    }
+
+    #[test]
+    fn fault_synth_fingerprint_flip_rejects_noop_or_out_of_range_bits() {
+        let flip = SynthFingerprintFlip::new(31, 7).expect("valid flip");
+
+        assert_eq!(flip.byte_index(), 31);
+        assert_eq!(flip.bit_mask(), 0b1000_0000);
+        assert_ne!(flip.apply(FINGERPRINT), FINGERPRINT);
+        assert_eq!(
+            SynthFingerprintFlip::new(32, 0),
+            Err(FaultConfigError::InvalidSynthFingerprintFlip {
+                byte_index: 32,
+                bit_index: 0,
+            })
+        );
+        assert_eq!(
+            SynthFingerprintFlip::new(0, 8),
+            Err(FaultConfigError::InvalidSynthFingerprintFlip {
+                byte_index: 0,
+                bit_index: 8,
+            })
+        );
     }
 
     #[test]
