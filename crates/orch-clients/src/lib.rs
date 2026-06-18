@@ -32,6 +32,8 @@ pub enum ClientErrorKind {
     ResourceExhausted,
     /// Service is temporarily unreachable or not ready to serve the request.
     Unavailable,
+    /// Determinism violation or boundary-engine overshoot reported by the service.
+    DataLoss,
     /// Unexpected service or adapter failure that does not fit a stable category.
     Internal,
 }
@@ -46,6 +48,7 @@ impl ClientErrorKind {
             Self::AlreadyExists => "already exists",
             Self::ResourceExhausted => "resource exhausted",
             Self::Unavailable => "unavailable",
+            Self::DataLoss => "data loss",
             Self::Internal => "internal",
         }
     }
@@ -90,17 +93,7 @@ impl fmt::Display for ClientError {
 
 impl Error for ClientError {}
 
-pub mod hypervisor {
-    //! Hypervisor worker client boundary.
-    //!
-    //! Owner docs: `../determinism-hypervisor/.agents/docs/determinism-hypervisor/API.md`
-    //! section 2 and `../determinism-hypervisor/.agents/docs/determinism-hypervisor/INTEGRATION.md`
-    //! sections 1-2; current skeletal proto lives at
-    //! `../control-plane/proto/determinism/hypervisor/v1/hypervisor.proto`.
-    //! This module will mirror the slot lease, VM lifecycle, input injection, run,
-    //! snapshot, worker-info, and slot-watch shapes from the owner API without
-    //! exposing a bespoke orchestrator job API.
-}
+pub mod hypervisor;
 
 pub mod input_synth;
 
@@ -126,6 +119,14 @@ mod tests {
         let error = ClientError::new(ClientErrorKind::Internal, "");
 
         assert_eq!(error.to_string(), "internal");
+    }
+
+    #[test]
+    fn error_kind_preserves_data_loss_boundary() {
+        let error = ClientError::new(ClientErrorKind::DataLoss, "state hash diverged");
+
+        assert_eq!(error.kind(), ClientErrorKind::DataLoss);
+        assert_eq!(error.to_string(), "data loss: state hash diverged");
     }
 
     #[test]
