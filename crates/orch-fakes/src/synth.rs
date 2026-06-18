@@ -99,7 +99,7 @@ impl FakeSynth {
         let experiment_id =
             parse_scalar(text, "experiment_id").unwrap_or_else(|| document.document_id.clone());
         let model = parse_model(text).unwrap_or(ModelKind::Pad);
-        let mix = GeneratorMix::default().with_overrides(text.as_bytes())?;
+        let mix = GeneratorMix::default().with_config_document(text.as_bytes())?;
         let config = FakeExperimentConfig {
             experiment_id: experiment_id.clone(),
             model,
@@ -614,6 +614,20 @@ impl Default for GeneratorMix {
 }
 
 impl GeneratorMix {
+    fn with_config_document(self, bytes: &[u8]) -> ClientResult<Self> {
+        let text = str::from_utf8(bytes).map_err(|_| {
+            ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "experiment config document is not valid UTF-8",
+            )
+        })?;
+        if !text.contains("generator_mix") {
+            return Ok(self.clamp_nonnegative());
+        }
+
+        self.with_overrides(bytes)
+    }
+
     fn with_overrides(mut self, bytes: &[u8]) -> ClientResult<Self> {
         let text = str::from_utf8(bytes).map_err(|_| {
             ClientError::new(
@@ -621,6 +635,17 @@ impl GeneratorMix {
                 "config_overrides_yaml is not valid UTF-8",
             )
         })?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed == "{}" {
+            return Ok(self.clamp_nonnegative());
+        }
+        if !text.contains("generator_mix") {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "config_overrides_yaml must contain a generator_mix override",
+            ));
+        }
+
         for (key, value) in parse_generator_mix_entries(text)? {
             match key.as_str() {
                 "weighted_random" => self.weighted_random = value,
@@ -1190,6 +1215,8 @@ mod tests {
             b"generator_mix:\n  macro: nope\n".as_slice(),
             b"generator_mix:\n  surprise: 1\n",
             b"generator_mix: { macro: NaN }\n",
+            b"[",
+            b"weighted_random: {",
             &[0xff],
         ] {
             let mut synth = configured_synth(true);
