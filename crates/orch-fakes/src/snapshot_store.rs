@@ -178,10 +178,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
             attrs: request.attrs,
         };
 
-        let experiment = self
-            .experiments
-            .entry(experiment_id)
-            .or_insert_with(ExperimentStore::default);
+        let experiment = self.experiments.entry(experiment_id).or_default();
         experiment.insert_node(StoredNode {
             meta: node.clone(),
             input_log_container,
@@ -609,21 +606,21 @@ fn query_matches(node: &NodeMeta, request: &QueryNodesRequest) -> bool {
     (request.statuses.is_empty() || request.statuses.contains(&node.status))
         && request
             .min_progress
-            .map_or(true, |min| node.progress_score >= min)
+            .is_none_or(|min| node.progress_score >= min)
         && request
             .max_progress
-            .map_or(true, |max| node.progress_score <= max)
+            .is_none_or(|max| node.progress_score <= max)
         && request
             .min_novelty
-            .map_or(true, |min| node.novelty_score >= min)
-        && request.min_depth.map_or(true, |min| node.depth >= min)
-        && request.max_depth.map_or(true, |max| node.depth <= max)
+            .is_none_or(|min| node.novelty_score >= min)
+        && request.min_depth.is_none_or(|min| node.depth >= min)
+        && request.max_depth.is_none_or(|max| node.depth <= max)
         && request
             .created_after
-            .map_or(true, |after| node.created_at > after)
+            .is_none_or(|after| node.created_at > after)
         && request
             .updated_after
-            .map_or(true, |after| node.updated_at > after)
+            .is_none_or(|after| node.updated_at > after)
 }
 
 fn sort_query_nodes(nodes: &mut [NodeMeta], order_by: orch_clients::snapshot_store::OrderBy) {
@@ -1185,7 +1182,7 @@ mod tests {
             experiment_id: experiment_id.to_owned(),
             node_id: NodeId::new(node_id),
             parent_node_id: Some(parent),
-            snapshot_ref: if node_id % 2 == 0 {
+            snapshot_ref: if node_id.is_multiple_of(2) {
                 SNAPSHOT_B
             } else {
                 SNAPSHOT_A

@@ -799,12 +799,13 @@ fn macro_segments(
         "right" => 0b10_0000_0000,
         _ => 0,
     };
-    let action_mask = if stable_u64(selected_macro.name.as_bytes(), b"macro-action") % 2 == 0 {
-        0b0000_0001
-    } else {
-        0b0000_0010
-    };
-    let first = target_frames.min(24).max(1);
+    let action_mask =
+        if stable_u64(selected_macro.name.as_bytes(), b"macro-action").is_multiple_of(2) {
+            0b0000_0001
+        } else {
+            0b0000_0010
+        };
+    let first = target_frames.clamp(1, 24);
     let second = target_frames.saturating_sub(first);
     let mut segments = vec![PadSegment {
         buttons: direction_mask | action_mask,

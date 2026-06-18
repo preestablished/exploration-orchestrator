@@ -578,9 +578,11 @@ fn score_state_input(
             duplicate,
             stage: stage(state),
             prune: prune(state),
-            decoded: return_decoded
-                .then(|| decoded_values(state))
-                .unwrap_or_default(),
+            decoded: if return_decoded {
+                decoded_values(state)
+            } else {
+                Vec::new()
+            },
             component_breakdown: component_breakdown(state),
             novelty_detail: NoveltyDetail {
                 count_novelty,

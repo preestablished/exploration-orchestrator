@@ -391,9 +391,8 @@ impl HypervisorWorkerClient for FakeHypervisor {
             &slot.input_log,
         );
         let capture = capture_response(slot.state, slot.frame_counter, request.capture.as_ref())?;
-        let dirty_pages = 1u32
-            .checked_add(u32::try_from(slot.input_log.len()).unwrap_or(u32::MAX - 1))
-            .unwrap_or(u32::MAX);
+        let dirty_pages =
+            1u32.saturating_add(u32::try_from(slot.input_log.len()).unwrap_or(u32::MAX - 1));
 
         self.snapshots.insert(
             snapshot,

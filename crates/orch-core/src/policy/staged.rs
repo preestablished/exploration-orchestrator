@@ -50,30 +50,58 @@ impl SelectionPolicy for StagedPolicy {
         let target_stage = target_stage_from_tree(context.tree)?;
         select_from_candidates(
             &candidates,
-            target_stage,
-            context.selection.staged.inner,
-            context.selection.staged.epsilon_regress,
-            context.selection.temperature,
-            context.selection.ucb_c,
-            self.total_expansions,
+            StagedSelectionParams::new(
+                target_stage,
+                context.selection.staged.inner,
+                context.selection.staged.epsilon_regress,
+                context.selection.temperature,
+                context.selection.ucb_c,
+                self.total_expansions,
+            ),
             rng,
         )
     }
 }
 
-pub(crate) fn select_from_candidates(
-    candidates: &[CandidateSnapshot],
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StagedSelectionParams {
     target_stage: Stage,
     inner: PolicyKind,
     epsilon_regress: f64,
     temperature: f64,
     ucb_c: f64,
     total_expansions: u64,
+}
+
+impl StagedSelectionParams {
+    #[must_use]
+    pub(crate) const fn new(
+        target_stage: Stage,
+        inner: PolicyKind,
+        epsilon_regress: f64,
+        temperature: f64,
+        ucb_c: f64,
+        total_expansions: u64,
+    ) -> Self {
+        Self {
+            target_stage,
+            inner,
+            epsilon_regress,
+            temperature,
+            ucb_c,
+            total_expansions,
+        }
+    }
+}
+
+pub(crate) fn select_from_candidates(
+    candidates: &[CandidateSnapshot],
+    params: StagedSelectionParams,
     rng: &mut DeterministicRng,
 ) -> PolicyResult<SelectionChoice> {
-    validate_staged_config(inner, epsilon_regress)?;
-    let partition = partition_candidates(candidates, target_stage);
-    let regress_mix = rng.next_unit_f64() < epsilon_regress;
+    validate_staged_config(params.inner, params.epsilon_regress)?;
+    let partition = partition_candidates(candidates, params.target_stage);
+    let regress_mix = rng.next_unit_f64() < params.epsilon_regress;
     let selected = match (
         regress_mix,
         partition.regress.is_empty(),
@@ -91,10 +119,10 @@ pub(crate) fn select_from_candidates(
         .collect::<Vec<_>>();
     let inner_choice = dispatch_inner(
         &selected_candidates,
-        inner,
-        temperature,
-        ucb_c,
-        total_expansions,
+        params.inner,
+        params.temperature,
+        params.ucb_c,
+        params.total_expansions,
         rng,
     )?;
     let original = selected[inner_choice.candidate_index];
@@ -203,12 +231,7 @@ mod tests {
 
         let choice = select_from_candidates(
             &candidates,
-            Stage::new(2),
-            PolicyKind::Ucb,
-            0.0,
-            1.0,
-            0.0,
-            64,
+            params(Stage::new(2), PolicyKind::Ucb, 0.0, 1.0, 0.0, 64),
             &mut rng,
         )
         .unwrap();
@@ -229,12 +252,7 @@ mod tests {
 
         let choice = select_from_candidates(
             &candidates,
-            Stage::new(2),
-            PolicyKind::Ucb,
-            1.0,
-            1.0,
-            0.0,
-            64,
+            params(Stage::new(2), PolicyKind::Ucb, 1.0, 1.0, 0.0, 64),
             &mut rng,
         )
         .unwrap();
@@ -251,12 +269,7 @@ mod tests {
 
         let choice = select_from_candidates(
             &candidates,
-            Stage::new(2),
-            PolicyKind::Ucb,
-            0.05,
-            1.0,
-            0.0,
-            64,
+            params(Stage::new(2), PolicyKind::Ucb, 0.05, 1.0, 0.0, 64),
             &mut rng,
         )
         .unwrap();
@@ -273,12 +286,7 @@ mod tests {
 
         let choice = select_from_candidates(
             &candidates,
-            Stage::new(2),
-            PolicyKind::Ucb,
-            0.05,
-            1.0,
-            0.0,
-            64,
+            params(Stage::new(2), PolicyKind::Ucb, 0.05, 1.0, 0.0, 64),
             &mut rng,
         )
         .unwrap();
@@ -295,12 +303,7 @@ mod tests {
 
         let choice = select_from_candidates(
             &candidates,
-            Stage::new(2),
-            PolicyKind::Ucb,
-            1.0,
-            1.0,
-            0.0,
-            64,
+            params(Stage::new(2), PolicyKind::Ucb, 1.0, 1.0, 0.0, 64),
             &mut rng,
         )
         .unwrap();
@@ -318,12 +321,7 @@ mod tests {
         assert_eq!(
             select_from_candidates(
                 &candidates,
-                Stage::new(1),
-                PolicyKind::Staged,
-                0.05,
-                1.0,
-                1.0,
-                64,
+                params(Stage::new(1), PolicyKind::Staged, 0.05, 1.0, 1.0, 64),
                 &mut rng
             ),
             Err(PolicyError::InvalidConfig {
@@ -393,12 +391,7 @@ mod tests {
 
         let _choice = select_from_candidates(
             &candidates,
-            Stage::new(2),
-            PolicyKind::Softmax,
-            0.0,
-            1.0,
-            1.0,
-            64,
+            params(Stage::new(2), PolicyKind::Softmax, 0.0, 1.0, 1.0, 64),
             &mut rng,
         )
         .unwrap();
@@ -419,6 +412,24 @@ mod tests {
             priority_terms: super::super::PriorityTerms::new(priority, 0.0, 0.0, 0.0),
             priority,
         }
+    }
+
+    fn params(
+        target_stage: Stage,
+        inner: PolicyKind,
+        epsilon_regress: f64,
+        temperature: f64,
+        ucb_c: f64,
+        total_expansions: u64,
+    ) -> StagedSelectionParams {
+        StagedSelectionParams::new(
+            target_stage,
+            inner,
+            epsilon_regress,
+            temperature,
+            ucb_c,
+            total_expansions,
+        )
     }
 
     fn sample_tree() -> (Tree, [NodeId; 3]) {
