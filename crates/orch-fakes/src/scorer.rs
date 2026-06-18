@@ -240,12 +240,8 @@ impl StateScorerClient for FakeScorer {
             archive_ref,
             archive_hash,
             archive_seq: snapshot.archive_seq,
-            cell_count: snapshot
-                .cell_counts
-                .values()
-                .map(|count| u64::from(*count))
-                .sum(),
-            phash_count: snapshot.seen_hashes.len() as u64,
+            cell_count: snapshot.cell_counts.len() as u64,
+            phash_count: 0,
             embedding_count: 0,
             blob_bytes: postcard::to_allocvec(&snapshot)
                 .expect("snapshot serializes")
@@ -266,16 +262,20 @@ impl StateScorerClient for FakeScorer {
             ClientError::new(ClientErrorKind::NotFound, "archive checkpoint not found")
         })?;
         let archive = self.archive_mut(&request.experiment_id);
+        if archive.feature_map_hash != Some(snapshot.feature_map_hash)
+            || archive.program_hash != Some(snapshot.program_hash)
+        {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                "loaded scorer artifacts do not match archive checkpoint bindings",
+            ));
+        }
         archive.restore(snapshot.clone());
 
         Ok(RestoreArchiveResponse {
             archive_seq: snapshot.archive_seq,
-            cell_count: snapshot
-                .cell_counts
-                .values()
-                .map(|count| u64::from(*count))
-                .sum(),
-            phash_count: snapshot.seen_hashes.len() as u64,
+            cell_count: snapshot.cell_counts.len() as u64,
+            phash_count: 0,
             embedding_count: 0,
             bound_feature_map_hash: snapshot.feature_map_hash,
             bound_scoring_program_hash: snapshot.program_hash,
@@ -588,12 +588,12 @@ fn decoded_values(state: GridState) -> Vec<DecodedValue> {
         DecodedValue::Number(finite(f64::from(state.room.id()))),
         DecodedValue::Number(finite(f64::from(state.x))),
         DecodedValue::Number(finite(f64::from(state.y))),
+        DecodedValue::Number(finite(f64::from(state.keys))),
         if state.boss_hp == 0 {
             DecodedValue::Invalid
         } else {
             DecodedValue::Number(finite(f64::from(state.boss_hp)))
         },
-        DecodedValue::Number(finite(u8::from(state.goal_reached()).into())),
     ]
 }
 
@@ -780,9 +780,19 @@ mod tests {
         assert_eq!(response.results[2].stage, Stage::new(4));
         assert!(response.results[2].goal_hit);
         assert_eq!(
-            response.results[2].decoded[3],
-            DecodedValue::Invalid,
-            "boss_hp decode uses Invalid instead of a non-finite sentinel"
+            response.results[1].decoded[3],
+            DecodedValue::Number(finite(f64::from(KEY_BOSS_DOOR)))
+        );
+        assert_eq!(
+            response.results[2].decoded,
+            vec![
+                DecodedValue::Number(finite(f64::from(Room::Boss.id()))),
+                DecodedValue::Number(finite(4.0)),
+                DecodedValue::Number(finite(0.0)),
+                DecodedValue::Number(finite(f64::from(KEY_BOSS_DOOR))),
+                DecodedValue::Invalid,
+            ],
+            "decoded values follow [room, x, y, keys, boss_hp] capture order"
         );
         assert_eq!(
             response.results[0].component_breakdown[0].name,
@@ -852,6 +862,8 @@ mod tests {
                 checkpoint_id: "cp1".to_owned(),
             })
             .expect("checkpoint");
+        assert_eq!(checkpoint.cell_count, 1);
+        assert_eq!(checkpoint.phash_count, 0);
         scorer
             .score_batch(score_request("b2", [state_b]))
             .expect("score b");
@@ -882,6 +894,8 @@ mod tests {
             .expect("score b after replay");
 
         assert_eq!(restored.archive_seq, checkpoint.archive_seq);
+        assert_eq!(restored.cell_count, 1);
+        assert_eq!(restored.phash_count, 0);
         assert_eq!(replay.applied, 1);
         assert_eq!(replay.skipped, 1);
         assert_eq!(
@@ -916,6 +930,41 @@ mod tests {
         assert_eq!(rebin.warnings, ["rebin reset fake scorer cell counts"]);
         assert!(after_rebin.results[0].duplicate);
         assert_eq!(after_rebin.results[0].novelty_detail.cell_count, 0);
+    }
+
+    #[test]
+    fn scorer_restore_rejects_loaded_artifact_binding_mismatch_without_mutation() {
+        let mut scorer = loaded_scorer();
+        let state = grid_state(0, 2, Room::Start, 0, BOSS_MAX_HP);
+        scorer
+            .score_batch(score_request("b1", [state]))
+            .expect("initial score");
+        let checkpoint = scorer
+            .checkpoint_archive(CheckpointArchiveRequest {
+                experiment_id: "exp-a".to_owned(),
+                checkpoint_id: "cp1".to_owned(),
+            })
+            .expect("checkpoint");
+        scorer
+            .load_feature_map(LoadFeatureMapRequest {
+                experiment_id: "exp-a".to_owned(),
+                source: ArtifactSource::InlineYaml(b"feature-map: fake-v2".to_vec()),
+                layout: sample_layout(),
+                frame: Some(sample_frame()),
+                rebin: true,
+            })
+            .expect("rebin feature map");
+
+        let error = scorer
+            .restore_archive(RestoreArchiveRequest {
+                experiment_id: "exp-a".to_owned(),
+                checkpoint_id: "cp1".to_owned(),
+                archive_ref: checkpoint.archive_ref,
+            })
+            .expect_err("restore should reject mismatched loaded bindings");
+
+        assert_eq!(error.kind(), ClientErrorKind::FailedPrecondition);
+        assert_eq!(scorer.archive_seq("exp-a"), Some(1));
     }
 
     fn loaded_scorer() -> FakeScorer {
