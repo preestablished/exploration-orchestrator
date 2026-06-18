@@ -205,6 +205,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orch-fakes"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "orch-clients",
+ "orch-core",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "orch-proto"
 version = "0.1.0"
 dependencies = [
