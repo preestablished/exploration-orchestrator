@@ -13,7 +13,9 @@
 use orch_core::types::{FrameCount, GuestInstructions, SnapshotRef, StateHash};
 use serde::{Deserialize, Serialize};
 
-use crate::ClientResult;
+pub use crate::snapshot_store::{InputLogId, INPUT_LOG_ID_LEN};
+
+use crate::{ClientError, ClientErrorKind, ClientResult};
 
 pub trait HypervisorWorkerClient {
     fn create_vm(&mut self, request: CreateVmRequest) -> ClientResult<CreateVmResponse>;
@@ -37,11 +39,11 @@ pub trait HypervisorWorkerClient {
 
     fn list_slots(&self, request: ListSlotsRequest) -> ClientResult<ListSlotsResponse>;
 
-    /// Returns a transport-adapter batch of slot transitions.
+    /// Returns the next transport-adapter batch from one slot-watch subscription.
     ///
-    /// The owner API streams `SlotEvent`s. This trait keeps clients
-    /// transport-free by representing the adapter's currently available logical
-    /// batch as one response.
+    /// The owner API streams `SlotEvent`s. This trait keeps clients transport-free
+    /// by representing a drained logical batch as one response; implementations
+    /// must not synthesize watch results by repeatedly polling `ListSlots`.
     fn watch_slots(&self, request: WatchSlotsRequest) -> ClientResult<WatchSlotsResponse>;
 
     fn worker_info(&self, request: GetWorkerInfoRequest) -> ClientResult<GetWorkerInfoResponse>;
@@ -80,6 +82,40 @@ pub struct ForkRequest {
     pub entropy_seeds: Vec<EntropySeed>,
 }
 
+impl ForkRequest {
+    pub fn new(parent: Lease, entropy_seeds: Vec<EntropySeed>) -> ClientResult<Self> {
+        let count = u32::try_from(entropy_seeds.len()).map_err(|_| {
+            ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "fork entropy seed count exceeds u32",
+            )
+        })?;
+        let request = Self {
+            parent,
+            count,
+            entropy_seeds,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> ClientResult<()> {
+        if self.count == 0 {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "fork count must be nonzero",
+            ));
+        }
+        if self.entropy_seeds.len() != self.count as usize {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "fork entropy seed count must match fork count",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkResponse {
     pub children: Vec<Lease>,
@@ -112,13 +148,20 @@ pub struct RunRequest {
     pub capture: Option<CaptureSpec>,
 }
 
+impl RunRequest {
+    #[must_use]
+    pub fn hard_icount_cap_wire_value(&self) -> u64 {
+        self.hard_icount_cap.map_or(0, GuestInstructions::get)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResponse {
     pub reason: StopReason,
     pub icount: GuestInstructions,
     pub vns: u64,
     pub state_hash: StateHash,
-    pub frames_elapsed: FrameCount,
+    pub frames_elapsed: u64,
     pub sdk_event: Option<GuestEvent>,
     pub feature_bytes: Option<Vec<u8>>,
     pub fb_lz4: Option<Vec<u8>>,
@@ -135,7 +178,7 @@ pub struct TakeSnapshotRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TakeSnapshotResponse {
     pub snapshot: SnapshotRef,
-    pub input_log_id: InputLogId,
+    pub input_log_id: Option<InputLogId>,
     pub icount: GuestInstructions,
     pub vns: u64,
     pub state_hash: StateHash,
@@ -188,6 +231,7 @@ pub struct Lease {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SlotId(pub u64);
 
 impl SlotId {
@@ -205,6 +249,7 @@ impl SlotId {
 pub const LEASE_TOKEN_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct LeaseToken(pub [u8; LEASE_TOKEN_LEN]);
 
 impl LeaseToken {
@@ -227,6 +272,7 @@ impl LeaseToken {
 pub const ENTROPY_SEED_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EntropySeed(pub [u8; ENTROPY_SEED_LEN]);
 
 impl EntropySeed {
@@ -249,6 +295,7 @@ impl EntropySeed {
 pub const DIGEST32_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Digest32(pub [u8; DIGEST32_LEN]);
 
 impl Digest32 {
@@ -264,28 +311,6 @@ impl Digest32 {
 
     #[must_use]
     pub const fn into_bytes(self) -> [u8; DIGEST32_LEN] {
-        self.0
-    }
-}
-
-pub const INPUT_LOG_ID_LEN: usize = 32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct InputLogId(pub [u8; INPUT_LOG_ID_LEN]);
-
-impl InputLogId {
-    #[must_use]
-    pub const fn new(bytes: [u8; INPUT_LOG_ID_LEN]) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; INPUT_LOG_ID_LEN] {
-        &self.0
-    }
-
-    #[must_use]
-    pub const fn into_bytes(self) -> [u8; INPUT_LOG_ID_LEN] {
         self.0
     }
 }
@@ -418,6 +443,13 @@ pub struct GoalCondition {
     pub poll_period: Option<GuestInstructions>,
 }
 
+impl GoalCondition {
+    #[must_use]
+    pub fn poll_period_wire_value(&self) -> u64 {
+        self.poll_period.map_or(0, GuestInstructions::get)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemPredicate {
     pub gpa: u64,
@@ -524,14 +556,14 @@ mod tests {
             snapshot: SNAPSHOT,
             entropy_seed: None,
         };
-        let fork = ForkRequest {
-            parent: sample_lease(1, 0x10),
-            count: 2,
-            entropy_seeds: vec![
+        let fork = ForkRequest::new(
+            sample_lease(1, 0x10),
+            vec![
                 EntropySeed::new([0x20; ENTROPY_SEED_LEN]),
                 EntropySeed::new([0x21; ENTROPY_SEED_LEN]),
             ],
-        };
+        )
+        .expect("valid fork request");
 
         assert_eq!(create.config.vcpus, 1);
         assert_eq!(create.config.epoch_len, GuestInstructions::new(50_000_000));
@@ -581,7 +613,7 @@ mod tests {
             icount: GuestInstructions::new(1_234_000),
             vns: 1_234_000,
             state_hash: STATE,
-            frames_elapsed: FrameCount::new(4),
+            frames_elapsed: 4,
             sdk_event: None,
             feature_bytes: Some(vec![1, 2, 3, 4]),
             fb_lz4: Some(vec![0xAA, 0xBB]),
@@ -593,8 +625,9 @@ mod tests {
             request.hard_icount_cap,
             Some(GuestInstructions::new(2_000_000))
         );
+        assert_eq!(request.hard_icount_cap_wire_value(), 2_000_000);
         assert_eq!(response.reason, StopReason::BudgetReached);
-        assert_eq!(response.frames_elapsed, FrameCount::new(4));
+        assert_eq!(response.frames_elapsed, 4);
         assert_eq!(
             response.fb_info.expect("fb info").frame_counter,
             FrameCount::new(904)
@@ -605,7 +638,7 @@ mod tests {
     fn hypervisor_snapshot_response_carries_digests_and_capture_meta() {
         let response = TakeSnapshotResponse {
             snapshot: SNAPSHOT,
-            input_log_id: LOG_ID,
+            input_log_id: Some(LOG_ID),
             icount: GuestInstructions::new(9_000_000),
             vns: 9_000_000,
             state_hash: STATE,
@@ -619,7 +652,10 @@ mod tests {
         };
 
         assert_eq!(response.snapshot, SNAPSHOT);
-        assert_eq!(response.input_log_id.as_bytes(), &[0x44; INPUT_LOG_ID_LEN]);
+        assert_eq!(
+            response.input_log_id.expect("sealed log").as_bytes(),
+            &[0x44; INPUT_LOG_ID_LEN]
+        );
         assert_eq!(response.state_hash, STATE);
         assert_eq!(response.machine_config_hash, MACHINE_HASH);
         assert_eq!(
@@ -631,6 +667,27 @@ mod tests {
             response.fb_info.expect("fb info").format,
             PixelFormat::Xrgb8888
         );
+        assert_eq!(response.frame_counter, FrameCount::new(904));
+    }
+
+    #[test]
+    fn hypervisor_snapshot_response_can_represent_unsealed_log() {
+        let response = TakeSnapshotResponse {
+            snapshot: SNAPSHOT,
+            input_log_id: None,
+            icount: GuestInstructions::new(9_000_000),
+            vns: 9_000_000,
+            state_hash: STATE,
+            dirty_pages: 12,
+            machine_config_hash: MACHINE_HASH,
+            determinism_class: sample_class(),
+            feature_bytes: None,
+            fb_lz4: None,
+            fb_info: None,
+            frame_counter: FrameCount::new(904),
+        };
+
+        assert_eq!(response.input_log_id, None);
         assert_eq!(response.frame_counter, FrameCount::new(904));
     }
 
@@ -673,10 +730,94 @@ mod tests {
     }
 
     #[test]
+    fn hypervisor_wire_default_helpers_match_owner_scalar_defaults() {
+        let request = RunRequest {
+            lease: sample_lease(5, 0x55),
+            until: RunUntil::Goal(GoalCondition {
+                all_of: vec![MemPredicate {
+                    gpa: 0x1000,
+                    width: 4,
+                    mask: u64::MAX,
+                    op: PredicateOp::Eq,
+                    value: 1,
+                }],
+                poll_period: None,
+            }),
+            hard_icount_cap: None,
+            capture: None,
+        };
+
+        assert_eq!(request.hard_icount_cap_wire_value(), 0);
+        let RunUntil::Goal(goal) = &request.until else {
+            panic!("expected goal run");
+        };
+        assert_eq!(goal.poll_period_wire_value(), 0);
+
+        let with_values = RunRequest {
+            hard_icount_cap: Some(GuestInstructions::new(9_000)),
+            until: RunUntil::Goal(GoalCondition {
+                all_of: Vec::new(),
+                poll_period: Some(GuestInstructions::new(1_000)),
+            }),
+            ..request
+        };
+
+        assert_eq!(with_values.hard_icount_cap_wire_value(), 9_000);
+        let RunUntil::Goal(goal) = &with_values.until else {
+            panic!("expected goal run");
+        };
+        assert_eq!(goal.poll_period_wire_value(), 1_000);
+    }
+
+    #[test]
+    fn hypervisor_fork_request_validates_seed_count() {
+        let valid = ForkRequest::new(
+            sample_lease(6, 0x66),
+            vec![EntropySeed::new([0x30; ENTROPY_SEED_LEN])],
+        )
+        .expect("valid fork request");
+
+        assert_eq!(valid.count, 1);
+        assert!(valid.validate().is_ok());
+
+        let invalid = ForkRequest {
+            parent: sample_lease(6, 0x66),
+            count: 2,
+            entropy_seeds: vec![EntropySeed::new([0x30; ENTROPY_SEED_LEN])],
+        };
+        let error = invalid.validate().expect_err("mismatched seed count");
+        assert_eq!(error.kind(), ClientErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn hypervisor_enum_wire_order_is_stable() {
+        assert_eq!(
+            postcard::to_allocvec(&HashEpochs::EpochsOn).expect("hash epochs"),
+            vec![1]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&PixelFormat::Xrgb8888).expect("pixel format"),
+            vec![1]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&PredicateOp::Eq).expect("predicate op"),
+            vec![1]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&StopReason::BudgetReached).expect("stop reason"),
+            vec![1]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&SlotState::Paused).expect("slot state"),
+            vec![2]
+        );
+    }
+
+    #[test]
     fn hypervisor_dtos_round_trip_with_postcard() {
         let response = TakeSnapshotResponse {
             snapshot: SNAPSHOT,
-            input_log_id: LOG_ID,
+            input_log_id: Some(LOG_ID),
             icount: GuestInstructions::new(9_000_000),
             vns: 9_000_000,
             state_hash: STATE,
