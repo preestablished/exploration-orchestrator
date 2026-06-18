@@ -12,7 +12,7 @@
 use orch_core::types::{NodeId, NodeStatus, Novelty, Score, SnapshotRef};
 use serde::{Deserialize, Serialize};
 
-use crate::ClientResult;
+use crate::{ClientError, ClientErrorKind, ClientResult};
 
 pub trait SnapshotStoreClient {
     fn create_node(&mut self, request: CreateNodeRequest) -> ClientResult<CreateNodeResponse>;
@@ -25,6 +25,12 @@ pub trait SnapshotStoreClient {
 
     fn get_path(&self, request: GetPathRequest) -> ClientResult<GetPathResponse>;
 
+    /// Returns the complete logical result set for the query.
+    ///
+    /// Real transport adapters must drain every streamed `QueryNodesResponse` page
+    /// from the owner API before returning. Resume-style pagination is expressed by
+    /// issuing a new request with `created_after` or `updated_after` set to the last
+    /// logical counter consumed by the caller.
     fn query_nodes(&self, request: QueryNodesRequest) -> ClientResult<QueryNodesResponse>;
 
     fn put_metadata(&mut self, request: PutMetadataRequest) -> ClientResult<PutMetadataResponse>;
@@ -71,6 +77,48 @@ pub struct CreateNodeRequest {
     pub novelty_score: Novelty,
     pub attrs: NodeAttrs,
     pub input_log_container: Option<Vec<u8>>,
+}
+
+impl CreateNodeRequest {
+    pub fn validate(&self) -> ClientResult<()> {
+        if self.node_id.is_root() {
+            if self.parent_node_id.is_some() {
+                return Err(ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    "root node must not have a parent",
+                ));
+            }
+            if self.input_log_id.is_some() || self.input_log_container.is_some() {
+                return Err(ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    "root node must not have an input log",
+                ));
+            }
+        } else if self.parent_node_id.is_none() {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "non-root node must have a parent",
+            ));
+        }
+
+        if self.input_log_id.is_some() && self.input_log_container.is_some() {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "input_log_id and input_log_container are mutually exclusive",
+            ));
+        }
+        if !self.node_id.is_root()
+            && self.input_log_id.is_none()
+            && self.input_log_container.is_none()
+        {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "non-root node must provide an input log id or inline log container",
+            ));
+        }
+
+        self.attrs.validate()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -152,6 +200,20 @@ pub struct QueryNodesRequest {
     pub limit: Option<u32>,
 }
 
+impl QueryNodesRequest {
+    #[must_use]
+    pub fn resume_created_after(mut self, created_at: u64) -> Self {
+        self.created_after = Some(created_at);
+        self
+    }
+
+    #[must_use]
+    pub fn resume_updated_after(mut self, updated_at: u64) -> Self {
+        self.updated_after = Some(updated_at);
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryNodesResponse {
     pub nodes: Vec<NodeMeta>,
@@ -161,7 +223,7 @@ pub struct QueryNodesResponse {
 pub struct PutMetadataRequest {
     pub key: MetadataKey,
     pub value: Vec<u8>,
-    pub expected_generation: Option<MetadataGeneration>,
+    pub expected_generation: MetadataExpectation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,7 +245,7 @@ pub struct GetMetadataResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteMetadataRequest {
     pub key: MetadataKey,
-    pub expected_generation: Option<MetadataGeneration>,
+    pub expected_generation: MetadataExpectation,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,9 +269,29 @@ pub struct NodeAttrs(pub Vec<u8>);
 impl NodeAttrs {
     pub const MAX_BYTES: usize = 16 * 1024 * 1024;
 
+    pub fn new(bytes: Vec<u8>) -> ClientResult<Self> {
+        if bytes.len() > Self::MAX_BYTES {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "node attrs exceed 16 MiB",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+
     #[must_use]
-    pub fn new(bytes: Vec<u8>) -> Self {
+    pub fn from_trusted_bytes(bytes: Vec<u8>) -> Self {
         Self(bytes)
+    }
+
+    pub fn validate(&self) -> ClientResult<()> {
+        if self.0.len() > Self::MAX_BYTES {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "node attrs exceed 16 MiB",
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -292,6 +374,40 @@ impl MetadataGeneration {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MetadataExpectation {
+    #[default]
+    Unconditional,
+    CreateOnly,
+    Generation(MetadataGeneration),
+}
+
+impl MetadataExpectation {
+    #[must_use]
+    pub const fn unconditional() -> Self {
+        Self::Unconditional
+    }
+
+    #[must_use]
+    pub const fn create_only() -> Self {
+        Self::CreateOnly
+    }
+
+    #[must_use]
+    pub const fn generation(generation: MetadataGeneration) -> Self {
+        Self::Generation(generation)
+    }
+
+    #[must_use]
+    pub const fn wire_generation(self) -> Option<MetadataGeneration> {
+        match self {
+            Self::Unconditional => None,
+            Self::CreateOnly => Some(MetadataGeneration::CREATE_ONLY),
+            Self::Generation(generation) => Some(generation),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderBy {
     CreatedAt,
@@ -309,7 +425,7 @@ mod tests {
 
     #[test]
     fn snapshot_store_node_meta_carries_status_and_attrs_boundaries() {
-        let attrs = NodeAttrs::new(vec![1, 2, 3, 4]);
+        let attrs = NodeAttrs::new(vec![1, 2, 3, 4]).unwrap();
         let node = sample_node(
             NodeId::new(7),
             Some(NodeId::ROOT),
@@ -340,9 +456,10 @@ mod tests {
             status: NodeStatus::Frontier,
             progress_score: score(11.0),
             novelty_score: novelty(0.25),
-            attrs: NodeAttrs::new(vec![9, 9]),
+            attrs: NodeAttrs::new(vec![9, 9]).unwrap(),
             input_log_container: None,
         };
+        request.validate().unwrap();
         let response = CreateNodeResponse {
             node: sample_node(
                 request.node_id,
@@ -356,7 +473,38 @@ mod tests {
         assert_eq!(request.parent_node_id, response.node.parent_node_id);
         assert_eq!(request.snapshot_ref, SNAPSHOT_B);
         assert_eq!(request.input_log_id, Some(LOG_A));
-        assert_eq!(request.attrs, NodeAttrs::new(vec![9, 9]));
+        assert_eq!(request.attrs, NodeAttrs::new(vec![9, 9]).unwrap());
+    }
+
+    #[test]
+    fn snapshot_store_create_node_validation_covers_log_and_root_rules() {
+        let root_with_parent = CreateNodeRequest {
+            experiment_id: "exp-a".to_owned(),
+            node_id: NodeId::ROOT,
+            parent_node_id: Some(NodeId::new(1)),
+            snapshot_ref: SNAPSHOT_A,
+            input_log_id: None,
+            status: NodeStatus::Frontier,
+            progress_score: score(0.0),
+            novelty_score: novelty(1.0),
+            attrs: NodeAttrs::new(Vec::new()).unwrap(),
+            input_log_container: None,
+        };
+        let both_logs = CreateNodeRequest {
+            experiment_id: "exp-a".to_owned(),
+            node_id: NodeId::new(9),
+            parent_node_id: Some(NodeId::ROOT),
+            snapshot_ref: SNAPSHOT_B,
+            input_log_id: Some(LOG_A),
+            status: NodeStatus::Frontier,
+            progress_score: score(1.0),
+            novelty_score: novelty(0.5),
+            attrs: NodeAttrs::new(Vec::new()).unwrap(),
+            input_log_container: Some(b"dhi-log".to_vec()),
+        };
+
+        assert!(root_with_parent.validate().is_err());
+        assert!(both_logs.validate().is_err());
     }
 
     #[test]
@@ -371,7 +519,7 @@ mod tests {
                 visit_count_delta: 1,
                 expand_count_delta: 1,
                 touch_visited: true,
-                attrs: Some(NodeAttrs::new(vec![4, 3, 2, 1])),
+                attrs: Some(NodeAttrs::new(vec![4, 3, 2, 1]).unwrap()),
             }],
         };
         let response = UpdateNodesResponse {
@@ -388,6 +536,15 @@ mod tests {
         );
         assert_eq!(response.updated_at, 99);
         assert_eq!(response.applied, 1);
+    }
+
+    #[test]
+    fn snapshot_store_attrs_boundary_is_checked() {
+        assert!(NodeAttrs::new(vec![0; NodeAttrs::MAX_BYTES]).is_ok());
+        let too_large = NodeAttrs::new(vec![0; NodeAttrs::MAX_BYTES + 1])
+            .expect_err("attrs above 16 MiB should fail");
+
+        assert_eq!(too_large.kind(), ClientErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -410,7 +567,7 @@ mod tests {
                 NodeId::new(7),
                 Some(NodeId::ROOT),
                 NodeStatus::Goal,
-                NodeAttrs::new(vec![1]),
+                NodeAttrs::new(vec![1]).unwrap(),
             )],
         };
 
@@ -423,18 +580,74 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_store_query_resume_uses_logical_counter_cursors() {
+        let first_page = QueryNodesRequest {
+            experiment_id: "exp-a".to_owned(),
+            statuses: Vec::new(),
+            min_progress: None,
+            max_progress: None,
+            min_novelty: None,
+            min_depth: None,
+            max_depth: None,
+            created_after: None,
+            updated_after: None,
+            order_by: OrderBy::CreatedAt,
+            limit: Some(512),
+        };
+        let next_page = first_page.clone().resume_created_after(120);
+        let update_resume = first_page.resume_updated_after(220);
+
+        assert_eq!(next_page.created_after, Some(120));
+        assert_eq!(next_page.updated_after, None);
+        assert_eq!(update_resume.updated_after, Some(220));
+        assert_eq!(update_resume.order_by, OrderBy::CreatedAt);
+    }
+
+    #[test]
+    fn snapshot_store_progress_and_novelty_queries_have_stable_tie_breaker_inputs() {
+        let earlier = sample_node(
+            NodeId::new(7),
+            Some(NodeId::ROOT),
+            NodeStatus::Frontier,
+            NodeAttrs::new(vec![7]).unwrap(),
+        );
+        let later = sample_node(
+            NodeId::new(8),
+            Some(NodeId::ROOT),
+            NodeStatus::Frontier,
+            NodeAttrs::new(vec![8]).unwrap(),
+        );
+        let request = QueryNodesRequest {
+            experiment_id: "exp-a".to_owned(),
+            statuses: vec![NodeStatus::Frontier],
+            min_progress: Some(score(10.0)),
+            max_progress: None,
+            min_novelty: None,
+            min_depth: None,
+            max_depth: None,
+            created_after: None,
+            updated_after: None,
+            order_by: OrderBy::ProgressDesc,
+            limit: None,
+        };
+
+        assert_eq!(request.order_by, OrderBy::ProgressDesc);
+        assert!(earlier.created_at < later.created_at || earlier.node_id < later.node_id);
+    }
+
+    #[test]
     fn snapshot_store_path_children_and_prune_shapes_match_tree_reads() {
         let root = sample_node(
             NodeId::ROOT,
             None,
             NodeStatus::Expanded,
-            NodeAttrs::new(vec![]),
+            NodeAttrs::new(vec![]).unwrap(),
         );
         let child = sample_node(
             NodeId::new(7),
             Some(NodeId::ROOT),
             NodeStatus::Pruned,
-            NodeAttrs::new(vec![7]),
+            NodeAttrs::new(vec![7]).unwrap(),
         );
         let path = GetPathResponse {
             nodes: vec![root.clone(), child.clone()],
@@ -464,7 +677,7 @@ mod tests {
         let put = PutMetadataRequest {
             key: ckpt_key.clone(),
             value: b"checkpoint-v1".to_vec(),
-            expected_generation: Some(MetadataGeneration::CREATE_ONLY),
+            expected_generation: MetadataExpectation::create_only(),
         };
         let put_response = PutMetadataResponse {
             generation: MetadataGeneration::new(1),
@@ -475,18 +688,23 @@ mod tests {
         };
         let delete = DeleteMetadataRequest {
             key: wal_key.clone(),
-            expected_generation: Some(MetadataGeneration::new(7)),
+            expected_generation: MetadataExpectation::generation(MetadataGeneration::new(7)),
         };
+        let unconditional = MetadataExpectation::unconditional();
 
         assert_eq!(ckpt_key.as_str(), "orch/ckpt/exp-a");
         assert_eq!(wal_key.as_str(), "orch/wal/exp-a/00000000000000000042");
         assert_eq!(
-            put.expected_generation,
+            put.expected_generation.wire_generation(),
             Some(MetadataGeneration::CREATE_ONLY)
         );
         assert_eq!(put_response.generation.get(), 1);
         assert_eq!(get_response.value, b"checkpoint-v1");
-        assert_eq!(delete.expected_generation.unwrap().get(), 7);
+        assert_eq!(
+            delete.expected_generation.wire_generation().unwrap().get(),
+            7
+        );
+        assert_eq!(unconditional.wire_generation(), None);
     }
 
     #[test]
@@ -496,7 +714,7 @@ mod tests {
                 NodeId::new(7),
                 Some(NodeId::ROOT),
                 NodeStatus::Frontier,
-                NodeAttrs::new(vec![1, 2, 3]),
+                NodeAttrs::new(vec![1, 2, 3]).unwrap(),
             )],
         };
         let encoded = postcard::to_allocvec(&response).expect("serialize query response");
