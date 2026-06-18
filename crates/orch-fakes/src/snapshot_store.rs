@@ -93,7 +93,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
     fn create_node(&mut self, request: CreateNodeRequest) -> ClientResult<CreateNodeResponse> {
         self.decide_fault("create_node", request_identity(&request), 0)?;
         request.validate()?;
-        let requested_input_log_id = resolved_input_log_id(&request);
+        let requested_input_log_id = resolved_input_log_id(&request)?;
 
         if let Some(experiment) = self.experiments.get(&request.experiment_id) {
             if let Some(existing) = experiment.nodes.get(&request.node_id) {
@@ -550,13 +550,34 @@ fn apply_update(node: &mut StoredNode, update: NodeUpdate, updated_at: u64) -> C
     Ok(())
 }
 
-fn resolved_input_log_id(request: &CreateNodeRequest) -> Option<InputLogId> {
-    request.input_log_id.or_else(|| {
-        request
-            .input_log_container
-            .as_ref()
-            .map(|container| InputLogId::new(*blake3::hash(container).as_bytes()))
-    })
+fn resolved_input_log_id(request: &CreateNodeRequest) -> ClientResult<Option<InputLogId>> {
+    if let Some(input_log_id) = request.input_log_id {
+        return Ok(Some(input_log_id));
+    }
+
+    request
+        .input_log_container
+        .as_ref()
+        .map(|container| {
+            if container.len() < blake3::OUT_LEN {
+                return Err(ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    "input log container is missing footer",
+                ));
+            }
+
+            let canonical_len = container.len() - blake3::OUT_LEN;
+            let expected = blake3::hash(&container[..canonical_len]);
+            if container[canonical_len..] != expected.as_bytes()[..] {
+                return Err(ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    "input log container footer mismatch",
+                ));
+            }
+
+            Ok(InputLogId::new(*expected.as_bytes()))
+        })
+        .transpose()
 }
 
 fn check_metadata_expectation(
@@ -712,7 +733,8 @@ mod tests {
     #[test]
     fn snapshot_store_inline_input_log_id_is_content_addressed() {
         let mut store = InMemorySnapshotStore::new();
-        let container = b"same-log-container".to_vec();
+        let canonical = b"same-log-container".to_vec();
+        let container = input_log_container(canonical.clone());
         store.create_node(root_request(EXP_A)).unwrap();
         store.create_node(root_request(EXP_B)).unwrap();
 
@@ -734,10 +756,20 @@ mod tests {
             ))
             .unwrap()
             .node;
-        let expected = InputLogId::new(*blake3::hash(&container).as_bytes());
+        let expected = InputLogId::new(*blake3::hash(&canonical).as_bytes());
 
         assert_eq!(first.input_log_id, Some(expected));
         assert_eq!(second.input_log_id, Some(expected));
+
+        let malformed = store
+            .create_node(child_with_container(
+                EXP_A,
+                2,
+                NodeId::ROOT,
+                b"missing-footer".to_vec(),
+            ))
+            .expect_err("inline containers must carry a valid footer");
+        assert_eq!(malformed.kind(), ClientErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -921,7 +953,10 @@ mod tests {
         );
         assert_eq!(
             path.input_log_containers,
-            vec![b"log-1".to_vec(), b"log-2".to_vec()]
+            vec![
+                input_log_container(b"log-1".to_vec()),
+                input_log_container(b"log-2".to_vec()),
+            ]
         );
         assert_eq!(prune.nodes_pruned, 2);
         assert_eq!(
@@ -1160,7 +1195,8 @@ mod tests {
             progress_score: score(progress),
             novelty_score: novelty(1.0 / (node_id as f64 + 1.0)),
             attrs: NodeAttrs::new(format!("node-{node_id}").into_bytes()).unwrap(),
-            input_log_container: (node_id != 3).then(|| format!("log-{node_id}").into_bytes()),
+            input_log_container: (node_id != 3)
+                .then(|| input_log_container(format!("log-{node_id}").into_bytes())),
         }
     }
 
@@ -1182,6 +1218,12 @@ mod tests {
             attrs: NodeAttrs::new(Vec::new()).unwrap(),
             input_log_container: Some(container),
         }
+    }
+
+    fn input_log_container(mut canonical: Vec<u8>) -> Vec<u8> {
+        let footer = blake3::hash(&canonical);
+        canonical.extend_from_slice(footer.as_bytes());
+        canonical
     }
 
     fn score(value: f64) -> Score {
