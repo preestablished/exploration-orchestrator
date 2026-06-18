@@ -59,7 +59,7 @@ pub(crate) fn select_from_candidates(
 
     for (index, candidate) in candidates.iter().enumerate().skip(1) {
         let value = ucb_value(candidate, total_expansions, ucb_c)?;
-        if value > best.2 {
+        if value > best.2 || (value == best.2 && candidate.id < best.1.id) {
             best = (index, candidate, value);
         }
     }
@@ -132,12 +132,12 @@ mod tests {
 
     #[test]
     fn ucb_ties_choose_smallest_node_id() {
-        let candidates = [candidate(1, 2.0, 4), candidate(2, 2.0, 4)];
+        let candidates = [candidate(2, 2.0, 4), candidate(1, 2.0, 4)];
 
         let choice = select_from_candidates(&candidates, 64, 1.25).unwrap();
 
         assert_eq!(choice.selected, NodeId::new(1));
-        assert_eq!(choice.candidate_index, 0);
+        assert_eq!(choice.candidate_index, 1);
     }
 
     #[test]
@@ -173,7 +173,7 @@ mod tests {
         let choice = policy.select(&context, &mut rng).unwrap();
 
         assert_eq!(policy.kind(), PolicyKind::Ucb);
-        assert!(ids.contains(&choice.selected));
+        assert_eq!(choice.selected, ids[2]);
         assert_eq!(rng.draw_count(), before);
         assert_eq!(policy.total_expansions(), 128);
     }
