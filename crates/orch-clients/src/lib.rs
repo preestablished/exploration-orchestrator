@@ -106,17 +106,7 @@ pub mod input_synth;
 
 pub mod scorer;
 
-pub mod snapshot_store {
-    //! Snapshot-store client boundary.
-    //!
-    //! Owner docs: `../determinism-hypervisor/.agents/docs/snapshot-store/API.md`
-    //! sections 1.4-1.5 and
-    //! `../determinism-hypervisor/.agents/docs/snapshot-store/INTEGRATION.md`
-    //! sections 2.2-2.3; current skeletal proto lives at
-    //! `../control-plane/proto/determinism/snapstore/v1/snapshot_store.proto`.
-    //! This module will mirror tree node, subtree prune, path/query, metadata CAS,
-    //! checkpoint, WAL, and private node-attribute shapes from the owner API.
-}
+pub mod snapshot_store;
 
 #[cfg(test)]
 mod tests {
