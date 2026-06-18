@@ -90,17 +90,7 @@ impl fmt::Display for ClientError {
 
 impl Error for ClientError {}
 
-pub mod hypervisor {
-    //! Hypervisor worker client boundary.
-    //!
-    //! Owner docs: `../determinism-hypervisor/.agents/docs/determinism-hypervisor/API.md`
-    //! section 2 and `../determinism-hypervisor/.agents/docs/determinism-hypervisor/INTEGRATION.md`
-    //! sections 1-2; current skeletal proto lives at
-    //! `../control-plane/proto/determinism/hypervisor/v1/hypervisor.proto`.
-    //! This module will mirror the slot lease, VM lifecycle, input injection, run,
-    //! snapshot, worker-info, and slot-watch shapes from the owner API without
-    //! exposing a bespoke orchestrator job API.
-}
+pub mod hypervisor;
 
 pub mod input_synth;
 
