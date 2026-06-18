@@ -621,7 +621,7 @@ impl GeneratorMix {
                 "experiment config document is not valid UTF-8",
             )
         })?;
-        if !text.contains("generator_mix") {
+        if !has_generator_mix_key(text) {
             return Ok(self.clamp_nonnegative());
         }
 
@@ -639,7 +639,7 @@ impl GeneratorMix {
         if trimmed.is_empty() || trimmed == "{}" {
             return Ok(self.clamp_nonnegative());
         }
-        if !text.contains("generator_mix") {
+        if !has_generator_mix_key(text) {
             return Err(ClientError::new(
                 ClientErrorKind::InvalidRequest,
                 "config_overrides_yaml must contain a generator_mix override",
@@ -953,25 +953,30 @@ fn parse_generator_mix_block(text: &str) -> ClientResult<Vec<(String, f64)>> {
 }
 
 fn parse_generator_mix_inline(text: &str) -> ClientResult<Vec<(String, f64)>> {
-    let Some(start) = text.find("generator_mix") else {
-        return Ok(Vec::new());
-    };
-    let rest = &text[start..];
-    let Some(open) = rest.find('{') else {
-        return Ok(Vec::new());
-    };
-    let Some(close) = rest[open + 1..].find('}') else {
-        return Err(ClientError::new(
-            ClientErrorKind::InvalidRequest,
-            "malformed inline generator_mix override",
-        ));
-    };
-    rest[open + 1..open + 1 + close]
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(parse_key_value_number)
-        .collect()
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("generator_mix:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        let Some(inner) = rest.strip_prefix('{') else {
+            return Ok(Vec::new());
+        };
+        let Some(close) = inner.find('}') else {
+            return Err(ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "malformed inline generator_mix override",
+            ));
+        };
+        return inner[..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(parse_key_value_number)
+            .collect();
+    }
+
+    Ok(Vec::new())
 }
 
 fn parse_key_value_number(text: &str) -> ClientResult<(String, f64)> {
@@ -1011,6 +1016,11 @@ fn clean_scalar(value: &str) -> String {
         .trim_matches('"')
         .trim_matches('\'')
         .to_owned()
+}
+
+fn has_generator_mix_key(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim().starts_with("generator_mix:"))
 }
 
 fn propose_request_identity(
@@ -1217,6 +1227,7 @@ mod tests {
             b"generator_mix: { macro: NaN }\n",
             b"[",
             b"weighted_random: {",
+            b"not_generator_mix: 1\n",
             &[0xff],
         ] {
             let mut synth = configured_synth(true);
