@@ -18,16 +18,7 @@ pub mod transcript;
 mod tests {
     #[test]
     fn crate_exports_fake_modules() {
-        let modules = [
-            "fault",
-            "grid",
-            "hypervisor",
-            "scorer",
-            "snapshot_store",
-            "synth",
-            "transcript",
-        ];
-
-        assert_eq!(modules.len(), 7);
+        #[allow(unused_imports)]
+        use crate::{fault, grid, hypervisor, scorer, snapshot_store, synth, transcript};
     }
 }
