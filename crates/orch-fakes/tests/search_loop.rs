@@ -106,6 +106,16 @@ struct CandidateExecution {
 }
 
 #[derive(Clone, Debug)]
+struct StoreNodeSpec {
+    node_id: NodeId,
+    parent_node_id: Option<NodeId>,
+    snapshot_ref: SnapshotRef,
+    input_log_id: Option<InputLogId>,
+    status: NodeStatus,
+    attrs: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 struct SearchRun {
     expansions: u64,
     transcript_hash: TranscriptHash,
@@ -163,13 +173,15 @@ fn run_search(seed: u64) -> SearchRun {
     let mut commit_state = CommitState::from_root(root_payload);
     create_store_node(
         &mut store,
-        NodeId::ROOT,
-        None,
-        root_runtime.snapshot,
-        None,
-        NodeStatus::Frontier,
+        StoreNodeSpec {
+            node_id: NodeId::ROOT,
+            parent_node_id: None,
+            snapshot_ref: root_runtime.snapshot,
+            input_log_id: None,
+            status: NodeStatus::Frontier,
+            attrs: Vec::new(),
+        },
         &root_payload,
-        Vec::new(),
     );
 
     let mut runtimes = BTreeMap::from([(NodeId::ROOT, root_runtime)]);
@@ -251,13 +263,15 @@ fn run_search(seed: u64) -> SearchRun {
             let payload = record.payload();
             create_store_node(
                 &mut store,
-                node_id,
-                Some(choice.selected),
-                execution.snapshot,
-                Some(execution.input_log_id),
-                record.status,
+                StoreNodeSpec {
+                    node_id,
+                    parent_node_id: Some(choice.selected),
+                    snapshot_ref: execution.snapshot,
+                    input_log_id: Some(execution.input_log_id),
+                    status: record.status,
+                    attrs: node_attrs(execution.action, execution.outcome),
+                },
                 &payload,
-                node_attrs(execution.action, execution.outcome),
             );
             runtimes.insert(
                 node_id,
@@ -498,25 +512,20 @@ fn payload_from_score(
 
 fn create_store_node(
     store: &mut InMemorySnapshotStore,
-    node_id: NodeId,
-    parent_node_id: Option<NodeId>,
-    snapshot_ref: SnapshotRef,
-    input_log_id: Option<InputLogId>,
-    status: NodeStatus,
+    spec: StoreNodeSpec,
     payload: &NodePayload,
-    attrs: Vec<u8>,
 ) {
     store
         .create_node(CreateNodeRequest {
             experiment_id: EXPERIMENT_ID.to_owned(),
-            node_id,
-            parent_node_id,
-            snapshot_ref,
-            input_log_id,
-            status,
+            node_id: spec.node_id,
+            parent_node_id: spec.parent_node_id,
+            snapshot_ref: spec.snapshot_ref,
+            input_log_id: spec.input_log_id,
+            status: spec.status,
             progress_score: payload.score,
             novelty_score: payload.novelty_at_commit,
-            attrs: NodeAttrs::new(attrs).expect("node attrs"),
+            attrs: NodeAttrs::new(spec.attrs).expect("node attrs"),
             input_log_container: None,
         })
         .expect("create snapshot-store node");

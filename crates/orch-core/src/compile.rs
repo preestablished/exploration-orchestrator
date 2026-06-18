@@ -746,7 +746,7 @@ fn compile_field(
 fn scale_positive(value: u64, radius_factor: RadiusFactor) -> CompileResult<u64> {
     let product = u128::from(value) * u128::from(radius_factor.numerator);
     let denominator = u128::from(radius_factor.denominator.get());
-    let scaled = (product + denominator - 1) / denominator;
+    let scaled = product.div_ceil(denominator);
     if scaled > u128::from(u64::MAX) {
         return Err(CompileError::RadiusOverflow);
     }
