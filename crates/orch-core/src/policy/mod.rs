@@ -338,7 +338,7 @@ mod tests {
     use crate::mirror::CellMirror;
     use crate::plateau::{EscalationKnobs, EscalationLevel};
     use crate::tree::{NodePayload, Tree};
-    use crate::types::{FrameCount, Novelty, SnapshotRef, Stage, StateHash};
+    use crate::types::{FrameCount, Novelty, SnapshotRef, Stage, StagedConfig, StateHash};
 
     #[test]
     fn policy_common_normalizes_scores_and_builds_priority_terms() {
@@ -439,8 +439,10 @@ mod tests {
             }) if value.is_nan()
         ));
 
-        let mut selection = SelectionConfig::default();
-        selection.alpha = f64::INFINITY;
+        let selection = SelectionConfig {
+            alpha: f64::INFINITY,
+            ..Default::default()
+        };
         assert_eq!(
             validate_selection_weights(&selection),
             Err(PolicyError::InvalidWeight {
@@ -458,9 +460,14 @@ mod tests {
             }) if value.is_nan()
         ));
 
-        let mut selection = SelectionConfig::default();
-        selection.policy = PolicyKind::Staged;
-        selection.staged.inner = PolicyKind::Staged;
+        let selection = SelectionConfig {
+            policy: PolicyKind::Staged,
+            staged: StagedConfig {
+                inner: PolicyKind::Staged,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert_eq!(
             validate_selection_weights(&selection),
             Err(PolicyError::InvalidConfig {
@@ -468,8 +475,10 @@ mod tests {
             })
         );
 
-        let mut selection = SelectionConfig::default();
-        selection.max_visits_per_node = 0;
+        let selection = SelectionConfig {
+            max_visits_per_node: 0,
+            ..Default::default()
+        };
         assert_eq!(
             validate_selection_weights(&selection),
             Err(PolicyError::InvalidConfig {

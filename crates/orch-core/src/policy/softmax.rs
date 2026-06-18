@@ -232,8 +232,10 @@ mod tests {
         }
         let mirror = CellMirror::new();
         let plateau = plateau_knobs();
-        let mut selection = SelectionConfig::default();
-        selection.temperature = ARGMAX_TEMPERATURE;
+        let selection = SelectionConfig {
+            temperature: ARGMAX_TEMPERATURE,
+            ..Default::default()
+        };
         let context = PolicyContext::new(&tree, &frontier, &mirror, &plateau, &selection);
         let mut rng = DeterministicRng::selection(123, 0);
         let mut policy = SoftmaxPolicy::new();

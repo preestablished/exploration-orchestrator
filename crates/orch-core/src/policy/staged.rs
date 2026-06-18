@@ -217,7 +217,8 @@ mod tests {
     use crate::plateau::{EscalationKnobs, EscalationLevel, PlateauKnobs};
     use crate::tree::{NodePayload, Tree};
     use crate::types::{
-        CellKey, FrameCount, NodeId, Novelty, Score, SelectionConfig, SnapshotRef, Stage, StateHash,
+        CellKey, FrameCount, NodeId, Novelty, Score, SelectionConfig, SnapshotRef, Stage,
+        StagedConfig, StateHash,
     };
 
     #[test]
@@ -340,11 +341,15 @@ mod tests {
         }
         let mirror = CellMirror::new();
         let plateau = plateau_knobs();
-        let mut selection = SelectionConfig::default();
-        selection.policy = PolicyKind::Staged;
-        selection.staged.inner = PolicyKind::Ucb;
-        selection.staged.epsilon_regress = 0.0;
-        selection.ucb_c = 0.0;
+        let selection = SelectionConfig {
+            policy: PolicyKind::Staged,
+            staged: StagedConfig {
+                inner: PolicyKind::Ucb,
+                epsilon_regress: 0.0,
+            },
+            ucb_c: 0.0,
+            ..Default::default()
+        };
         let context = PolicyContext::new(&tree, &frontier, &mirror, &plateau, &selection);
         let mut rng = DeterministicRng::selection(123, 0);
         let mut policy = StagedPolicy::with_total_expansions(64);
@@ -367,11 +372,15 @@ mod tests {
         }
         let mirror = CellMirror::new();
         let plateau = plateau_knobs();
-        let mut selection = SelectionConfig::default();
-        selection.policy = PolicyKind::Staged;
-        selection.staged.inner = PolicyKind::Ucb;
-        selection.staged.epsilon_regress = 0.0;
-        selection.ucb_c = 0.0;
+        let selection = SelectionConfig {
+            policy: PolicyKind::Staged,
+            staged: StagedConfig {
+                inner: PolicyKind::Ucb,
+                epsilon_regress: 0.0,
+            },
+            ucb_c: 0.0,
+            ..Default::default()
+        };
         let context = PolicyContext::new(&tree, &frontier, &mirror, &plateau, &selection);
         let mut rng = DeterministicRng::selection(0, 0);
         let mut policy = StagedPolicy::with_total_expansions(64);

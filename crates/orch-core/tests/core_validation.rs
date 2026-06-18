@@ -3,7 +3,7 @@ use orch_core::policy::{validate_selection_weights, PolicyError, PriorityTerms, 
 use orch_core::tree::NodePayload;
 use orch_core::types::{
     CellKey, FrameCount, NodeId, Novelty, PolicyKind, PruneAction, Score, SnapshotRef, Stage,
-    StateHash,
+    StagedConfig, StateHash,
 };
 use proptest::prelude::*;
 
@@ -49,11 +49,13 @@ proptest! {
         gamma in 0.0f64..10.0,
         delta in 0.0f64..10.0,
     ) {
-        let mut selection = SelectionConfig::default();
-        selection.alpha = alpha;
-        selection.beta = beta;
-        selection.gamma = gamma;
-        selection.delta = delta;
+        let selection = SelectionConfig {
+            alpha,
+            beta,
+            gamma,
+            delta,
+            ..Default::default()
+        };
         validate_selection_weights(&selection).unwrap();
 
         let priority = PriorityTerms::new(
@@ -92,8 +94,10 @@ fn core_validation_selection_rejects_non_finite_weights() {
         }
     }
 
-    let mut selection = SelectionConfig::default();
-    selection.temperature = f64::NAN;
+    let selection = SelectionConfig {
+        temperature: f64::NAN,
+        ..Default::default()
+    };
     assert!(matches!(
         validate_selection_weights(&selection),
         Err(PolicyError::InvalidWeight { field: "selection.temperature", value }) if value.is_nan()
@@ -109,9 +113,14 @@ fn core_validation_selection_rejects_non_finite_weights() {
         })
     );
 
-    let mut selection = SelectionConfig::default();
-    selection.policy = PolicyKind::Staged;
-    selection.staged.inner = PolicyKind::Staged;
+    let selection = SelectionConfig {
+        policy: PolicyKind::Staged,
+        staged: StagedConfig {
+            inner: PolicyKind::Staged,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     assert_eq!(
         validate_selection_weights(&selection),
         Err(PolicyError::InvalidConfig {
