@@ -86,7 +86,7 @@ impl FakeSynth {
         overrides_yaml: &[u8],
     ) -> Option<ConfigFingerprint> {
         let experiment = self.loaded_experiments.get(experiment_id)?;
-        let mix = experiment.mix.with_overrides(overrides_yaml);
+        let mix = experiment.mix.with_overrides(overrides_yaml).ok()?;
         Some(self.config_fingerprint(experiment, mix))
     }
 
@@ -99,7 +99,7 @@ impl FakeSynth {
         let experiment_id =
             parse_scalar(text, "experiment_id").unwrap_or_else(|| document.document_id.clone());
         let model = parse_model(text).unwrap_or(ModelKind::Pad);
-        let mix = GeneratorMix::default().with_overrides(text.as_bytes());
+        let mix = GeneratorMix::default().with_overrides(text.as_bytes())?;
         let config = FakeExperimentConfig {
             experiment_id: experiment_id.clone(),
             model,
@@ -432,7 +432,7 @@ impl InputSynthClient for FakeSynth {
 
         let requested_mix = experiment
             .mix
-            .with_overrides(&request.config_overrides_yaml);
+            .with_overrides(&request.config_overrides_yaml)?;
         let base_fingerprint = self.config_fingerprint(experiment, requested_mix);
         let request_identity = propose_request_identity(&request, base_fingerprint);
         let fault_decision = self.fault_injector.decide(
@@ -446,7 +446,7 @@ impl InputSynthClient for FakeSynth {
         let final_fingerprint = fault_decision.apply_synth_fingerprint(base_fingerprint);
         let (effective_mix, degraded, weighted_fallback_from) =
             self.effective_mix(requested_mix, &request);
-        let response_len = fault_decision.truncate_len(request.k as usize);
+        let response_len = request.k as usize;
         let mut bursts = Vec::with_capacity(response_len);
         for slot in 0..response_len as u32 {
             let generator = effective_mix.select_generator(request.seed, slot);
@@ -614,20 +614,28 @@ impl Default for GeneratorMix {
 }
 
 impl GeneratorMix {
-    fn with_overrides(mut self, bytes: &[u8]) -> Self {
-        let Ok(text) = str::from_utf8(bytes) else {
-            return self;
-        };
-        for (key, value) in parse_generator_mix_entries(text) {
+    fn with_overrides(mut self, bytes: &[u8]) -> ClientResult<Self> {
+        let text = str::from_utf8(bytes).map_err(|_| {
+            ClientError::new(
+                ClientErrorKind::InvalidRequest,
+                "config_overrides_yaml is not valid UTF-8",
+            )
+        })?;
+        for (key, value) in parse_generator_mix_entries(text)? {
             match key.as_str() {
                 "weighted_random" => self.weighted_random = value,
                 "macro" => self.macro_weight = value,
                 "mutation" => self.mutation = value,
                 "policy" => self.policy = value,
-                _ => {}
+                _ => {
+                    return Err(ClientError::new(
+                        ClientErrorKind::InvalidRequest,
+                        format!("unknown generator_mix key '{key}'"),
+                    ));
+                }
             }
         }
-        self.clamp_nonnegative()
+        Ok(self.clamp_nonnegative())
     }
 
     fn clamp_nonnegative(mut self) -> Self {
@@ -883,13 +891,13 @@ fn parse_macro_names(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_generator_mix_entries(text: &str) -> Vec<(String, f64)> {
-    let mut entries = parse_generator_mix_block(text);
-    entries.extend(parse_generator_mix_inline(text));
-    entries
+fn parse_generator_mix_entries(text: &str) -> ClientResult<Vec<(String, f64)>> {
+    let mut entries = parse_generator_mix_block(text)?;
+    entries.extend(parse_generator_mix_inline(text)?);
+    Ok(entries)
 }
 
-fn parse_generator_mix_block(text: &str) -> Vec<(String, f64)> {
+fn parse_generator_mix_block(text: &str) -> ClientResult<Vec<(String, f64)>> {
     let mut in_mix = false;
     let mut entries = Vec::new();
     for line in text.lines() {
@@ -897,8 +905,15 @@ fn parse_generator_mix_block(text: &str) -> Vec<(String, f64)> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if trimmed.starts_with("generator_mix:") {
-            in_mix = true;
+        if let Some(rest) = trimmed.strip_prefix("generator_mix:") {
+            let rest = rest.trim();
+            if !rest.is_empty() && !rest.starts_with('{') {
+                return Err(ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    "malformed generator_mix override",
+                ));
+            }
+            in_mix = rest.is_empty();
             continue;
         }
         if !in_mix {
@@ -907,36 +922,61 @@ fn parse_generator_mix_block(text: &str) -> Vec<(String, f64)> {
         if !line.starts_with(' ') && !line.starts_with('\t') {
             break;
         }
-        if let Some((key, value)) = parse_key_value_number(trimmed) {
-            entries.push((key, value));
-        }
+        entries.push(parse_key_value_number(trimmed)?);
     }
-    entries
+    Ok(entries)
 }
 
-fn parse_generator_mix_inline(text: &str) -> Vec<(String, f64)> {
+fn parse_generator_mix_inline(text: &str) -> ClientResult<Vec<(String, f64)>> {
     let Some(start) = text.find("generator_mix") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let rest = &text[start..];
     let Some(open) = rest.find('{') else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let Some(close) = rest[open + 1..].find('}') else {
-        return Vec::new();
+        return Err(ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            "malformed inline generator_mix override",
+        ));
     };
     rest[open + 1..open + 1 + close]
         .split(',')
-        .filter_map(parse_key_value_number)
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(parse_key_value_number)
         .collect()
 }
 
-fn parse_key_value_number(text: &str) -> Option<(String, f64)> {
-    let (key, value) = text.split_once(':')?;
+fn parse_key_value_number(text: &str) -> ClientResult<(String, f64)> {
+    let (key, value) = text.split_once(':').ok_or_else(|| {
+        ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            format!("malformed generator_mix entry '{text}'"),
+        )
+    })?;
     let key = clean_scalar(key);
     let value = clean_scalar(value);
-    let value = value.parse::<f64>().ok()?;
-    Some((key, value))
+    if key.is_empty() {
+        return Err(ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            "empty generator_mix key",
+        ));
+    }
+    let value = value.parse::<f64>().map_err(|_| {
+        ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            format!("invalid generator_mix value for '{key}'"),
+        )
+    })?;
+    if !value.is_finite() {
+        return Err(ClientError::new(
+            ClientErrorKind::InvalidRequest,
+            format!("non-finite generator_mix value for '{key}'"),
+        ));
+    }
+    Ok((key, value))
 }
 
 fn clean_scalar(value: &str) -> String {
@@ -1118,6 +1158,47 @@ mod tests {
             burst.provenance.generator == GeneratorKind::WeightedRandom
                 && burst.provenance.fallback_from == Some(GeneratorKind::Macro)
         }));
+    }
+
+    #[test]
+    fn synth_partial_response_fault_does_not_truncate_exact_k_contract() {
+        let mut synth = configured_synth_with_fault(
+            true,
+            FaultPlan::disabled(0xfeed).with_partial_response(
+                crate::fault::PartialResponseFault::new(crate::fault::FaultRate::always(), 0),
+            ),
+        );
+
+        let response = synth
+            .propose_bursts(sample_request(66, b""))
+            .expect("partial response fault should not alter synth shape");
+
+        assert_eq!(response.bursts.len(), 4);
+        assert_eq!(
+            response
+                .bursts
+                .iter()
+                .map(|burst| burst.provenance.slot)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn synth_malformed_overrides_are_invalid_request() {
+        for overrides in [
+            b"generator_mix:\n  macro: nope\n".as_slice(),
+            b"generator_mix:\n  surprise: 1\n",
+            b"generator_mix: { macro: NaN }\n",
+            &[0xff],
+        ] {
+            let mut synth = configured_synth(true);
+            let error = synth
+                .propose_bursts(sample_request(88, overrides))
+                .expect_err("malformed overrides should be rejected");
+
+            assert_eq!(error.kind(), ClientErrorKind::InvalidRequest);
+        }
     }
 
     #[test]
