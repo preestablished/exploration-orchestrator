@@ -7,6 +7,8 @@ Pure-Rust core (`orch-core` has no tokio/tonic).
 - `orch-core` owns deterministic in-memory search primitives: config/value types,
   compile-time feature layout checks, tree/frontier/mirror state, commit rules,
   plateau tracking, deterministic RNG, and parent-selection policies.
+- `orch-clients` owns transport-free DTOs and client traits for orchestrator
+  service boundaries.
 - `orch-fakes` owns deterministic service-contract fakes for M2 validation. These
   fakes mirror orchestrator client DTO boundaries for the fake grid world, scorer,
   snapshot store, input synth, hypervisor worker, fault injection, and transcript
