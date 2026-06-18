@@ -2,6 +2,20 @@
 
 Pure-Rust core (`orch-core` has no tokio/tonic).
 
+## M1 Core
+
+`orch-core` is pure synchronous search logic. It owns deterministic value types,
+feature-layout compilation, tree/frontier/mirror state, commit decisions,
+plateau tracking, deterministic RNG, and selection policies. It does not own
+platform service clients, transports, schedulers, or runners.
+
+Core validation commands:
+
+```bash
+cargo test -p orch-core
+cargo test -p orch-core --test purity_guard
+```
+
 ## M1-M2 Crate Roles
 
 - `orch-core` owns deterministic in-memory search primitives: config/value types,
