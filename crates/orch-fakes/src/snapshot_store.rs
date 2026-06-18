@@ -7,9 +7,9 @@ use orch_clients::snapshot_store::{
     CreateNodeRequest, CreateNodeResponse, DeleteMetadataRequest, DeleteMetadataResponse,
     GetChildrenRequest, GetChildrenResponse, GetMetadataRequest, GetMetadataResponse,
     GetNodeRequest, GetNodeResponse, GetPathRequest, GetPathResponse, InputLogId,
-    MetadataExpectation, MetadataGeneration, MetadataKey, NodeAttrs, NodeMeta, NodeUpdate,
-    PutMetadataRequest, PutMetadataResponse, QueryNodesRequest, QueryNodesResponse,
-    SnapshotStoreClient, UpdateNodesRequest, UpdateNodesResponse,
+    MetadataExpectation, MetadataGeneration, MetadataKey, NodeMeta, NodeUpdate, PutMetadataRequest,
+    PutMetadataResponse, QueryNodesRequest, QueryNodesResponse, SnapshotStoreClient,
+    UpdateNodesRequest, UpdateNodesResponse,
 };
 use orch_clients::{ClientError, ClientErrorKind, ClientResult};
 use orch_core::types::{NodeId, NodeStatus};
@@ -91,13 +91,13 @@ impl InMemorySnapshotStore {
 
 impl SnapshotStoreClient for InMemorySnapshotStore {
     fn create_node(&mut self, request: CreateNodeRequest) -> ClientResult<CreateNodeResponse> {
-        self.decide_fault("create_node", request_identity(&request), 1)?;
+        self.decide_fault("create_node", request_identity(&request), 0)?;
         request.validate()?;
+        let requested_input_log_id = resolved_input_log_id(&request);
 
         if let Some(experiment) = self.experiments.get(&request.experiment_id) {
             if let Some(existing) = experiment.nodes.get(&request.node_id) {
-                let create_key = CreateNodeKey::from_request(&request);
-                if existing.create_key == create_key {
+                if existing.same_immutable_create_identity(&request, requested_input_log_id) {
                     return Ok(CreateNodeResponse {
                         node: existing.meta.clone(),
                     });
@@ -126,6 +126,19 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
                     "parent node not found",
                 ));
             }
+            if experiment
+                .nodes
+                .get(&parent)
+                .expect("parent existence was checked")
+                .meta
+                .status
+                == NodeStatus::Pruned
+            {
+                return Err(ClientError::new(
+                    ClientErrorKind::FailedPrecondition,
+                    "parent node is pruned",
+                ));
+            }
         }
 
         let created_at = self.tick()?;
@@ -140,8 +153,6 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
             })
             .unwrap_or(0);
         let input_log_container = request.input_log_container.clone();
-        let input_log_id = resolved_input_log_id(&request);
-        let create_key = CreateNodeKey::from_request(&request);
 
         let node = NodeMeta {
             experiment_id: experiment_id.clone(),
@@ -155,7 +166,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
                 })?
             },
             snapshot_ref: request.snapshot_ref,
-            input_log_id,
+            input_log_id: requested_input_log_id,
             status: request.status,
             progress_score: request.progress_score,
             novelty_score: request.novelty_score,
@@ -173,7 +184,6 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
             .or_insert_with(ExperimentStore::default);
         experiment.insert_node(StoredNode {
             meta: node.clone(),
-            create_key,
             input_log_container,
         });
 
@@ -181,11 +191,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
     }
 
     fn update_nodes(&mut self, request: UpdateNodesRequest) -> ClientResult<UpdateNodesResponse> {
-        self.decide_fault(
-            "update_nodes",
-            request_identity(&request),
-            request.updates.len() as u32,
-        )?;
+        self.decide_fault("update_nodes", request_identity(&request), 0)?;
 
         if request.updates.is_empty() {
             return Ok(UpdateNodesResponse {
@@ -210,21 +216,35 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
             }
         }
 
-        let applied = request.updates.len() as u32;
-        let updated_at = self.tick()?;
+        let applied = u32::try_from(request.updates.len()).map_err(|_| {
+            ClientError::new(ClientErrorKind::InvalidRequest, "too many node updates")
+        })?;
+        let updated_at = self.logical_clock.checked_add(1).ok_or_else(|| {
+            ClientError::new(ClientErrorKind::Internal, "snapshot-store clock overflow")
+        })?;
+        let mut staged = BTreeMap::<NodeId, StoredNode>::new();
+        for update in request.updates {
+            let staged_node = if let Some(existing) = staged.get(&update.node_id) {
+                existing.clone()
+            } else {
+                experiment
+                    .nodes
+                    .get(&update.node_id)
+                    .expect("node existence was checked")
+                    .clone()
+            };
+            let mut staged_node = staged_node;
+            apply_update(&mut staged_node, update, updated_at)?;
+            staged.insert(staged_node.meta.node_id, staged_node);
+        }
+
+        self.logical_clock = updated_at;
         let experiment = self
             .experiments
             .get_mut(&request.experiment_id)
             .expect("experiment existence was checked");
-        for update in request.updates {
-            apply_update(
-                experiment
-                    .nodes
-                    .get_mut(&update.node_id)
-                    .expect("node existence was checked"),
-                update,
-                updated_at,
-            )?;
+        for (node_id, node) in staged {
+            experiment.nodes.insert(node_id, node);
         }
 
         Ok(UpdateNodesResponse {
@@ -234,7 +254,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
     }
 
     fn get_node(&self, request: GetNodeRequest) -> ClientResult<GetNodeResponse> {
-        self.decide_fault("get_node", request_identity(&request), 1)?;
+        self.decide_fault("get_node", request_identity(&request), 0)?;
         let node = self
             .node(&request.experiment_id, request.node_id)?
             .meta
@@ -330,7 +350,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
     }
 
     fn put_metadata(&mut self, request: PutMetadataRequest) -> ClientResult<PutMetadataResponse> {
-        self.decide_fault("put_metadata", request_identity(&request), 1)?;
+        self.decide_fault("put_metadata", request_identity(&request), 0)?;
         let current_generation = self
             .metadata
             .get(&request.key)
@@ -338,7 +358,11 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
         check_metadata_expectation(current_generation, request.expected_generation, true)?;
 
         let generation = MetadataGeneration::new(
-            current_generation.map_or(1, |generation| generation.get().saturating_add(1)),
+            current_generation
+                .map_or(Some(1), |generation| generation.get().checked_add(1))
+                .ok_or_else(|| {
+                    ClientError::new(ClientErrorKind::Internal, "metadata generation overflow")
+                })?,
         );
         self.metadata.insert(
             request.key,
@@ -351,7 +375,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
     }
 
     fn get_metadata(&self, request: GetMetadataRequest) -> ClientResult<GetMetadataResponse> {
-        self.decide_fault("get_metadata", request_identity(&request), 1)?;
+        self.decide_fault("get_metadata", request_identity(&request), 0)?;
         let entry = self
             .metadata
             .get(&request.key)
@@ -366,7 +390,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
         &mut self,
         request: DeleteMetadataRequest,
     ) -> ClientResult<DeleteMetadataResponse> {
-        self.decide_fault("delete_metadata", request_identity(&request), 1)?;
+        self.decide_fault("delete_metadata", request_identity(&request), 0)?;
         let current_generation = self
             .metadata
             .get(&request.key)
@@ -382,7 +406,7 @@ impl SnapshotStoreClient for InMemorySnapshotStore {
         &mut self,
         request: orch_clients::snapshot_store::PruneSubtreeRequest,
     ) -> ClientResult<orch_clients::snapshot_store::PruneSubtreeResponse> {
-        self.decide_fault("prune_subtree", request_identity(&request), 1)?;
+        self.decide_fault("prune_subtree", request_identity(&request), 0)?;
         if request.node_id.is_root() && !request.allow_root {
             return Err(ClientError::new(
                 ClientErrorKind::FailedPrecondition,
@@ -471,34 +495,18 @@ impl ExperimentStore {
 #[derive(Clone, Debug)]
 struct StoredNode {
     meta: NodeMeta,
-    create_key: CreateNodeKey,
     input_log_container: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct CreateNodeKey {
-    parent_node_id: Option<NodeId>,
-    snapshot_ref: orch_core::types::SnapshotRef,
-    input_log_id: Option<InputLogId>,
-    status: NodeStatus,
-    progress_score: orch_core::types::Score,
-    novelty_score: orch_core::types::Novelty,
-    attrs: NodeAttrs,
-    input_log_container: Option<Vec<u8>>,
-}
-
-impl CreateNodeKey {
-    fn from_request(request: &CreateNodeRequest) -> Self {
-        Self {
-            parent_node_id: request.parent_node_id,
-            snapshot_ref: request.snapshot_ref,
-            input_log_id: request.input_log_id,
-            status: request.status,
-            progress_score: request.progress_score,
-            novelty_score: request.novelty_score,
-            attrs: request.attrs.clone(),
-            input_log_container: request.input_log_container.clone(),
-        }
+impl StoredNode {
+    fn same_immutable_create_identity(
+        &self,
+        request: &CreateNodeRequest,
+        requested_input_log_id: Option<InputLogId>,
+    ) -> bool {
+        self.meta.parent_node_id == request.parent_node_id
+            && self.meta.snapshot_ref == request.snapshot_ref
+            && self.meta.input_log_id == requested_input_log_id
     }
 }
 
@@ -544,14 +552,10 @@ fn apply_update(node: &mut StoredNode, update: NodeUpdate, updated_at: u64) -> C
 
 fn resolved_input_log_id(request: &CreateNodeRequest) -> Option<InputLogId> {
     request.input_log_id.or_else(|| {
-        request.input_log_container.as_ref().map(|container| {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"orch-fakes/snapshot-store/input-log/v1");
-            hasher.update(request.experiment_id.as_bytes());
-            hasher.update(&request.node_id.get().to_le_bytes());
-            hasher.update(container);
-            InputLogId::new(*hasher.finalize().as_bytes())
-        })
+        request
+            .input_log_container
+            .as_ref()
+            .map(|container| InputLogId::new(*blake3::hash(container).as_bytes()))
     })
 }
 
@@ -563,20 +567,21 @@ fn check_metadata_expectation(
     match expected {
         MetadataExpectation::Unconditional => Ok(()),
         MetadataExpectation::CreateOnly if allow_create_only && current.is_none() => Ok(()),
-        MetadataExpectation::CreateOnly if allow_create_only => Err(ClientError::new(
-            ClientErrorKind::AlreadyExists,
-            "metadata key already exists",
-        )),
+        MetadataExpectation::CreateOnly if allow_create_only => Err(metadata_generation_conflict()),
         MetadataExpectation::CreateOnly => Err(ClientError::new(
             ClientErrorKind::FailedPrecondition,
             "create-only expectation is invalid for delete",
         )),
         MetadataExpectation::Generation(expected) if current == Some(expected) => Ok(()),
-        MetadataExpectation::Generation(_) => Err(ClientError::new(
-            ClientErrorKind::FailedPrecondition,
-            "metadata generation conflict",
-        )),
+        MetadataExpectation::Generation(_) => Err(metadata_generation_conflict()),
     }
+}
+
+fn metadata_generation_conflict() -> ClientError {
+    ClientError::new(
+        ClientErrorKind::FailedPrecondition,
+        "metadata generation conflict",
+    )
 }
 
 fn query_matches(node: &NodeMeta, request: &QueryNodesRequest) -> bool {
@@ -633,7 +638,7 @@ fn request_identity<T: Serialize>(request: &T) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orch_clients::snapshot_store::{OrderBy, PruneSubtreeRequest};
+    use orch_clients::snapshot_store::{NodeAttrs, OrderBy, PruneSubtreeRequest};
     use orch_core::types::{Novelty, Score, SnapshotRef};
 
     const EXP_A: &str = "exp-a";
@@ -687,15 +692,52 @@ mod tests {
         let request = root_request(EXP_A);
 
         let first = store.create_node(request.clone()).unwrap().node;
-        let retry = store.create_node(request).unwrap().node;
+        let mut mutable_retry = request;
+        mutable_retry.status = NodeStatus::Goal;
+        mutable_retry.progress_score = score(100.0);
+        mutable_retry.novelty_score = novelty(0.125);
+        mutable_retry.attrs = NodeAttrs::new(b"different".to_vec()).unwrap();
+        let retry = store.create_node(mutable_retry).unwrap().node;
+
         let mut mismatch = root_request(EXP_A);
-        mismatch.attrs = NodeAttrs::new(b"different".to_vec()).unwrap();
+        mismatch.snapshot_ref = SNAPSHOT_B;
         let error = store
             .create_node(mismatch)
-            .expect_err("same node id with different create data should fail");
+            .expect_err("same node id with different immutable create data should fail");
 
         assert_eq!(retry, first);
         assert_eq!(error.kind(), ClientErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn snapshot_store_inline_input_log_id_is_content_addressed() {
+        let mut store = InMemorySnapshotStore::new();
+        let container = b"same-log-container".to_vec();
+        store.create_node(root_request(EXP_A)).unwrap();
+        store.create_node(root_request(EXP_B)).unwrap();
+
+        let first = store
+            .create_node(child_with_container(
+                EXP_A,
+                1,
+                NodeId::ROOT,
+                container.clone(),
+            ))
+            .unwrap()
+            .node;
+        let second = store
+            .create_node(child_with_container(
+                EXP_B,
+                1,
+                NodeId::ROOT,
+                container.clone(),
+            ))
+            .unwrap()
+            .node;
+        let expected = InputLogId::new(*blake3::hash(&container).as_bytes());
+
+        assert_eq!(first.input_log_id, Some(expected));
+        assert_eq!(second.input_log_id, Some(expected));
     }
 
     #[test]
@@ -755,6 +797,71 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![NodeId::new(1)]
         );
+    }
+
+    #[test]
+    fn snapshot_store_update_nodes_is_atomic_on_counter_overflow() {
+        let mut store = populated_store();
+        store
+            .update_nodes(UpdateNodesRequest {
+                experiment_id: EXP_A.to_owned(),
+                updates: vec![NodeUpdate {
+                    node_id: NodeId::new(1),
+                    status: None,
+                    progress_score: None,
+                    novelty_score: None,
+                    visit_count_delta: u64::MAX,
+                    expand_count_delta: 0,
+                    touch_visited: false,
+                    attrs: None,
+                }],
+            })
+            .unwrap();
+
+        let before_node_3 = store
+            .get_node(GetNodeRequest {
+                experiment_id: EXP_A.to_owned(),
+                node_id: NodeId::new(3),
+            })
+            .unwrap()
+            .node;
+        let error = store
+            .update_nodes(UpdateNodesRequest {
+                experiment_id: EXP_A.to_owned(),
+                updates: vec![
+                    NodeUpdate {
+                        node_id: NodeId::new(3),
+                        status: Some(NodeStatus::Goal),
+                        progress_score: Some(score(77.0)),
+                        novelty_score: None,
+                        visit_count_delta: 0,
+                        expand_count_delta: 0,
+                        touch_visited: true,
+                        attrs: None,
+                    },
+                    NodeUpdate {
+                        node_id: NodeId::new(1),
+                        status: Some(NodeStatus::Goal),
+                        progress_score: None,
+                        novelty_score: None,
+                        visit_count_delta: 1,
+                        expand_count_delta: 0,
+                        touch_visited: false,
+                        attrs: None,
+                    },
+                ],
+            })
+            .expect_err("overflow should abort the whole batch");
+        let after_node_3 = store
+            .get_node(GetNodeRequest {
+                experiment_id: EXP_A.to_owned(),
+                node_id: NodeId::new(3),
+            })
+            .unwrap()
+            .node;
+
+        assert_eq!(error.kind(), ClientErrorKind::Internal);
+        assert_eq!(after_node_3, before_node_3);
     }
 
     #[test]
@@ -825,6 +932,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![NodeId::new(1), NodeId::new(2)]
         );
+
+        let error = store
+            .create_node(child_request(
+                EXP_A,
+                4,
+                NodeId::new(1),
+                30.0,
+                NodeStatus::Frontier,
+            ))
+            .expect_err("pruned parent should reject new children");
+        assert_eq!(error.kind(), ClientErrorKind::FailedPrecondition);
     }
 
     #[test]
@@ -887,7 +1005,7 @@ mod tests {
         assert_eq!(second.generation, MetadataGeneration::new(2));
         assert_eq!(fetched.value, b"checkpoint-v2");
         assert_eq!(fetched.generation, second.generation);
-        assert_eq!(conflict.kind(), ClientErrorKind::AlreadyExists);
+        assert_eq!(conflict.kind(), ClientErrorKind::FailedPrecondition);
         assert_eq!(stale.kind(), ClientErrorKind::FailedPrecondition);
     }
 
@@ -923,6 +1041,9 @@ mod tests {
         let disabled = baseline_transcript(InMemorySnapshotStore::with_fault_plan(
             FaultPlan::disabled(u64::MAX),
         ));
+        let mut scalar_store = InMemorySnapshotStore::with_fault_plan(plan.clone());
+        scalar_store.create_node(root_request(EXP_A)).unwrap();
+        let scalar_fault = scalar_store.last_fault().unwrap();
         let mut partial_store = InMemorySnapshotStore::with_fault_plan(plan);
         populate(&mut partial_store);
         let partial = partial_store
@@ -935,6 +1056,7 @@ mod tests {
         assert_eq!(same_a, same_b);
         assert_ne!(same_a, different_seed);
         assert_eq!(baseline, disabled);
+        assert_eq!(scalar_fault.partial, None);
         assert_eq!(
             partial.children.len(),
             partial_store.last_fault().unwrap().truncate_len(2)
@@ -1039,6 +1161,26 @@ mod tests {
             novelty_score: novelty(1.0 / (node_id as f64 + 1.0)),
             attrs: NodeAttrs::new(format!("node-{node_id}").into_bytes()).unwrap(),
             input_log_container: (node_id != 3).then(|| format!("log-{node_id}").into_bytes()),
+        }
+    }
+
+    fn child_with_container(
+        experiment_id: &str,
+        node_id: u64,
+        parent: NodeId,
+        container: Vec<u8>,
+    ) -> CreateNodeRequest {
+        CreateNodeRequest {
+            experiment_id: experiment_id.to_owned(),
+            node_id: NodeId::new(node_id),
+            parent_node_id: Some(parent),
+            snapshot_ref: SNAPSHOT_A,
+            input_log_id: None,
+            status: NodeStatus::Frontier,
+            progress_score: score(1.0),
+            novelty_score: novelty(1.0),
+            attrs: NodeAttrs::new(Vec::new()).unwrap(),
+            input_log_container: Some(container),
         }
     }
 
