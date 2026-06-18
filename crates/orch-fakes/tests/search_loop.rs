@@ -25,8 +25,8 @@ use orch_core::{
     rng::DeterministicRng,
     tree::NodePayload,
     types::{
-        FrameCount, GuestInstructions, NodeId, NodeStatus, Novelty, PolicyKind, PruneAction,
-        SelectionConfig, SnapshotRef, StateHash,
+        CellKey, FrameCount, GuestInstructions, NodeId, NodeStatus, Novelty, PolicyKind,
+        PruneAction, SelectionConfig, SnapshotRef, StateHash,
     },
 };
 use orch_fakes::{
@@ -39,6 +39,7 @@ use orch_fakes::{
 
 const EXPERIMENT_ID: &str = "search-loop-exp";
 const MAX_EXPANSIONS: u64 = 10_000;
+const SEARCH_EXPANSION_BOUND: u64 = 512;
 const BUTTON_ATTACK_A: u32 = 0b0000_0001;
 const BUTTON_UP: u32 = 0b0100_0000;
 const BUTTON_DOWN: u32 = 0b1000_0000;
@@ -64,11 +65,23 @@ fn search_loop_solves_three_room_fake_world_deterministically() {
         first.transcript_hash.as_bytes(),
         second.transcript_hash.as_bytes()
     );
+    assert_ne!(first.transcript_bytes, different_seed.transcript_bytes);
     assert_ne!(
         first.transcript_hash.as_bytes(),
         different_seed.transcript_hash.as_bytes()
     );
     assert!(first.expansions < MAX_EXPANSIONS);
+    assert_eq!(first.expansions, second.expansions);
+    assert!(
+        first.expansions <= SEARCH_EXPANSION_BOUND,
+        "same-seed run took {} expansions",
+        first.expansions
+    );
+    assert!(
+        different_seed.expansions <= SEARCH_EXPANSION_BOUND,
+        "different-seed run took {} expansions",
+        different_seed.expansions
+    );
     assert!(first.goal_state.goal_reached());
     assert_eq!(first.goal_path_len, second.goal_path_len);
 }
@@ -101,21 +114,45 @@ struct SearchRun {
     goal_path_len: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ScorerArchiveMirror {
+    seen: BTreeSet<StateHash>,
+    cell_counts: BTreeMap<CellKey, u32>,
+}
+
+impl ScorerArchiveMirror {
+    fn replay(&mut self, states: &[CommittedState]) {
+        for state in states {
+            if self.seen.insert(state.state_hash) {
+                *self.cell_counts.entry(state.cell_key).or_default() += 1;
+            }
+        }
+    }
+
+    fn contains(&self, state_hash: StateHash) -> bool {
+        self.seen.contains(&state_hash)
+    }
+
+    fn cell_count(&self, cell_key: CellKey) -> u32 {
+        self.cell_counts.get(&cell_key).copied().unwrap_or(0)
+    }
+}
+
 fn run_search(seed: u64) -> SearchRun {
     let mut hypervisor = FakeHypervisor::with_slots(16);
     let mut scorer = configured_scorer();
     let mut store = InMemorySnapshotStore::new();
+    let mut scorer_archive = ScorerArchiveMirror::default();
     let mut transcript = TranscriptBuilder::new(seed);
 
     let (root_runtime, root_result) = create_root(&mut hypervisor, &mut scorer, seed);
     transcript.append_state(root_runtime.state);
-    replay_commits(
-        &mut scorer,
-        vec![CommittedState {
-            state_hash: root_result.state_hash,
-            cell_key: root_result.novelty_detail.cell_key,
-        }],
-    );
+    let root_commit = CommittedState {
+        state_hash: root_result.state_hash,
+        cell_key: root_result.novelty_detail.cell_key,
+    };
+    replay_commits(&mut scorer, vec![root_commit]);
+    scorer_archive.replay(&[root_commit]);
 
     let root_payload = payload_from_score(
         root_runtime.snapshot,
@@ -192,7 +229,13 @@ fn run_search(seed: u64) -> SearchRun {
             .iter()
             .zip(&score_response.results)
             .map(|(execution, result)| {
-                scored_child(&commit_state, &mut sibling_hashes, execution, result)
+                scored_child(
+                    &commit_state,
+                    &scorer_archive,
+                    &mut sibling_hashes,
+                    execution,
+                    result,
+                )
             })
             .collect::<Vec<_>>();
         let outcome = commit_batch(&mut commit_state, choice.selected, &children, &rules)
@@ -229,6 +272,7 @@ fn run_search(seed: u64) -> SearchRun {
                 cell_key: payload.cell,
             });
         }
+        scorer_archive.replay(&committed);
         replay_commits(&mut scorer, committed);
 
         if let Some(goal) = outcome.goal_node {
@@ -241,7 +285,13 @@ fn run_search(seed: u64) -> SearchRun {
                     include_input_logs: false,
                 })
                 .expect("store goal path");
-            assert_eq!(tree_path.len(), store_path.nodes.len());
+            let store_node_ids = store_path
+                .nodes
+                .iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>();
+            assert_eq!(&tree_path, &store_node_ids);
+            assert_eq!(store_node_ids.last().copied(), Some(goal));
             assert_eq!(
                 store_path.nodes.last().expect("goal node").status,
                 NodeStatus::Goal
@@ -379,6 +429,7 @@ fn expand_parent(
 
 fn scored_child(
     commit_state: &CommitState,
+    scorer_archive: &ScorerArchiveMirror,
     sibling_hashes: &mut BTreeSet<StateHash>,
     execution: &CandidateExecution,
     result: &ScoreResult,
@@ -388,9 +439,22 @@ fn scored_child(
     assert_eq!(result.novelty_detail.cell_key, execution.after.cell_key());
     assert_eq!(execution.after, execution.before.step(execution.action).0);
 
-    let duplicate = result.duplicate
-        || commit_state.seen.contains(result.state_hash)
-        || !sibling_hashes.insert(result.state_hash);
+    let archive_duplicate = scorer_archive.contains(result.state_hash);
+    assert_eq!(result.duplicate, archive_duplicate);
+    assert_eq!(
+        commit_state.seen.contains(result.state_hash),
+        archive_duplicate
+    );
+
+    let archive_cell_count = scorer_archive.cell_count(result.novelty_detail.cell_key);
+    let scorer_novelty =
+        Novelty::new(1.0 / f64::from(archive_cell_count + 1).sqrt()).expect("finite novelty");
+    assert_eq!(result.novelty_detail.cell_count, archive_cell_count);
+    assert_eq!(result.novelty_detail.count_novelty, scorer_novelty);
+    assert_eq!(result.novelty_score, scorer_novelty);
+
+    let sibling_duplicate = !sibling_hashes.insert(result.state_hash);
+    let duplicate = result.duplicate || sibling_duplicate;
     let novelty = Novelty::new(
         commit_state
             .cell_mirror
