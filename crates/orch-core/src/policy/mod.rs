@@ -11,7 +11,7 @@ use crate::mirror::CellMirror;
 use crate::plateau::PlateauKnobs;
 use crate::rng::DeterministicRng;
 use crate::tree::Tree;
-use crate::types::{CellKey, NodeId};
+use crate::types::{CellKey, NodeId, Stage};
 
 pub use crate::types::{PolicyKind, SelectionConfig};
 
@@ -21,6 +21,7 @@ pub type PolicyResult<T> = Result<T, PolicyError>;
 pub enum PolicyError {
     Frontier(FrontierError),
     EmptyCandidateSet,
+    InvalidConfig { field: &'static str },
     InvalidWeight { field: &'static str, value: f64 },
     NonFiniteValue { field: &'static str, value: f64 },
 }
@@ -30,6 +31,7 @@ impl fmt::Display for PolicyError {
         match self {
             Self::Frontier(error) => write!(formatter, "{error}"),
             Self::EmptyCandidateSet => formatter.write_str("policy candidate set is empty"),
+            Self::InvalidConfig { field } => write!(formatter, "invalid policy config {field}"),
             Self::InvalidWeight { field, value } => {
                 write!(formatter, "invalid policy weight {field}={value}")
             }
@@ -143,6 +145,7 @@ pub struct CandidateSnapshot {
     pub visits: u32,
     pub children: u32,
     pub cell: CellKey,
+    pub stage: Stage,
     pub raw_score: f64,
     pub priority_terms: PriorityTerms,
     pub priority: f64,
@@ -152,6 +155,9 @@ pub fn candidate_snapshots(context: &PolicyContext<'_>) -> PolicyResult<Vec<Cand
     validate_selection_weights(context.selection)?;
 
     let ids = context.frontier.deterministic_candidates(context.tree)?;
+    if ids.is_empty() {
+        return Err(PolicyError::EmptyCandidateSet);
+    }
     let raw_scores: Vec<f64> = ids
         .iter()
         .map(|id| {
@@ -187,6 +193,7 @@ pub fn candidate_snapshots(context: &PolicyContext<'_>) -> PolicyResult<Vec<Cand
             visits: record.visits,
             children: record.children,
             cell: record.cell,
+            stage: record.stage,
             raw_score: raw_scores[index],
             priority: terms.weighted_priority(context.selection)?,
             priority_terms: terms,
@@ -213,12 +220,39 @@ pub fn normalize_scores(scores: &[f64]) -> PolicyResult<Vec<f64>> {
     if span == 0.0 {
         return Ok(vec![0.0; scores.len()]);
     }
-    ensure_finite("score.span", span)?;
+    if !span.is_finite() {
+        return normalize_scores_with_scale(scores, min, max);
+    }
 
     scores
         .iter()
         .map(|score| {
             let normalized = (*score - min) / span;
+            ensure_finite("score.normalized", normalized)?;
+            Ok(normalized)
+        })
+        .collect()
+}
+
+fn normalize_scores_with_scale(scores: &[f64], min: f64, max: f64) -> PolicyResult<Vec<f64>> {
+    let scale = min.abs().max(max.abs());
+    ensure_finite("score.scale", scale)?;
+    if scale == 0.0 {
+        return Ok(vec![0.0; scores.len()]);
+    }
+
+    let scaled_min = min / scale;
+    let scaled_max = max / scale;
+    let span = scaled_max - scaled_min;
+    ensure_finite("score.span", span)?;
+    if span == 0.0 {
+        return Ok(vec![0.0; scores.len()]);
+    }
+
+    scores
+        .iter()
+        .map(|score| {
+            let normalized = ((*score / scale) - scaled_min) / span;
             ensure_finite("score.normalized", normalized)?;
             Ok(normalized)
         })
@@ -260,6 +294,21 @@ pub fn validate_selection_weights(selection: &SelectionConfig) -> PolicyResult<(
         return Err(PolicyError::InvalidWeight {
             field: "selection.staged.epsilon_regress",
             value: selection.staged.epsilon_regress,
+        });
+    }
+    if selection.max_visits_per_node == 0 {
+        return Err(PolicyError::InvalidConfig {
+            field: "selection.max_visits_per_node",
+        });
+    }
+    if selection.exhaust_after_dup_expansions == 0 {
+        return Err(PolicyError::InvalidConfig {
+            field: "selection.exhaust_after_dup_expansions",
+        });
+    }
+    if selection.policy == PolicyKind::Staged && selection.staged.inner == PolicyKind::Staged {
+        return Err(PolicyError::InvalidConfig {
+            field: "selection.staged.inner",
         });
     }
 
@@ -324,6 +373,7 @@ mod tests {
 
         let low = &snapshots[0];
         assert_eq!(low.raw_score, 10.0);
+        assert_eq!(low.stage, Stage::new(1));
         assert_eq!(low.priority_terms.visit_penalty, libm::log(3.0));
         assert_eq!(low.priority_terms.depth_penalty, libm::log(2.0));
         assert_eq!(low.priority_terms.novelty, 1.0 / f64::sqrt(5.0));
@@ -341,6 +391,41 @@ mod tests {
         assert_eq!(
             normalize_scores(&[7.0, 7.0, 7.0]).unwrap(),
             vec![0.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn policy_common_normalizes_extreme_finite_score_ranges() {
+        assert_eq!(
+            normalize_scores(&[-f64::MAX, 0.0, f64::MAX]).unwrap(),
+            vec![0.0, 0.5, 1.0]
+        );
+    }
+
+    #[test]
+    fn policy_common_rejects_empty_candidate_sets() {
+        let (mut tree, ids) = sample_tree();
+        let frontier = Frontier::new();
+        let mirror = sample_mirror();
+        let selection = SelectionConfig::default();
+        let plateau = plateau_knobs();
+        let context = PolicyContext::new(&tree, &frontier, &mirror, &plateau, &selection);
+
+        assert_eq!(
+            candidate_snapshots(&context),
+            Err(PolicyError::EmptyCandidateSet)
+        );
+
+        tree.mark_exhausted(ids.low).unwrap();
+        tree.mark_goal(ids.mid).unwrap();
+        let mut frontier = Frontier::new();
+        frontier.insert(ids.low).unwrap();
+        frontier.insert(ids.mid).unwrap();
+        let context = PolicyContext::new(&tree, &frontier, &mirror, &plateau, &selection);
+
+        assert_eq!(
+            candidate_snapshots(&context),
+            Err(PolicyError::EmptyCandidateSet)
         );
     }
 
@@ -372,6 +457,25 @@ mod tests {
                 value,
             }) if value.is_nan()
         ));
+
+        let mut selection = SelectionConfig::default();
+        selection.policy = PolicyKind::Staged;
+        selection.staged.inner = PolicyKind::Staged;
+        assert_eq!(
+            validate_selection_weights(&selection),
+            Err(PolicyError::InvalidConfig {
+                field: "selection.staged.inner",
+            })
+        );
+
+        let mut selection = SelectionConfig::default();
+        selection.max_visits_per_node = 0;
+        assert_eq!(
+            validate_selection_weights(&selection),
+            Err(PolicyError::InvalidConfig {
+                field: "selection.max_visits_per_node",
+            })
+        );
     }
 
     #[test]
