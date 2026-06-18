@@ -766,11 +766,36 @@ fn validate_capture_spec(capture: Option<&CaptureSpec>) -> ClientResult<()> {
 }
 
 fn inline_framebuffer(state: GridState, frame_counter: FrameCount) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(16);
-    bytes.extend_from_slice(b"gridfb1");
-    bytes.extend_from_slice(&frame_counter.get().to_le_bytes());
-    bytes.extend_from_slice(&encode_grid_features(state));
-    bytes
+    let pixels = fake_framebuffer_pixels(state, frame_counter);
+    size_prefixed_lz4_literal_block(&pixels)
+}
+
+fn fake_framebuffer_pixels(state: GridState, frame_counter: FrameCount) -> [u8; 4] {
+    [
+        (frame_counter.get() & 0xFF) as u8,
+        state.room.id(),
+        state.x,
+        state.y,
+    ]
+}
+
+fn size_prefixed_lz4_literal_block(bytes: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(bytes.len()).expect("fake framebuffer fits in u32");
+    let mut encoded = Vec::with_capacity(5 + bytes.len());
+    encoded.extend_from_slice(&len.to_le_bytes());
+    if bytes.len() < 15 {
+        encoded.push((bytes.len() as u8) << 4);
+    } else {
+        encoded.push(0xF0);
+        let mut remaining = bytes.len() - 15;
+        while remaining >= 255 {
+            encoded.push(255);
+            remaining -= 255;
+        }
+        encoded.push(remaining as u8);
+    }
+    encoded.extend_from_slice(bytes);
+    encoded
 }
 
 fn event_frame(event: &ScheduledEvent) -> FrameCount {
@@ -977,7 +1002,10 @@ mod tests {
             run.fb_info.expect("fb info").frame_counter,
             FrameCount::new(1)
         );
-        assert!(run.fb_lz4.expect("fb bytes").starts_with(b"gridfb1"));
+        assert_eq!(
+            decode_fake_fb_lz4(&run.fb_lz4.expect("fb bytes")),
+            vec![1, 0, 1, 2]
+        );
         assert!(snapshot.input_log_id.is_some());
         assert_eq!(
             snapshot.state_hash,
@@ -989,10 +1017,10 @@ mod tests {
         );
         assert_eq!(snapshot.determinism_class, fake_determinism_class());
         assert_eq!(snapshot.frame_counter, FrameCount::new(1));
-        assert!(snapshot
-            .fb_lz4
-            .expect("snapshot fb")
-            .starts_with(b"gridfb1"));
+        assert_eq!(
+            decode_fake_fb_lz4(&snapshot.fb_lz4.expect("snapshot fb")),
+            vec![1, 0, 1, 2]
+        );
     }
 
     #[test]
@@ -1396,6 +1424,16 @@ mod tests {
         assert_eq!(first.input_log_id, second.input_log_id);
         assert_eq!(first.feature_bytes, second.feature_bytes);
         assert_eq!(first.fb_lz4, second.fb_lz4);
+    }
+
+    fn decode_fake_fb_lz4(bytes: &[u8]) -> Vec<u8> {
+        let (size_prefix, block) = bytes.split_at(4);
+        let expected_len = u32::from_le_bytes(size_prefix.try_into().expect("size prefix"));
+        assert_eq!(expected_len, 4);
+        assert_eq!(block.first(), Some(&0x40));
+        let pixels = &block[1..];
+        assert_eq!(pixels.len(), expected_len as usize);
+        pixels.to_vec()
     }
 
     fn create_sample_vm(fake: &mut FakeHypervisor, seed_byte: u8) -> CreateVmResponse {
