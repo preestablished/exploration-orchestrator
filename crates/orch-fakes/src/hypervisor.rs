@@ -18,6 +18,7 @@ use orch_clients::{
 use orch_core::types::{FrameCount, GuestInstructions, SnapshotRef};
 
 use crate::{
+    fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget},
     grid::{GridAction, GridState},
     scorer::encode_grid_features,
 };
@@ -49,6 +50,8 @@ pub struct FakeHypervisor {
     snapshots: BTreeMap<SnapshotRef, SnapshotRecord>,
     watch_events: Vec<SlotEvent>,
     watch_cursor: Cell<usize>,
+    fault_injector: FaultInjector,
+    last_fault: Cell<Option<FaultDecision>>,
 }
 
 impl Default for FakeHypervisor {
@@ -65,6 +68,16 @@ impl FakeHypervisor {
 
     #[must_use]
     pub fn with_slots(slots_total: u32) -> Self {
+        Self::with_slots_and_fault_plan(slots_total, FaultPlan::disabled(0))
+    }
+
+    #[must_use]
+    pub fn with_fault_plan(fault_plan: FaultPlan) -> Self {
+        Self::with_slots_and_fault_plan(DEFAULT_SLOTS_TOTAL, fault_plan)
+    }
+
+    #[must_use]
+    pub fn with_slots_and_fault_plan(slots_total: u32, fault_plan: FaultPlan) -> Self {
         Self {
             worker_id: "fake-grid-worker-0".to_owned(),
             slots_total,
@@ -74,7 +87,14 @@ impl FakeHypervisor {
             snapshots: BTreeMap::new(),
             watch_events: Vec::new(),
             watch_cursor: Cell::new(0),
+            fault_injector: FaultInjector::new(fault_plan),
+            last_fault: Cell::new(None),
         }
+    }
+
+    #[must_use]
+    pub fn last_fault(&self) -> Option<FaultDecision> {
+        self.last_fault.get()
     }
 
     #[must_use]
@@ -173,10 +193,37 @@ impl FakeHypervisor {
             self.push_slot_event(parent_id);
         }
     }
+
+    fn preview_fault(
+        &self,
+        operation: &'static str,
+        request_identity: &[u8],
+        response_items: u32,
+    ) -> FaultDecision {
+        self.fault_injector.decide(
+            FaultRequest::new(FaultTarget::Hypervisor, operation, request_identity),
+            response_items,
+        )
+    }
+
+    fn decide_fault(
+        &self,
+        operation: &'static str,
+        request_identity: Vec<u8>,
+        response_items: u32,
+    ) -> ClientResult<FaultDecision> {
+        let decision = self.preview_fault(operation, &request_identity, response_items);
+        self.last_fault.set(Some(decision));
+        if let Some(error) = decision.client_error() {
+            return Err(error);
+        }
+        Ok(decision)
+    }
 }
 
 impl HypervisorWorkerClient for FakeHypervisor {
     fn create_vm(&mut self, request: CreateVmRequest) -> ClientResult<CreateVmResponse> {
+        self.decide_fault("create_vm", request_identity(&request), 0)?;
         self.ensure_capacity(1)?;
         let lease = self.allocate_lease(&request.config, request.entropy_seed);
         let slot = Slot::new_root(lease, request.config);
@@ -193,6 +240,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
         &mut self,
         request: RestoreSnapshotRequest,
     ) -> ClientResult<RestoreSnapshotResponse> {
+        self.decide_fault("restore_snapshot", request_identity(&request), 0)?;
         self.ensure_capacity(1)?;
         let record = self
             .snapshots
@@ -215,6 +263,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
 
     fn fork(&mut self, request: ForkRequest) -> ClientResult<ForkResponse> {
         request.validate()?;
+        self.decide_fault("fork", request_identity(&request), request.count)?;
         self.ensure_capacity(request.count)?;
         let parent = self.slot(request.parent)?.clone();
         ensure_paused(&parent, "fork")?;
@@ -242,6 +291,11 @@ impl HypervisorWorkerClient for FakeHypervisor {
         &mut self,
         request: InjectInputsRequest,
     ) -> ClientResult<InjectInputsResponse> {
+        self.decide_fault(
+            "inject_inputs",
+            request_identity(&request),
+            request.events.len() as u32,
+        )?;
         let scheduled = u32::try_from(request.events.len()).map_err(|_| {
             ClientError::new(ClientErrorKind::InvalidRequest, "too many scheduled events")
         })?;
@@ -271,6 +325,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
     }
 
     fn run(&mut self, request: RunRequest) -> ClientResult<RunResponse> {
+        self.decide_fault("run", request_identity(&request), 0)?;
         let lease = request.lease;
         let capture = request.capture;
         validate_capture_spec(capture.as_ref())?;
@@ -320,6 +375,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
         &mut self,
         request: TakeSnapshotRequest,
     ) -> ClientResult<TakeSnapshotResponse> {
+        self.decide_fault("take_snapshot", request_identity(&request), 0)?;
         let slot = self.slot(request.lease)?.clone();
         ensure_paused(&slot, "take snapshot")?;
         let machine_config_hash = machine_config_hash(&slot.config);
@@ -371,6 +427,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
     }
 
     fn destroy_vm(&mut self, request: DestroyVmRequest) -> ClientResult<DestroyVmResponse> {
+        self.decide_fault("destroy_vm", request_identity(&request), 0)?;
         let slot = self.slot(request.lease)?.clone();
         if slot.state_kind == SlotState::Running {
             return Err(ClientError::new(
@@ -404,24 +461,32 @@ impl HypervisorWorkerClient for FakeHypervisor {
         Ok(DestroyVmResponse)
     }
 
-    fn list_slots(&self, _request: ListSlotsRequest) -> ClientResult<ListSlotsResponse> {
-        Ok(ListSlotsResponse {
-            slots: self
-                .slots
-                .values()
-                .map(|slot| self.slot_info(slot))
-                .collect(),
-        })
+    fn list_slots(&self, request: ListSlotsRequest) -> ClientResult<ListSlotsResponse> {
+        let mut slots = self
+            .slots
+            .values()
+            .map(|slot| self.slot_info(slot))
+            .collect::<Vec<_>>();
+        let decision =
+            self.decide_fault("list_slots", request_identity(&request), slots.len() as u32)?;
+        slots.truncate(decision.truncate_len(slots.len()));
+        Ok(ListSlotsResponse { slots })
     }
 
-    fn watch_slots(&self, _request: WatchSlotsRequest) -> ClientResult<WatchSlotsResponse> {
+    fn watch_slots(&self, request: WatchSlotsRequest) -> ClientResult<WatchSlotsResponse> {
         let start = self.watch_cursor.get().min(self.watch_events.len());
-        let events = self.watch_events[start..].to_vec();
-        self.watch_cursor.set(self.watch_events.len());
+        let available = self.watch_events.len() - start;
+        let decision =
+            self.decide_fault("watch_slots", request_identity(&request), available as u32)?;
+        let keep = decision.truncate_len(available);
+        let end = start + keep;
+        let events = self.watch_events[start..end].to_vec();
+        self.watch_cursor.set(end);
         Ok(WatchSlotsResponse { events })
     }
 
-    fn worker_info(&self, _request: GetWorkerInfoRequest) -> ClientResult<GetWorkerInfoResponse> {
+    fn worker_info(&self, request: GetWorkerInfoRequest) -> ClientResult<GetWorkerInfoResponse> {
+        self.decide_fault("worker_info", request_identity(&request), 0)?;
         let used = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
         Ok(GetWorkerInfoResponse {
             worker_id: self.worker_id.clone(),
@@ -920,6 +985,10 @@ fn digest32<T: serde::Serialize>(domain: &[u8], value: &T) -> Digest32 {
         domain,
         &postcard::to_allocvec(value).expect("value serializes"),
     ))
+}
+
+fn request_identity<T: serde::Serialize>(request: &T) -> Vec<u8> {
+    postcard::to_allocvec(request).expect("hypervisor request DTO serializes")
 }
 
 fn digest_bytes(domain: &[u8], bytes: &[u8]) -> [u8; DIGEST32_LEN] {

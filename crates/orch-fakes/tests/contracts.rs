@@ -1,6 +1,12 @@
 use std::collections::BTreeMap;
 
 use orch_clients::{
+    hypervisor::{
+        BootSpec, CreateVmRequest, Digest32 as HypervisorDigest32, ElfBoot, EntropySeed,
+        HashEpochs, HypervisorWorkerClient, InjectInputsRequest, InputEvent, ListSlotsRequest,
+        MachineConfig, PadSet, RunRequest, RunUntil, ScheduleAt, ScheduledEvent,
+        TakeSnapshotRequest,
+    },
     input_synth::{
         DocumentKind, HealthRequest, HealthStatus, InputSynthClient, LoadMacroPackRequest,
         LoadMacroPackSource, ModelKind, NodeContext, ProposeBurstsRequest,
@@ -20,11 +26,9 @@ use orch_core::types::{
     CellKey, FrameCount, NodeId, NodeStatus, Novelty, Score, SnapshotRef, Stage, StateHash,
 };
 use orch_fakes::{
-    fault::{
-        FaultInjector, FaultPlan, FaultRate, FaultRequest, FaultTarget, LatencyFault,
-        PartialResponseFault,
-    },
+    fault::{FaultPlan, FaultRate, LatencyFault, PartialResponseFault},
     grid::{GridAction, GridState},
+    hypervisor::FakeHypervisor,
     scorer::{encode_grid_features, FakeScorer, GRID_FEATURE_BYTES_LEN},
     snapshot_store::InMemorySnapshotStore,
     synth::FakeSynth,
@@ -37,46 +41,62 @@ const SNAPSHOT_B: SnapshotRef = SnapshotRef::new([0x5A; 32]);
 const STATE_A: StateHash = StateHash::new([0x11; 32]);
 
 #[test]
-fn contracts_fault_knobs_are_deterministic_for_each_fake_surface() {
-    let plan = FaultPlan::disabled(0xC0DE)
-        .with_latency(LatencyFault::new(5, 7))
-        .with_partial_response(PartialResponseFault::new(FaultRate::always(), 1));
-    for target in [
-        FaultTarget::Hypervisor,
-        FaultTarget::SnapshotStore,
-        FaultTarget::Scorer,
-        FaultTarget::Synth,
-    ] {
-        let request = FaultRequest::new(target, "contract_operation", b"stable-request");
-        let first = FaultInjector::new(plan.clone()).decide(request, 6);
-        let second = FaultInjector::new(plan.clone()).decide(request, 6);
-        let error = FaultInjector::new(
-            FaultPlan::disabled(0xC0DE).with_error(FaultRate::always(), ClientErrorKind::DataLoss),
-        )
-        .decide(request, 6)
-        .client_error()
-        .expect("forced error");
-        let timeout = FaultInjector::new(
-            FaultPlan::disabled(0xC0DE)
-                .with_timeout(FaultRate::always())
-                .with_partial_response(PartialResponseFault::new(FaultRate::always(), 0)),
-        )
-        .decide(request, 6);
-
-        assert_eq!(first, second);
-        assert!((5..=12).contains(&first.latency_ticks));
-        assert!(first.partial.expect("partial").keep_items < 6);
-        assert_eq!(error.kind(), ClientErrorKind::DataLoss);
-        assert_eq!(
-            timeout.client_error().expect("timeout").kind(),
-            ClientErrorKind::Unavailable
-        );
-        assert_eq!(timeout.partial, None);
+fn contracts_hypervisor_faults_surface_through_client_calls() {
+    let mut hypervisor = FakeHypervisor::with_slots_and_fault_plan(
+        4,
+        FaultPlan::disabled(0xC0DE)
+            .with_latency(LatencyFault::new(5, 7))
+            .with_partial_response(PartialResponseFault::new(FaultRate::always(), 1)),
+    );
+    for seed in [0x10, 0x11, 0x12] {
+        hypervisor
+            .create_vm(sample_vm_request(seed))
+            .expect("create vm");
     }
+    let latency = hypervisor.last_fault().expect("create fault decision");
+    let slots = hypervisor
+        .list_slots(ListSlotsRequest)
+        .expect("partial slot list");
+    let partial = hypervisor.last_fault().expect("list fault decision");
+    let mut erroring = FakeHypervisor::with_fault_plan(
+        FaultPlan::disabled(0xC0DE).with_error(FaultRate::always(), ClientErrorKind::DataLoss),
+    );
+    let error = erroring
+        .create_vm(sample_vm_request(0x20))
+        .expect_err("forced hypervisor error");
+    let mut timing_out = FakeHypervisor::with_fault_plan(
+        FaultPlan::disabled(0xC0DE).with_timeout(FaultRate::always()),
+    );
+    let timeout = timing_out
+        .create_vm(sample_vm_request(0x21))
+        .expect_err("forced hypervisor timeout");
+
+    assert!((5..=12).contains(&latency.latency_ticks));
+    assert_eq!(slots.slots.len(), partial.truncate_len(3));
+    assert!(slots.slots.len() < 3);
+    assert_eq!(error.kind(), ClientErrorKind::DataLoss);
+    assert_eq!(timeout.kind(), ClientErrorKind::Unavailable);
 }
 
 #[test]
 fn contracts_snapshot_store_cas_and_partial_faults_are_observable() {
+    let mut latency_store = InMemorySnapshotStore::with_fault_plan(
+        FaultPlan::disabled(0xAA55).with_latency(LatencyFault::new(4, 6)),
+    );
+    latency_store.create_node(root_request()).expect("root");
+    let latency = latency_store.last_fault().expect("latency fault decision");
+    let mut error_store = InMemorySnapshotStore::with_fault_plan(
+        FaultPlan::disabled(0xAA55).with_error(FaultRate::always(), ClientErrorKind::DataLoss),
+    );
+    let error = error_store
+        .create_node(root_request())
+        .expect_err("forced snapshot-store error");
+    let mut timeout_store = InMemorySnapshotStore::with_fault_plan(
+        FaultPlan::disabled(0xAA55).with_timeout(FaultRate::always()),
+    );
+    let timeout = timeout_store
+        .create_node(root_request())
+        .expect_err("forced snapshot-store timeout");
     let mut store = InMemorySnapshotStore::with_fault_plan(
         FaultPlan::disabled(0xAA55)
             .with_partial_response(PartialResponseFault::new(FaultRate::always(), 0)),
@@ -120,6 +140,9 @@ fn contracts_snapshot_store_cas_and_partial_faults_are_observable() {
         })
         .expect_err("stale generation");
 
+    assert!((4..=10).contains(&latency.latency_ticks));
+    assert_eq!(error.kind(), ClientErrorKind::DataLoss);
+    assert_eq!(timeout.kind(), ClientErrorKind::Unavailable);
     assert_eq!(children.children.len(), partial.truncate_len(2));
     assert!(children.children.len() < 2);
     assert_eq!(create_conflict.kind(), ClientErrorKind::FailedPrecondition);
@@ -132,12 +155,15 @@ fn contracts_synth_faults_preserve_shape_and_expose_fingerprint_flip() {
     let mut clean = configured_synth(FaultPlan::disabled(0));
     let mut faulty = configured_synth(
         FaultPlan::disabled(0xBEEF)
+            .with_latency(LatencyFault::new(2, 3))
             .with_partial_response(PartialResponseFault::new(FaultRate::always(), 0))
             .with_synth_fingerprint_flip(FaultRate::always()),
     );
     let mut erroring = configured_synth(
-        FaultPlan::disabled(0xBEEF).with_error(FaultRate::always(), ClientErrorKind::Unavailable),
+        FaultPlan::disabled(0xBEEF).with_error(FaultRate::always(), ClientErrorKind::DataLoss),
     );
+    let mut timing_out =
+        configured_synth(FaultPlan::disabled(0xBEEF).with_timeout(FaultRate::always()));
 
     let clean_response = clean
         .propose_bursts(sample_burst_request(7))
@@ -148,8 +174,14 @@ fn contracts_synth_faults_preserve_shape_and_expose_fingerprint_flip() {
     let error = erroring
         .propose_bursts(sample_burst_request(7))
         .expect_err("terminal synth fault");
+    let timeout = timing_out
+        .propose_bursts(sample_burst_request(7))
+        .expect_err("terminal synth timeout");
+    let fault = faulty.last_fault().expect("synth fault decision");
     let health = faulty.health(HealthRequest).expect("health");
 
+    assert!((2..=5).contains(&fault.latency_ticks));
+    assert!(fault.synth_fingerprint_flip.is_some());
     assert_eq!(clean_response.bursts.len(), 4);
     assert_eq!(faulty_response.bursts.len(), 4);
     assert_ne!(
@@ -160,13 +192,24 @@ fn contracts_synth_faults_preserve_shape_and_expose_fingerprint_flip() {
         .bursts
         .iter()
         .all(|burst| burst.provenance.config_fingerprint == faulty_response.config_fingerprint));
-    assert_eq!(error.kind(), ClientErrorKind::Unavailable);
+    assert_eq!(error.kind(), ClientErrorKind::DataLoss);
+    assert_eq!(timeout.kind(), ClientErrorKind::Unavailable);
     assert_eq!(health.status, HealthStatus::Serving);
 }
 
 #[test]
 fn contracts_scorer_item_errors_and_partial_fault_decisions_are_explicit() {
     let mut scorer = configured_scorer();
+    let mut partial_scorer = configured_scorer_with_fault(
+        FaultPlan::disabled(0x51)
+            .with_latency(LatencyFault::new(3, 4))
+            .with_partial_response(PartialResponseFault::new(FaultRate::always(), 1)),
+    );
+    let mut erroring = FakeScorer::with_fault_plan(
+        FaultPlan::disabled(0x51).with_error(FaultRate::always(), ClientErrorKind::DataLoss),
+    );
+    let mut timing_out =
+        FakeScorer::with_fault_plan(FaultPlan::disabled(0x51).with_timeout(FaultRate::always()));
     let valid = scorer
         .score_batch(ScoreBatchRequest {
             experiment_id: EXPERIMENT_ID.to_owned(),
@@ -195,25 +238,43 @@ fn contracts_scorer_item_errors_and_partial_fault_decisions_are_explicit() {
             return_decoded: false,
         })
         .expect("item error is per-result");
-    let partial = FaultInjector::new(
-        FaultPlan::disabled(0x51)
-            .with_partial_response(PartialResponseFault::new(FaultRate::always(), 1)),
-    )
-    .decide(
-        FaultRequest::new(FaultTarget::Scorer, "score_batch", b"states=4"),
-        4,
-    );
+    let partial_response = partial_scorer
+        .score_batch(ScoreBatchRequest {
+            experiment_id: EXPERIMENT_ID.to_owned(),
+            states: (0..4)
+                .map(|index| StateInput {
+                    node_ref: format!("partial-{index}"),
+                    feature_bytes: encode_grid_features(GridState::new()),
+                    framebuffer: None,
+                    fb_meta: None,
+                })
+                .collect(),
+            archive_update: ArchiveUpdateMode::ScoreOnly,
+            client_batch_id: "partial-batch".to_owned(),
+            return_decoded: false,
+        })
+        .expect("partial score");
+    let partial = partial_scorer.last_fault().expect("partial scorer fault");
+    let error = erroring
+        .load_feature_map(sample_feature_map_request())
+        .expect_err("forced scorer error");
+    let timeout = timing_out
+        .load_feature_map(sample_feature_map_request())
+        .expect_err("forced scorer timeout");
 
     assert_eq!(valid.results[0].error, None);
     assert_eq!(
         invalid.results[0].error.as_ref().map(|error| &error.kind),
         Some(&ItemErrorKind::FeatureLenMismatch)
     );
+    assert!((3..=7).contains(&partial.latency_ticks));
     assert_eq!(
-        partial.truncate_len(4),
+        partial_response.results.len(),
         partial.partial.expect("partial").keep_items as usize
     );
-    assert!(partial.truncate_len(4) < 4);
+    assert!(partial_response.results.len() < 4);
+    assert_eq!(error.kind(), ClientErrorKind::DataLoss);
+    assert_eq!(timeout.kind(), ClientErrorKind::Unavailable);
 }
 
 #[test]
@@ -318,47 +379,108 @@ fn sample_burst_request(seed: u64) -> ProposeBurstsRequest {
 }
 
 fn configured_scorer() -> FakeScorer {
-    let mut scorer = FakeScorer::new();
+    configured_scorer_with_fault(FaultPlan::disabled(0))
+}
+
+fn configured_scorer_with_fault(fault_plan: FaultPlan) -> FakeScorer {
+    let mut scorer = FakeScorer::with_fault_plan(fault_plan);
     scorer
-        .load_feature_map(LoadFeatureMapRequest {
-            experiment_id: EXPERIMENT_ID.to_owned(),
-            source: ArtifactSource::InlineYaml(b"feature-map: contracts\n".to_vec()),
-            layout: CompiledLayout {
-                ranges: vec![ExtractRange {
-                    region: "grid".to_owned(),
-                    layout_version: 1,
-                    offset: 0,
-                    len: GRID_FEATURE_BYTES_LEN,
-                }],
-            },
-            frame: None,
-            rebin: false,
-        })
+        .load_feature_map(sample_feature_map_request())
         .expect("feature map");
     scorer
-        .load_scoring_program(LoadScoringProgramRequest {
-            experiment_id: EXPERIMENT_ID.to_owned(),
-            source: ArtifactSource::InlineYaml(b"score: contracts\n".to_vec()),
-        })
+        .load_scoring_program(sample_scoring_program_request())
         .expect("scoring program");
     scorer
 }
 
-fn grid_transcript_with_disabled_faults(seed: u64) -> orch_fakes::transcript::TranscriptHash {
-    let injector = FaultInjector::new(FaultPlan::disabled(seed));
-    let request = FaultRequest::new(FaultTarget::Grid, "transcript", b"fixed-path");
-    let decision = injector.decide(request, 3);
-    assert_eq!(decision.client_error(), None);
-    assert_eq!(decision.partial, None);
-
-    let mut transcript = TranscriptBuilder::new(99);
-    let mut state = GridState::new();
-    transcript.append_state(state);
-    for action in [GridAction::Right, GridAction::Right, GridAction::Wait] {
-        let (next, outcome) = state.step(action);
-        transcript.append_step(state, action, next, outcome);
-        state = next;
+fn sample_feature_map_request() -> LoadFeatureMapRequest {
+    LoadFeatureMapRequest {
+        experiment_id: EXPERIMENT_ID.to_owned(),
+        source: ArtifactSource::InlineYaml(b"feature-map: contracts\n".to_vec()),
+        layout: CompiledLayout {
+            ranges: vec![ExtractRange {
+                region: "grid".to_owned(),
+                layout_version: 1,
+                offset: 0,
+                len: GRID_FEATURE_BYTES_LEN,
+            }],
+        },
+        frame: None,
+        rebin: false,
     }
+}
+
+fn sample_scoring_program_request() -> LoadScoringProgramRequest {
+    LoadScoringProgramRequest {
+        experiment_id: EXPERIMENT_ID.to_owned(),
+        source: ArtifactSource::InlineYaml(b"score: contracts\n".to_vec()),
+    }
+}
+
+fn sample_vm_request(seed_byte: u8) -> CreateVmRequest {
+    CreateVmRequest {
+        config: sample_machine_config(),
+        entropy_seed: EntropySeed::new([seed_byte; 32]),
+    }
+}
+
+fn sample_machine_config() -> MachineConfig {
+    MachineConfig {
+        version: 1,
+        mem_bytes: 128 * 1024 * 1024,
+        vcpus: 1,
+        clock_num: 1,
+        clock_den: 1,
+        base_image_hash: HypervisorDigest32::new([0xAA; 32]),
+        boot: BootSpec::Elf(ElfBoot {
+            kernel_hash: HypervisorDigest32::new([0xBB; 32]),
+            cmdline: b"console=ttyS0".to_vec(),
+        }),
+        epoch_len: orch_core::types::GuestInstructions::new(50_000_000),
+        hash_epochs: HashEpochs::EpochsOn,
+        skid_margin: 8192,
+    }
+}
+
+fn grid_transcript_with_disabled_faults(seed: u64) -> orch_fakes::transcript::TranscriptHash {
+    let mut hypervisor = FakeHypervisor::with_fault_plan(FaultPlan::disabled(seed));
+    let created = hypervisor
+        .create_vm(sample_vm_request(0x70))
+        .expect("create vm");
+    hypervisor
+        .inject_inputs(InjectInputsRequest {
+            lease: created.lease,
+            events: vec![ScheduledEvent {
+                at: ScheduleAt::Frame(FrameCount::new(1)),
+                event: InputEvent::PadSet(PadSet {
+                    port: 0,
+                    buttons: 0b10_0000_0000,
+                }),
+            }],
+        })
+        .expect("inject input");
+    let run = hypervisor
+        .run(RunRequest {
+            lease: created.lease,
+            until: RunUntil::FrameBudget(FrameCount::new(1)),
+            hard_icount_cap: None,
+            capture: None,
+        })
+        .expect("run frame");
+    let snapshot = hypervisor
+        .take_snapshot(TakeSnapshotRequest {
+            lease: created.lease,
+            seal_input_log: true,
+            capture: None,
+        })
+        .expect("snapshot");
+    let mut transcript = TranscriptBuilder::new(99);
+    let state = GridState::new();
+    let (next, outcome) = state.step(GridAction::Right);
+    assert_eq!(run.state_hash, next.state_hash());
+    assert_eq!(snapshot.state_hash, next.state_hash());
+    transcript.append_state(state);
+    transcript.append_step(state, GridAction::Right, next, outcome);
     transcript.finish()
 }
 

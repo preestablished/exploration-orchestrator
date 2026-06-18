@@ -3,7 +3,7 @@
 //! This fake satisfies [`orch_clients::input_synth::InputSynthClient`] without
 //! transport, filesystem, wall-clock, or policy-service dependencies.
 
-use std::{collections::BTreeMap, str};
+use std::{cell::Cell, collections::BTreeMap, str};
 
 use orch_clients::{
     input_synth::{
@@ -22,7 +22,7 @@ use orch_core::{
     types::{FiniteF64, FrameCount, Score},
 };
 
-use crate::fault::{FaultInjector, FaultPlan, FaultRequest, FaultTarget};
+use crate::fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget};
 
 pub const FAKE_SYNTH_VERSION: &str = "fake-synth/0.1";
 pub const MAX_PROPOSE_BURSTS: u32 = 256;
@@ -45,6 +45,7 @@ pub struct FakeSynth {
     loaded_packs: BTreeMap<String, FakeMacroPack>,
     loaded_experiments: BTreeMap<String, FakeExperimentConfig>,
     fault_injector: FaultInjector,
+    last_fault: Cell<Option<FaultDecision>>,
 }
 
 impl Default for FakeSynth {
@@ -66,7 +67,13 @@ impl FakeSynth {
             loaded_packs: BTreeMap::new(),
             loaded_experiments: BTreeMap::new(),
             fault_injector: FaultInjector::new(fault_plan),
+            last_fault: Cell::new(None),
         }
+    }
+
+    #[must_use]
+    pub fn last_fault(&self) -> Option<FaultDecision> {
+        self.last_fault.get()
     }
 
     #[must_use]
@@ -439,6 +446,7 @@ impl InputSynthClient for FakeSynth {
             FaultRequest::new(FaultTarget::Synth, "propose_bursts", &request_identity),
             request.k,
         );
+        self.last_fault.set(Some(fault_decision));
         if let Some(error) = fault_decision.client_error() {
             return Err(error);
         }

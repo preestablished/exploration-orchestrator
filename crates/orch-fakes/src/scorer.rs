@@ -3,7 +3,10 @@
 //! This fake satisfies [`orch_clients::scorer::StateScorerClient`] over the
 //! synthetic grid-world capture format used by in-repository fake services.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use orch_clients::{
     scorer::{
@@ -19,7 +22,10 @@ use orch_clients::{
 use orch_core::types::{CellKey, FiniteF64, Novelty, Score, Stage, StateHash};
 use serde::{Deserialize, Serialize};
 
-use crate::grid::{GridState, Room, BOSS_MAX_HP, GRID_HEIGHT, GRID_WIDTH};
+use crate::{
+    fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget},
+    grid::{GridState, Room, BOSS_MAX_HP, GRID_HEIGHT, GRID_WIDTH},
+};
 
 pub const MAX_SCORE_BATCH_ITEMS: usize = 256;
 pub const GRID_FEATURE_BYTES_LEN: u32 = 5;
@@ -33,16 +39,54 @@ const COMPONENT_NAMES: [&str; 5] = [
 ];
 const STAGE_NAMES: [&str; 4] = ["start", "key", "boss", "credits"];
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FakeScorer {
     experiments: BTreeMap<String, ExperimentArchive>,
     checkpoints: BTreeMap<CheckpointKey, ArchiveSnapshot>,
+    #[serde(skip, default = "default_fault_injector")]
+    fault_injector: FaultInjector,
+    #[serde(skip, default)]
+    last_fault: Cell<Option<FaultDecision>>,
+}
+
+impl Default for FakeScorer {
+    fn default() -> Self {
+        Self::with_fault_plan(FaultPlan::disabled(0))
+    }
 }
 
 impl FakeScorer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn with_fault_plan(fault_plan: FaultPlan) -> Self {
+        Self {
+            experiments: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
+            fault_injector: FaultInjector::new(fault_plan),
+            last_fault: Cell::new(None),
+        }
+    }
+
+    #[must_use]
+    pub fn last_fault(&self) -> Option<FaultDecision> {
+        self.last_fault.get()
+    }
+
+    #[must_use]
+    pub fn preview_fault(
+        &self,
+        operation: &'static str,
+        request_identity: &[u8],
+        response_items: u32,
+    ) -> FaultDecision {
+        self.fault_injector.decide(
+            FaultRequest::new(FaultTarget::Scorer, operation, request_identity),
+            response_items,
+        )
     }
 
     #[must_use]
@@ -79,6 +123,20 @@ impl FakeScorer {
         archive.ensure_loaded()?;
         Ok(archive)
     }
+
+    fn decide_fault(
+        &self,
+        operation: &'static str,
+        request_identity: Vec<u8>,
+        response_items: u32,
+    ) -> ClientResult<FaultDecision> {
+        let decision = self.preview_fault(operation, &request_identity, response_items);
+        self.last_fault.set(Some(decision));
+        if let Some(error) = decision.client_error() {
+            return Err(error);
+        }
+        Ok(decision)
+    }
 }
 
 impl StateScorerClient for FakeScorer {
@@ -86,6 +144,7 @@ impl StateScorerClient for FakeScorer {
         &mut self,
         request: LoadFeatureMapRequest,
     ) -> ClientResult<LoadFeatureMapResponse> {
+        self.decide_fault("load_feature_map", request_identity(&request), 0)?;
         let feature_map_hash = hash_artifact_source(b"feature-map", &request.source);
         let feature_bytes_len = layout_len(&request.layout)?;
         let layout_signature = layout_signature(&request.layout);
@@ -132,6 +191,7 @@ impl StateScorerClient for FakeScorer {
         &mut self,
         request: LoadScoringProgramRequest,
     ) -> ClientResult<LoadScoringProgramResponse> {
+        self.decide_fault("load_scoring_program", request_identity(&request), 0)?;
         let archive = self.archive_mut(&request.experiment_id);
         if archive.feature_map_hash.is_none() {
             return Err(ClientError::new(
@@ -170,17 +230,27 @@ impl StateScorerClient for FakeScorer {
                 ),
             ));
         }
+        let decision = self.decide_fault(
+            "score_batch",
+            request_identity(&request),
+            request.states.len() as u32,
+        )?;
+        let keep_items = decision.truncate_len(request.states.len());
 
         let archive = self.loaded_archive_mut(&request.experiment_id)?;
         if let Some(cached) = archive.batch_cache.get(&request.client_batch_id) {
-            return Ok(cached.clone());
+            let mut cached = cached.clone();
+            cached
+                .results
+                .truncate(decision.truncate_len(cached.results.len()));
+            return Ok(cached);
         }
 
         let seen_before = archive.seen_hashes.clone();
         let cell_counts_before = archive.cell_counts.clone();
         let mut results = Vec::with_capacity(request.states.len());
         let mut scored_states = Vec::new();
-        for input in &request.states {
+        for input in request.states.iter().take(keep_items) {
             let scored = score_state_input(
                 input.node_ref.clone(),
                 &input.feature_bytes,
@@ -225,6 +295,7 @@ impl StateScorerClient for FakeScorer {
         &mut self,
         request: CheckpointArchiveRequest,
     ) -> ClientResult<CheckpointArchiveResponse> {
+        self.decide_fault("checkpoint_archive", request_identity(&request), 0)?;
         let archive = self.loaded_archive(&request.experiment_id)?;
         let snapshot = archive.snapshot()?;
         let archive_hash = snapshot.hash();
@@ -253,6 +324,7 @@ impl StateScorerClient for FakeScorer {
         &mut self,
         request: RestoreArchiveRequest,
     ) -> ClientResult<RestoreArchiveResponse> {
+        self.decide_fault("restore_archive", request_identity(&request), 0)?;
         let key = CheckpointKey {
             experiment_id: request.experiment_id.clone(),
             checkpoint_id: request.checkpoint_id,
@@ -286,11 +358,17 @@ impl StateScorerClient for FakeScorer {
         &mut self,
         request: ReplayCommitsRequest,
     ) -> ClientResult<ReplayCommitsResponse> {
+        let decision = self.decide_fault(
+            "replay_commits",
+            request_identity(&request),
+            request.states.len() as u32,
+        )?;
+        let keep_items = decision.truncate_len(request.states.len());
         let archive = self.loaded_archive_mut(&request.experiment_id)?;
         let mut applied = 0u64;
         let mut skipped = 0u64;
 
-        for state in request.states {
+        for state in request.states.into_iter().take(keep_items) {
             if archive.seen_hashes.insert(state.state_hash) {
                 *archive.cell_counts.entry(state.cell_key).or_default() += 1;
                 applied += 1;
@@ -664,6 +742,14 @@ fn layout_len(layout: &orch_clients::scorer::CompiledLayout) -> ClientResult<u32
             )
         })
     })
+}
+
+fn default_fault_injector() -> FaultInjector {
+    FaultInjector::new(FaultPlan::disabled(0))
+}
+
+fn request_identity<T: Serialize>(request: &T) -> Vec<u8> {
+    postcard::to_allocvec(request).expect("scorer request DTO serializes")
 }
 
 fn layout_signature(layout: &orch_clients::scorer::CompiledLayout) -> Digest32 {
