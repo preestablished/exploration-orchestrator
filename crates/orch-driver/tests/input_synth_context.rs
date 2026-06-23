@@ -178,6 +178,21 @@ fn bringup_checks_required_pack_ids_from_config_health() {
         .any(|pack| pack == "required-pack"));
 }
 
+#[test]
+fn bringup_checks_loaded_experiment_from_health() {
+    let bringup = synth_bringup();
+    let mut synth = MissingExperimentHealthSynth::new(FakeSynth::new());
+
+    let error = bringup
+        .run(&mut synth)
+        .expect_err("health must include requested experiment");
+
+    assert_eq!(
+        error.kind(),
+        orch_clients::ClientErrorKind::FailedPrecondition
+    );
+}
+
 fn request_for(
     node_id: NodeId,
     batch_seq: u64,
@@ -455,6 +470,43 @@ impl InputSynthClient for RecordingSynth {
         request: ProposeBurstsRequest,
     ) -> ClientResult<ProposeBurstsResponse> {
         self.last_request = Some(request.clone());
+        self.inner.propose_bursts(request)
+    }
+
+    fn mine_macros(&mut self, request: MineMacrosRequest) -> ClientResult<MineMacrosResponse> {
+        self.inner.mine_macros(request)
+    }
+}
+
+#[derive(Debug)]
+struct MissingExperimentHealthSynth {
+    inner: FakeSynth,
+}
+
+impl MissingExperimentHealthSynth {
+    fn new(inner: FakeSynth) -> Self {
+        Self { inner }
+    }
+}
+
+impl InputSynthClient for MissingExperimentHealthSynth {
+    fn load_macro_pack(
+        &mut self,
+        request: LoadMacroPackRequest,
+    ) -> ClientResult<LoadMacroPackResponse> {
+        self.inner.load_macro_pack(request)
+    }
+
+    fn health(&self, request: HealthRequest) -> ClientResult<HealthResponse> {
+        let mut response = self.inner.health(request)?;
+        response.loaded_experiments.clear();
+        Ok(response)
+    }
+
+    fn propose_bursts(
+        &mut self,
+        request: ProposeBurstsRequest,
+    ) -> ClientResult<ProposeBurstsResponse> {
         self.inner.propose_bursts(request)
     }
 

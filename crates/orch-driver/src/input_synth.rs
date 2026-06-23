@@ -370,7 +370,8 @@ pub const fn tonic_code_to_client_error_kind(code: Code) -> ClientErrorKind {
         Code::AlreadyExists => ClientErrorKind::AlreadyExists,
         Code::ResourceExhausted => ClientErrorKind::ResourceExhausted,
         Code::Unavailable | Code::DeadlineExceeded => ClientErrorKind::Unavailable,
-        Code::Internal | Code::DataLoss | Code::Unknown => ClientErrorKind::Internal,
+        Code::DataLoss => ClientErrorKind::DataLoss,
+        Code::Internal | Code::Unknown => ClientErrorKind::Internal,
         _ => ClientErrorKind::Internal,
     }
 }
@@ -489,6 +490,19 @@ impl SynthBringup {
                 format!(
                     "input synthesizer health is missing loaded macro packs: {}",
                     missing.join(", ")
+                ),
+            ));
+        }
+        if !health
+            .loaded_experiments
+            .iter()
+            .any(|experiment_id| experiment_id == &self.experiment_id)
+        {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                format!(
+                    "input synthesizer health is missing loaded experiment '{}'",
+                    self.experiment_id
                 ),
             ));
         }
@@ -745,7 +759,7 @@ pub fn propose_bursts_with_fingerprint_guard<C: InputSynthClient>(
 
 fn runtime() -> ClientResult<Runtime> {
     tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
         .map_err(|error| {
             ClientError::new(
@@ -849,11 +863,12 @@ fn wire_to_dto_provenanced_burst(burst: wire::ProvenancedBurst) -> ClientResult<
 fn dto_to_wire_burst(burst: &Burst) -> ClientResult<wire::Burst> {
     Ok(wire::Burst {
         format_version: burst.format_version,
-        burst_id: burst.burst_id.as_bytes().to_vec(),
         body: Some(match &burst.body {
             BurstBody::Pad(pad) => wire::burst::Body::Pad(dto_to_wire_pad_burst(pad)),
             BurstBody::Event(event) => wire::burst::Body::Event(dto_to_wire_event_burst(event)?),
         }),
+        burst_id: burst.burst_id.as_bytes().to_vec(),
+        ..Default::default()
     })
 }
 
@@ -890,8 +905,9 @@ fn dto_to_wire_pad_burst(pad: &PadBurst) -> wire::PadBurst {
             .segments
             .iter()
             .map(|segment| wire::PadSegment {
+                start_frame: 0,
+                frames: segment.hold_frames.get(),
                 buttons: segment.buttons,
-                hold_frames: segment.hold_frames.get(),
             })
             .collect(),
         button_alphabet: pad.button_alphabet.clone(),
@@ -905,7 +921,7 @@ fn wire_to_dto_pad_burst(pad: wire::PadBurst) -> PadBurst {
             .into_iter()
             .map(|segment| PadSegment {
                 buttons: segment.buttons,
-                hold_frames: FrameCount::new(segment.hold_frames),
+                hold_frames: FrameCount::new(segment.frames),
             })
             .collect(),
         button_alphabet: pad.button_alphabet,
@@ -999,6 +1015,8 @@ fn wire_to_dto_field_value(value: wire::FieldValue) -> ClientResult<FieldValue> 
 }
 
 fn dto_to_wire_provenance(provenance: &Provenance) -> ClientResult<wire::Provenance> {
+    validate_provenance_payloads(provenance, ClientErrorKind::InvalidRequest)?;
+
     Ok(wire::Provenance {
         generator: dto_generator_kind_to_wire(provenance.generator) as i32,
         slot: provenance.slot,
@@ -1025,7 +1043,7 @@ fn dto_to_wire_provenance(provenance: &Provenance) -> ClientResult<wire::Provena
 }
 
 fn wire_to_dto_provenance(provenance: wire::Provenance) -> ClientResult<Provenance> {
-    Ok(Provenance {
+    let dto = Provenance {
         generator: wire_generator_kind_to_dto_required(provenance.generator)?,
         slot: provenance.slot,
         rng_stream: provenance.rng_stream,
@@ -1040,7 +1058,66 @@ fn wire_to_dto_provenance(provenance: wire::Provenance) -> ClientResult<Provenan
             .policy
             .map(wire_to_dto_policy_provenance)
             .transpose()?,
-    })
+    };
+    validate_provenance_payloads(&dto, ClientErrorKind::DataLoss)?;
+    Ok(dto)
+}
+
+fn validate_provenance_payloads(
+    provenance: &Provenance,
+    kind: ClientErrorKind,
+) -> ClientResult<()> {
+    let macro_set = provenance.macro_provenance.is_some();
+    let mutation_set = provenance.mutation_provenance.is_some();
+    let policy_set = provenance.policy_provenance.is_some();
+
+    let expected_payload = match provenance.generator {
+        GeneratorKind::WeightedRandom => None,
+        GeneratorKind::Macro => Some("macro"),
+        GeneratorKind::Mutation => Some("mutation"),
+        GeneratorKind::Policy => Some("policy"),
+    };
+    let actual_count = usize::from(macro_set) + usize::from(mutation_set) + usize::from(policy_set);
+
+    if expected_payload.is_none() {
+        if actual_count == 0 {
+            return Ok(());
+        }
+        return Err(ClientError::new(
+            kind,
+            "weighted-random provenance must not include generator-specific payloads",
+        ));
+    }
+
+    if actual_count != 1 {
+        return Err(ClientError::new(
+            kind,
+            format!(
+                "{:?} provenance must include exactly one matching generator payload",
+                provenance.generator
+            ),
+        ));
+    }
+
+    let payload_matches = match provenance.generator {
+        GeneratorKind::WeightedRandom => true,
+        GeneratorKind::Macro => macro_set,
+        GeneratorKind::Mutation => mutation_set,
+        GeneratorKind::Policy => policy_set,
+    };
+
+    if payload_matches {
+        Ok(())
+    } else {
+        Err(ClientError::new(
+            kind,
+            format!(
+                "{:?} provenance must include {} payload only",
+                provenance.generator,
+                expected_payload.expect("non-weighted generators have payloads")
+            ),
+        ))
+    }
 }
 
 fn dto_to_wire_macro_provenance(provenance: &MacroProvenance) -> wire::MacroProvenance {

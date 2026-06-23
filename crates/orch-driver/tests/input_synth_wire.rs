@@ -6,7 +6,7 @@ use orch_clients::{
         GeneratorKind, GrammarEvent, GrammarField, HealthStatus, LoadMacroPackRequest,
         LoadMacroPackSource, MacroProvenance, MineMacrosRequest, MiningParams, ModelKind,
         MutationOp, MutationProvenance, NodeContext, PadBurst, PadSegment, PathSample,
-        PolicyProvenance, ProposeBurstsRequest, Provenance, ProvenancedBurst, ScoredBurst,
+        ProposeBurstsRequest, Provenance, ProvenancedBurst, ScoredBurst,
     },
     ClientErrorKind,
 };
@@ -237,14 +237,47 @@ fn mutation_provenance_ids_are_length_checked_on_request_and_response() {
 }
 
 #[test]
-fn generated_non_finite_response_numbers_are_data_loss() {
+fn generator_specific_provenance_payloads_are_required_and_exclusive() {
     let request = sample_request(1);
-    let mut response = sample_wire_response(&request, FP_A);
-    response.bursts[0]
+
+    let mut missing_macro = sample_wire_response(&request, FP_A);
+    missing_macro.bursts[0]
+        .provenance
+        .as_mut()
+        .expect("provenance")
+        .r#macro = None;
+    assert_data_loss(&request, missing_macro);
+
+    let mut extra_policy = sample_wire_response(&request, FP_A);
+    extra_policy.bursts[0]
         .provenance
         .as_mut()
         .expect("provenance")
         .policy = Some(wire::PolicyProvenance {
+        model_id: "policy".to_owned(),
+        model_version: "v1".to_owned(),
+        temperature: 0.8,
+        server_attested_deterministic: true,
+    });
+    assert_data_loss(&request, extra_policy);
+
+    let mut weighted_with_payload = sample_wire_response(&request, FP_A);
+    let provenance = weighted_with_payload.bursts[0]
+        .provenance
+        .as_mut()
+        .expect("provenance");
+    provenance.generator = wire::GeneratorKind::WeightedRandom as i32;
+    assert_data_loss(&request, weighted_with_payload);
+}
+
+#[test]
+fn generated_non_finite_response_numbers_are_data_loss() {
+    let request = sample_request(1);
+    let mut response = sample_wire_response(&request, FP_A);
+    let provenance = response.bursts[0].provenance.as_mut().expect("provenance");
+    provenance.generator = wire::GeneratorKind::Policy as i32;
+    provenance.r#macro = None;
+    provenance.policy = Some(wire::PolicyProvenance {
         model_id: "policy".to_owned(),
         model_version: "v1".to_owned(),
         temperature: f64::NAN,
@@ -346,6 +379,10 @@ fn tonic_status_mapping_matches_client_error_contract() {
         tonic_code_to_client_error_kind(Code::Internal),
         ClientErrorKind::Internal
     );
+    assert_eq!(
+        tonic_code_to_client_error_kind(Code::DataLoss),
+        ClientErrorKind::DataLoss
+    );
 }
 
 fn assert_data_loss(request: &ProposeBurstsRequest, response: wire::ProposeBurstsResponse) {
@@ -405,14 +442,16 @@ fn sample_wire_response(
 fn sample_wire_burst(slot: u32) -> wire::Burst {
     wire::Burst {
         format_version: wire::BURST_FORMAT_VERSION,
-        burst_id: [slot as u8; 32].to_vec(),
         body: Some(wire::burst::Body::Pad(wire::PadBurst {
             segments: vec![wire::PadSegment {
+                start_frame: 0,
+                frames: 4,
                 buttons: slot,
-                hold_frames: 4,
             }],
             button_alphabet: "console16-12btn-v1".to_owned(),
         })),
+        burst_id: [slot as u8; 32].to_vec(),
+        ..Default::default()
     }
 }
 
@@ -505,12 +544,7 @@ fn sample_provenance(
             }],
             post_clamp: true,
         }),
-        policy_provenance: Some(PolicyProvenance {
-            model_id: "policy".to_owned(),
-            model_version: "v1".to_owned(),
-            temperature: finite(0.8),
-            server_attested_deterministic: true,
-        }),
+        policy_provenance: None,
     }
 }
 
