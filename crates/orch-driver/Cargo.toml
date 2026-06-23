@@ -10,6 +10,8 @@ orch-core = { path = "../orch-core" }
 orch-proto = { path = "../orch-proto" }
 postcard.workspace = true
 serde.workspace = true
+tokio.workspace = true
+tonic.workspace = true
 
 [dev-dependencies]
 orch-fakes = { path = "../orch-fakes" }
