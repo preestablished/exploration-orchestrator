@@ -5,5 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+orch-clients = { path = "../orch-clients" }
 orch-core = { path = "../orch-core" }
 orch-proto = { path = "../orch-proto" }
+postcard.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+orch-fakes = { path = "../orch-fakes" }

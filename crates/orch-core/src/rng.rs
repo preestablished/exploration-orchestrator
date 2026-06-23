@@ -142,6 +142,15 @@ pub fn derive_stream_seed(seed: u64, purpose: RngPurpose, batch_seq: u64) -> [u8
     *hasher.finalize().as_bytes()
 }
 
+/// Derives the only orchestrator seed used for one input-synth request.
+///
+/// The request seed is the first `next_u64()` draw from
+/// [`DeterministicRng::synth`] for the experiment seed and expansion batch
+/// sequence. Node ids are not part of this seed rule.
+pub fn derive_synth_request_seed(experiment_seed: u64, batch_seq: u64) -> u64 {
+    DeterministicRng::synth(experiment_seed, batch_seq).next_u64()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +222,14 @@ mod tests {
             );
             assert_eq!(rng.draw_count(), 3);
         }
+    }
+
+    #[test]
+    fn synth_request_seed_uses_first_synth_stream_draw() {
+        assert_eq!(
+            derive_synth_request_seed(GOLDEN_SEED, 7),
+            8_371_989_289_210_138_313
+        );
     }
 
     #[test]

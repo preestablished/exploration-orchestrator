@@ -213,8 +213,12 @@ dependencies = [
 name = "orch-driver"
 version = "0.1.0"
 dependencies = [
+ "orch-clients",
  "orch-core",
+ "orch-fakes",
  "orch-proto",
+ "postcard",
+ "serde",
 ]
 
 [[package]]
