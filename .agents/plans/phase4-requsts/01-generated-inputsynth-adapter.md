@@ -4,12 +4,13 @@ Goal: implement a real generated-proto client for `determinism.inputsynth.v1.Inp
 
 Prerequisite:
 
-- Control-plane must publish the complete generated Rust/prost/tonic facade for `determinism.inputsynth.v1`, including `InputSynthesizerClient`, `LoadMacroPack`, `Health`, `ProposeBursts`, `NodeContext`, `ProvenancedBurst`, and `ScoredBurst`.
+- Control-plane must publish the complete generated Rust/prost/tonic facade for `determinism.inputsynth.v1`, including the tonic client module, all request/response messages, all enums, `NodeContext`, `ProvenancedBurst`, `ScoredBurst`, and `MineMacros` messages.
+- Do not treat the current `determinism_proto::inputsynth::v1` stub as usable. Block until the facade exposes the real tonic client, likely `input_synthesizer_client::InputSynthesizerClient`, plus all v1 messages/enums.
 - If that facade is not present, stop this slice after adding a clear Beads blocker that names the missing generated symbols. Do not invent local proto replacements.
 
 Crate placement:
 
-- Update `crates/orch-proto` to re-export the generated input-synth v1 module, next to the existing orchestrator re-export.
+- Update `crates/orch-proto` to re-export the generated input-synth v1 module under an explicit namespace such as `orch_proto::inputsynth::v1`. Do not add a second ambiguous top-level `v1`.
 - Implement the adapter in `crates/orch-driver/src/input_synth.rs`.
 - Keep `orch-clients` DTOs and traits synchronous and transport-free.
 - Let `orch-driver` own tonic, tokio runtime/handle usage, deadlines, and status mapping.
@@ -31,8 +32,9 @@ Adapter shape:
 
 Required public helpers:
 
-- DTO to wire request converters for `LoadMacroPackRequest`, `HealthRequest`, and `ProposeBurstsRequest`.
-- Wire to DTO response converters for `LoadMacroPackResponse`, `HealthResponse`, and `ProposeBurstsResponse`.
+- DTO to wire request converters for `LoadMacroPackRequest`, `HealthRequest`, `ProposeBurstsRequest`, and `MineMacrosRequest`.
+- Wire to DTO response converters for `LoadMacroPackResponse`, `HealthResponse`, `ProposeBurstsResponse`, and `MineMacrosResponse`.
+- Implement the adapter method for `mine_macros`. If the generated facade lacks `MineMacros`, return a deliberate `ClientErrorKind::FailedPrecondition` or block the slice; do not leave a placeholder that compiles but silently drops the call.
 - A small adapter config type containing endpoint, deadline, and retry budget. Keep retries outside the raw tonic conversion helpers so tests can exercise response validation without network.
 
 Out of scope for this slice:
@@ -48,4 +50,3 @@ Definition of done:
 - The generated adapter implements the existing `InputSynthClient` trait.
 - `orch-clients` and `orch-fakes` have no tonic/tokio dependency.
 - Error mapping is covered by unit tests using direct converter/status helpers, with network tests behind an opt-in feature if needed.
-

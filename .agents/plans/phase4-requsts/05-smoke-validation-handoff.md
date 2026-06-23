@@ -31,7 +31,13 @@ Quality gates:
 - `cargo test -p orch-driver`
 - `cargo test -p orch-fakes`
 - `cargo test --workspace`
-- If adapter tests need the real generated facade and the facade is unavailable, mark only that Beads issue blocked and keep pure DTO/context tests runnable.
+
+Gate matrix:
+
+- If the generated input-synth facade is unavailable, leave no partial generated-adapter code in the workspace and keep the workspace compiling.
+- For each unblocked local slice, run the package tests it touches before closing that slice.
+- Run `cargo test --workspace` before closing the parent request only when generated-dependent code is not blocked.
+- If generated-dependent code is blocked, run all non-blocked local gates and keep the parent request issue blocked/open with a final handoff that names the blocked adapter work.
 
 Handoff expectations:
 
@@ -49,4 +55,4 @@ Definition of done:
 - Fingerprint mismatch commits no children.
 - All non-blocked tests pass locally.
 - Remaining blocked work is captured in Beads, not in loose markdown notes.
-
+- The whole request is complete only after the real generated adapter and generated wire contract tests are implemented; otherwise the correct final state is blocked with the parent issue still open/blocked.

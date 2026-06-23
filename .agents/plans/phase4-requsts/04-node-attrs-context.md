@@ -5,13 +5,14 @@ Goal: persist enough child metadata to reconstruct future `NodeContext.parent_bu
 Attrs ownership:
 
 - The attrs postcard blob is orchestrator-private.
-- Put encode/decode helpers in `orch-driver`, not `orch-core`; the envelope depends on `orch-clients::input_synth` DTOs.
+- Put encode/decode helpers in `orch-driver`, not `orch-core`; the synth context record depends on `orch-clients::input_synth` DTOs.
 - Keep the snapshot-store DTO `NodeAttrs` opaque.
+- Preserve all non-synth attrs required by the existing docs, including restore/replay-critical fields such as machine config hash, determinism class, and root display/pad metadata. Either define `OrchNodeAttrsV1` as the full node attrs envelope or nest the synth context fields inside a full envelope that preserves those records.
 
 Envelope shape:
 
 - Define a versioned envelope with a magic/version field, for example `OrchNodeAttrsV1`.
-- Include at least:
+- Include at least the synth-context subrecord:
   - `created_by_burst: Option<ProvenancedBurst>` for non-root committed children
   - `config_fingerprint: Option<ConfigFingerprint>`
   - `decoded_features: BTreeMap<String, FiniteF64>` for `feat/<name>` values
@@ -40,9 +41,12 @@ Context assembly helper:
   - decode selected attrs
   - copy `node_id`, `parent_node_id`, `snapshot_ref`, `state_hash`, `cell_key`, `stage`, `depth`, `frame_counter`, `node_score`, `novelty`, decoded features, frame embedding empty, and recent input tail
   - set `parent_burst` to the selected node's `created_by_burst`
-  - if the node has a parent, load committed children of that same parent
+  - if the node has a parent, load that parent with `GetNode(parent_node_id)` before sibling assembly
+  - verify the selected node's `parent_node_id` matches the loaded parent and use the parent's `progress_score` for sibling score deltas
+  - load committed children of that same parent with `GetChildren`
   - exclude the selected node from siblings
-  - include only children whose attrs decode with `created_by_burst`
+  - include only successful committed siblings whose attrs decode with `created_by_burst`
+  - include statuses `Frontier`, `Expanded`, and `Goal`; exclude `Pruned` and any dropped/uncommitted children
   - order sibling bursts by `node_id` ascending
   - cap siblings by a documented deterministic limit if needed
   - compute `score_delta = child.progress_score - parent.progress_score`
@@ -59,4 +63,3 @@ Definition of done:
 - Unknown envelope version and malformed bytes fail cleanly.
 - A child expansion can build `parent_burst` from its own committed attrs.
 - A sibling expansion can build `sibling_bursts` from same-parent committed children with exact deterministic score deltas.
-

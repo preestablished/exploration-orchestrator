@@ -18,6 +18,13 @@ Current repo shape:
 - `orch-proto` currently re-exports only orchestrator proto types.
 - The adjacent control-plane `determinism-proto` input-synth surface is still a stub; the real generated `determinism.inputsynth.v1` facade is a prerequisite for the real adapter.
 
+Preflight rule for `/goal implement .agents/plans/phase4-requsts/`:
+
+- First check whether `determinism-proto` exposes the real generated `inputsynth` v1 tonic/prost facade. The current stub module is not usable.
+- If the facade is missing, create a Beads blocker naming the missing generated symbols and skip only the generated adapter and generated wire-golden parts of files `01` and `02`.
+- Continue all independent work that can compile without the real facade: synth seed helper/tests, bring-up/fingerprint state helpers against the `InputSynthClient` trait, attrs encode/decode, `NodeContext` reconstruction, fake-backed smoke tests, and docs.
+- Do not report the whole request as complete while the real generated adapter is blocked. Keep a parent implementation issue open or blocked until the adapter and generated wire tests are finished.
+
 Implementation sequence:
 
 1. Add generated input-synth proto access and the real transport adapter in `orch-driver`.
@@ -28,9 +35,9 @@ Implementation sequence:
 
 Execution notes for the implementing agent:
 
-- Use Beads for implementation tracking. Create or claim one issue per major slice before editing.
+- Use Beads for implementation tracking. Create new implementation issues for these slices rather than reusing planning/review issues.
+- Suggested dependency shape: parent Phase 4 request issue; generated-facade blocker; adapter issue blocked by facade; generated wire-goldens blocked by facade; seed/fingerprint issue; attrs/context issue; smoke issue blocked by seed/fingerprint and attrs/context, and partially blocked by adapter only for real-network coverage.
 - Keep `orch-clients` and `orch-fakes` transport-free.
 - Do not move generator logic into orchestrator.
 - Do not add request fields that are not in the generated owner API. Ladder changes use `config_overrides_yaml`.
 - Preserve deterministic behavior: no wall-clock, thread RNG, hash map iteration, or unordered sibling/context assembly in deterministic paths.
-
