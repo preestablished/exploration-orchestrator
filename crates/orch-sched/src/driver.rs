@@ -32,10 +32,7 @@ use orch_core::{
     types::{FrameCount, GuestInstructions, SnapshotRef, StateHash},
 };
 
-use crate::{
-    ports::AsyncHypervisor,
-    slots::SlotView,
-};
+use crate::{ports::AsyncHypervisor, slots::SlotView};
 
 /// Virtual-time pause before retrying a `RESOURCE_EXHAUSTED` allocation
 /// (backpressure, not an error).
@@ -232,6 +229,18 @@ where
 
     /// Runs one job on the Restore path (also the retry path).
     pub async fn run_job(&self, spec: &JobSpec) -> ClientResult<JobResult> {
+        self.run_job_deadline(spec, None).await
+    }
+
+    /// Runs one job with an optional per-attempt deadline covering
+    /// everything after the slot permit is acquired. On expiry, any lease
+    /// the attempt allocated is torn down best-effort so a timed-out job
+    /// never leaks its slot (ARCHITECTURE.md §6.4).
+    pub async fn run_job_deadline(
+        &self,
+        spec: &JobSpec,
+        deadline: Option<Duration>,
+    ) -> ClientResult<JobResult> {
         let permit = self.slots.acquire(spec.required_class.as_ref()).await?;
         let entropy = EntropySeed::new(derive_job_entropy_seed(
             self.config.experiment_seed,
@@ -239,28 +248,49 @@ where
             spec.job_idx,
         ));
 
-        // RESOURCE_EXHAUSTED on the actual allocation is backpressure: the
-        // view over-admitted; wait a beat and retry the allocation.
-        let restored = loop {
-            match self
-                .hypervisor
-                .restore_snapshot(RestoreSnapshotRequest {
-                    snapshot: spec.parent_snapshot,
-                    entropy_seed: Some(entropy),
-                })
-                .await
-            {
-                Ok(response) => break response,
-                Err(error) if is_backpressure(&error) => {
-                    tokio::time::sleep(EXHAUSTED_BACKOFF).await;
+        let active_lease: std::sync::Mutex<Option<Lease>> = std::sync::Mutex::new(None);
+        let work = async {
+            // RESOURCE_EXHAUSTED on the actual allocation is backpressure:
+            // the view over-admitted; wait a beat and retry the allocation.
+            let restored = loop {
+                match self
+                    .hypervisor
+                    .restore_snapshot(RestoreSnapshotRequest {
+                        snapshot: spec.parent_snapshot,
+                        entropy_seed: Some(entropy),
+                    })
+                    .await
+                {
+                    Ok(response) => break response,
+                    Err(error) if is_backpressure(&error) => {
+                        tokio::time::sleep(EXHAUSTED_BACKOFF).await;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
-            }
+            };
+            *active_lease.lock().expect("lease cell poisoned") = Some(restored.lease);
+            let result = self
+                .drive_leased_job(spec, restored.lease, restored.frame_counter)
+                .await;
+            active_lease.lock().expect("lease cell poisoned").take();
+            result
         };
 
-        let result = self
-            .drive_leased_job(spec, restored.lease, restored.frame_counter)
-            .await;
+        let result = match deadline {
+            None => work.await,
+            Some(deadline) => match tokio::time::timeout(deadline, work).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(ClientError::new(
+                    ClientErrorKind::Unavailable,
+                    format!("job timed out after {} ms", deadline.as_millis()),
+                )),
+            },
+        };
+        // Best-effort teardown of a lease stranded by cancellation.
+        let stranded = active_lease.lock().expect("lease cell poisoned").take();
+        if let Some(lease) = stranded {
+            let _ = self.hypervisor.destroy_vm(DestroyVmRequest { lease }).await;
+        }
         drop(permit);
         result
     }

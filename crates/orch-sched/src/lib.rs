@@ -9,5 +9,8 @@
 //! transport adapters arrive at M6 behind the same ports.
 
 pub mod driver;
+pub mod metrics;
+pub mod pipeline;
 pub mod ports;
+pub mod retry;
 pub mod slots;
