@@ -3,8 +3,10 @@
 //! Experiment runner and served control surface (plan M4).
 
 pub mod bringup;
+pub mod config;
 pub mod events;
 pub mod experiment;
+pub mod service;
 
 use orch_clients::{
     input_synth::ProposeBurstsRequest, snapshot_store::SnapshotStoreClient, ClientResult,

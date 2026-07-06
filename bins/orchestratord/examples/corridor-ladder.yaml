@@ -1,0 +1,24 @@
+# Standalone plateau-ladder config (note: --simulate wires the boss+credits
+# world; the corridor world is exercised by the plateau_ladder test).
+version: 1
+seed: 1760740
+workload_image_ref: workload://grid
+feature_map_ref: featmap://grid
+scoring_program_ref: score://grid
+synth_config_ref: synth://grid
+budgets:
+  max_expansions: 4096
+burst:
+  k_per_expansion: 8
+  base_burst_len_frames: 3
+  max_burst_len_frames: 12
+selection:
+  temperature: 8.0
+  max_visits_per_node: 256
+  exhaust_after_dup_expansions: 32
+plateau:
+  window_n: 12
+  ladder:
+    max_level: 4
+checkpoint:
+  every_commits: 16

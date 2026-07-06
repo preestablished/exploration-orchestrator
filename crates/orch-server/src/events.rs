@@ -120,6 +120,32 @@ impl<S: EventSink> EventEmitter<S> {
     }
 }
 
+/// Clonable, thread-safe wrapper for a sink shared between the service and
+/// an inspector (tests) or across service clones (the binary).
+pub struct SharedSink<S>(pub std::sync::Arc<std::sync::Mutex<S>>);
+
+impl<S> SharedSink<S> {
+    pub fn new(sink: S) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(sink)))
+    }
+}
+
+impl<S> Clone for SharedSink<S> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<S: EventSink> EventSink for SharedSink<S> {
+    fn emit(&mut self, envelope: EventEnvelope) -> orch_clients::ClientResult<()> {
+        self.0.lock().expect("shared sink lock").emit(envelope)
+    }
+
+    fn acked_seq(&self) -> orch_clients::ClientResult<u64> {
+        self.0.lock().expect("shared sink lock").acked_seq()
+    }
+}
+
 // ── payload builders (API.md §6 catalog field shapes) ──────────────────────
 
 fn node_id_value(node: NodeId) -> PayloadValue {

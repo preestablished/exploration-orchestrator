@@ -1,0 +1,23 @@
+[package]
+name = "orchestratord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orchestratord"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+orch-checkpoint = { path = "../../crates/orch-checkpoint" }
+orch-clients = { path = "../../crates/orch-clients" }
+orch-core = { path = "../../crates/orch-core" }
+orch-fakes = { path = "../../crates/orch-fakes" }
+orch-proto = { path = "../../crates/orch-proto" }
+orch-sched = { path = "../../crates/orch-sched" }
+orch-server = { path = "../../crates/orch-server" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time"] }
+tonic = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

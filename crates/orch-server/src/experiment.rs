@@ -133,10 +133,15 @@ pub struct StatusSnapshot {
     pub expansions: u64,
     pub nodes: u64,
     pub best_score: Option<f64>,
+    pub best_node: Option<NodeId>,
     pub batch_seq: u64,
     pub checkpointed_batch_seq: u64,
     pub escalation_level: u32,
     pub expansions_since_improvement: u64,
+    pub frontier_size: u64,
+    pub children_discarded_dup: u64,
+    pub children_discarded_regression: u64,
+    pub guest_instructions_used: u64,
     pub goal_nodes: Vec<NodeId>,
     pub failure_reason: Option<String>,
 }
@@ -148,10 +153,15 @@ impl StatusSnapshot {
             expansions: 0,
             nodes: 0,
             best_score: None,
+            best_node: None,
             batch_seq: 0,
             checkpointed_batch_seq: 0,
             escalation_level: 0,
             expansions_since_improvement: 0,
+            frontier_size: 0,
+            children_discarded_dup: 0,
+            children_discarded_regression: 0,
+            guest_instructions_used: 0,
             goal_nodes: Vec::new(),
             failure_reason: None,
         }
@@ -260,6 +270,9 @@ where
     expansions: u64,
     best_score: Option<f64>,
     goal_nodes: Vec<NodeId>,
+    best_node: Option<NodeId>,
+    discarded_dup: u64,
+    discarded_regression: u64,
     guest_instructions_used: u64,
     scorer_archive_seq: u64,
     ckpt_generation: Option<MetadataGeneration>,
@@ -418,6 +431,9 @@ where
             expansions: 0,
             best_score: None,
             goal_nodes: Vec::new(),
+            best_node: None,
+            discarded_dup: 0,
+            discarded_regression: 0,
             guest_instructions_used: 0,
             scorer_archive_seq: 0,
             ckpt_generation: None,
@@ -468,10 +484,15 @@ where
             expansions: self.expansions,
             nodes: self.commit_state.tree.len() as u64,
             best_score: self.best_score,
+            best_node: self.best_node,
             batch_seq: self.batch_seq,
             checkpointed_batch_seq: self.checkpointed_batch_seq,
             escalation_level: self.ladder.level().get(),
             expansions_since_improvement: self.stall.observations_since_improvement(),
+            frontier_size: self.commit_state.frontier.len() as u64,
+            children_discarded_dup: self.discarded_dup,
+            children_discarded_regression: self.discarded_regression,
+            guest_instructions_used: self.guest_instructions_used,
             goal_nodes: self.goal_nodes.clone(),
             failure_reason: self.failure_reason.clone(),
         });
@@ -1448,9 +1469,13 @@ where
                     discarded_count += 1;
                     let reason = match child_commit.disposition {
                         CommitDisposition::Discard(DiscardReason::Regression) => {
+                            self.discarded_regression += 1;
                             PruneReason::Regression
                         }
-                        _ => PruneReason::Duplicate,
+                        _ => {
+                            self.discarded_dup += 1;
+                            PruneReason::Duplicate
+                        }
                     };
                     if let Some(existing) = child_commit.duplicate_route {
                         self.update_node(NodeUpdate {
@@ -1747,6 +1772,7 @@ where
 
             if duplicate {
                 discarded_count += 1;
+                self.discarded_dup += 1;
                 self.commit_state.cell_mirror.bump(cell);
                 let route = self.commit_state.seen.get(hash);
                 if let Some(existing) = route {
@@ -1778,6 +1804,7 @@ where
             let known_cell = self.commit_state.cell_mirror.count(cell) > 0;
             if worse && known_cell {
                 discarded_count += 1;
+                self.discarded_regression += 1;
                 self.emitter.emit(
                     ts,
                     "node-pruned",
@@ -1956,6 +1983,7 @@ where
         if observation.improved
             && previous_best.is_none_or(|best| observation.best_score.get() > best)
         {
+            self.best_node = Some(node);
             self.emitter.emit(
                 ts,
                 "best-score-improved",

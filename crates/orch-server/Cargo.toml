@@ -12,12 +12,29 @@ orch-core = { path = "../orch-core" }
 # Transport-free pieces only (request builders, fingerprint guard, node
 # attrs); the `grpc` feature stays off.
 orch-driver = { path = "../orch-driver" }
+orch-proto = { path = "../orch-proto" }
 orch-sched = { path = "../orch-sched" }
 postcard.workspace = true
+prost = "0.14"
+prost-types = "0.14"
+tonic = { workspace = true }
+futures-core = "0.3"
+tokio-stream = "0.1"
 serde.workspace = true
-tokio = { workspace = true, features = ["sync", "macros"] }
+serde_yaml = "0.9"
+tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
+
+[features]
+default = []
+# Fake-backed simulation world for `orchestratord --simulate` and tests.
+simulate = ["dep:orch-fakes"]
+
+[dependencies.orch-fakes]
+path = "../orch-fakes"
+optional = true
 
 [dev-dependencies]
 orch-fakes = { path = "../orch-fakes" }
+tokio-stream = { version = "0.1", features = ["net"] }
 proptest.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "test-util"] }

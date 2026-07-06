@@ -1,0 +1,227 @@
+// determinism.orchestrator.v1 — the exploration orchestrator's served
+// surface, authored in this repo per API.md §1/§7 (IMPLEMENTATION-PLAN §M0
+// fallback: upstreaming into control-plane is a disclosed follow-up; see
+// protos.lock).
+syntax = "proto3";
+package determinism.orchestrator.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service ExplorationOrchestrator {
+  rpc StartExperiment (StartExperimentRequest) returns (StartExperimentResponse);
+  rpc PauseExperiment (PauseExperimentRequest) returns (PauseExperimentResponse);
+  rpc ResumeExperiment (ResumeExperimentRequest) returns (ResumeExperimentResponse);
+  rpc StopExperiment (StopExperimentRequest) returns (StopExperimentResponse);
+  rpc GetExperimentStatus (GetExperimentStatusRequest) returns (ExperimentStatus);
+  rpc StreamProgress (StreamProgressRequest) returns (stream ProgressEvent);
+}
+
+enum ExperimentState {
+  EXPERIMENT_STATE_PENDING = 0;
+  EXPERIMENT_STATE_RUNNING = 1;
+  EXPERIMENT_STATE_PAUSED = 2;
+  EXPERIMENT_STATE_STOPPED = 3;
+  EXPERIMENT_STATE_GOAL_REACHED = 4;
+  EXPERIMENT_STATE_BUDGET_EXHAUSTED = 5;
+  EXPERIMENT_STATE_FAILED = 6;
+}
+
+message StartExperimentRequest {
+  string experiment_id = 1;   // caller-minted, unique; doubles as idempotency key
+  ExperimentConfig config = 2;
+  bool resume_if_exists = 3;  // true: load checkpoint for this id if present
+  string run_id = 4;          // empty => standalone: run_id = experiment_id
+}
+message StartExperimentResponse {
+  string experiment_id = 1;
+  ExperimentState state = 2;
+  uint64 resumed_at_batch_seq = 3; // 0 for fresh starts
+}
+
+message PauseExperimentRequest { string experiment_id = 1; }
+message PauseExperimentResponse {
+  ExperimentState state = 1;
+  uint64 checkpointed_batch_seq = 2;
+}
+
+message ResumeExperimentRequest { string experiment_id = 1; }
+message ResumeExperimentResponse { ExperimentState state = 1; }
+
+message StopExperimentRequest {
+  string experiment_id = 1;
+  bool abandon_inflight = 2;
+}
+message StopExperimentResponse {
+  ExperimentState state = 1;
+  ExperimentStats final_stats = 2;
+}
+
+message GetExperimentStatusRequest { string experiment_id = 1; }
+
+message ExperimentStatus {
+  string experiment_id = 1;
+  ExperimentState state = 2;
+  ExperimentStats stats = 3;
+  PlateauStatus plateau = 4;
+  repeated uint64 goal_node_ids = 5;
+  string failure_reason = 6; // set iff FAILED
+}
+
+message ExperimentStats {
+  uint64 expansions = 1;
+  uint64 nodes_committed = 2;
+  uint64 children_discarded_dup = 3;
+  uint64 children_discarded_regression = 4;
+  uint64 frontier_size = 5;
+  uint64 archive_cells = 6;
+  double best_score = 7;
+  uint64 best_node_id = 8;
+  uint32 best_stage = 9;
+  uint64 guest_instructions_used = 10;
+  uint64 wall_clock_seconds = 11;
+  uint64 batch_seq = 12;
+  double slots_utilization = 13;
+}
+
+message PlateauStatus {
+  uint32 level = 1;
+  uint64 expansions_since_improvement = 2;
+}
+
+message StreamProgressRequest {
+  string experiment_id = 1;
+  uint32 min_interval_ms = 2; // throttle; default 1000
+}
+message ProgressEvent {
+  google.protobuf.Timestamp at = 1;
+  ExperimentStatus status = 2;
+  oneof edge {
+    GoalReached goal = 3;
+    StallDetected stall = 4;
+    EscalationChanged escalation = 5;
+    BudgetExhausted budget = 6;
+  }
+}
+message GoalReached {
+  uint64 node_id = 1;
+  bytes snapshot_ref = 2;
+  double score = 3;
+  uint32 depth = 4;
+}
+message StallDetected {
+  uint32 level = 1;
+  double best_score = 2;
+  uint64 window_n = 3;
+}
+message EscalationChanged {
+  uint32 from_level = 1;
+  uint32 to_level = 2;
+}
+message BudgetExhausted {
+  string budget = 1; // "max_nodes" | "max_wall_clock" | "max_guest_instructions" | "max_expansions"
+}
+
+// ── ExperimentConfig (API.md §7, owned by this repo) ────────────────────────
+
+message ExperimentConfig {
+  uint32 version = 1; // = 1, required
+  uint64 seed = 2;    // required; root of all RNG substreams
+
+  string workload_image_ref = 3;
+  string feature_map_ref = 4;
+  string scoring_program_ref = 5;
+  string synth_config_ref = 6;
+  repeated string macro_pack_refs = 7;
+
+  Budgets budgets = 8;
+  SelectionConfig selection = 9;
+  BurstConfig burst = 10;
+  PlateauConfig plateau = 11;
+  SchedulingConfig scheduling = 12;
+  CheckpointConfig checkpoint = 13;
+  PruneAction prune_action = 14;
+  OnGoal on_goal = 15;
+  repeated string decoded_features = 16;
+}
+
+enum PruneAction {
+  PRUNE_ACTION_EXHAUSTED = 0;
+  PRUNE_ACTION_DROP = 1;
+}
+
+enum OnGoal {
+  ON_GOAL_STOP = 0;
+  ON_GOAL_CONTINUE = 1;
+}
+
+enum PolicyKind {
+  POLICY_KIND_SOFTMAX = 0;
+  POLICY_KIND_UCB = 1;
+  POLICY_KIND_STAGED = 2;
+}
+
+enum SchedMode {
+  SCHED_MODE_FAST = 0;
+  SCHED_MODE_DETERMINISTIC = 1;
+}
+
+message Budgets {
+  uint64 max_nodes = 1;              // default 1_000_000 (0 = unlimited)
+  uint64 max_wall_clock_s = 2;       // default 86_400
+  uint64 max_guest_instructions = 3; // default 0 (unlimited)
+  uint64 max_expansions = 4;         // default 0 (unlimited)
+}
+
+message SelectionConfig {
+  PolicyKind policy = 1;
+  double alpha = 2;        // default 1.0
+  double beta = 3;         // default 0.5
+  double gamma = 4;        // default 0.3
+  double delta = 5;        // default 0.1
+  double temperature = 6;  // default 1.0
+  double ucb_c = 7;        // default 1.4
+  StagedConfig staged = 8;
+  uint32 max_visits_per_node = 9;           // default 64
+  uint32 exhaust_after_dup_expansions = 10; // default 8
+}
+message StagedConfig {
+  PolicyKind inner = 1;      // SOFTMAX (default) | UCB; STAGED invalid
+  double epsilon_regress = 2; // default 0.05
+}
+
+message BurstConfig {
+  uint32 k_per_expansion = 1;                // default 16
+  uint32 base_burst_len_frames = 2;          // default 120
+  uint32 max_burst_len_frames = 3;           // default 600
+  uint64 max_guest_instructions_per_job = 4; // default 0
+}
+
+message PlateauConfig {
+  uint32 window_n = 1;  // default 200
+  double epsilon_s = 2; // default 0.001
+  LadderConfig ladder = 3;
+}
+message LadderConfig {
+  double burst_len_factor = 1;         // default 1.5
+  double temp_factor = 2;              // default 1.75
+  double macro_weight_hot = 3;         // default 0.5
+  double backtrack_kappa = 4;          // default 1.0
+  double backtrack_depth_quantile = 5; // default 0.5
+  double radius_factor = 6;            // default 2.0
+  uint32 max_level = 7;                // default 4
+}
+
+message SchedulingConfig {
+  SchedMode mode = 1;
+  uint32 max_inflight_batches = 2; // default 2; forced to 1 in DETERMINISTIC
+  uint32 job_timeout_s = 3;        // default 120
+  uint32 retry_max = 4;            // default 3
+  uint32 retry_backoff_ms = 5;     // default 250
+  repeated string hypervisor_endpoints = 6;
+  bool allow_class_mismatch = 7;
+}
+
+message CheckpointConfig {
+  uint32 every_commits = 1; // default 64
+  uint32 every_seconds = 2; // default 30
+}

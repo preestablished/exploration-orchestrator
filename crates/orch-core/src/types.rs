@@ -557,24 +557,43 @@ impl ExperimentConfig {
         }
     }
 
+    /// First-violation validation (kept for existing callers).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        match self.validate_all().into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Accumulating validation: returns every violation so the served
+    /// surface's INVALID_ARGUMENT can list every bad field (API.md §1).
+    pub fn validate_all(&self) -> Vec<ConfigError> {
+        let mut errors = Vec::new();
         if self.version != EXPERIMENT_CONFIG_VERSION {
-            return Err(ConfigError::InvalidVersion(self.version));
+            errors.push(ConfigError::InvalidVersion(self.version));
         }
 
-        require_non_empty("workload_image_ref", &self.workload_image_ref)?;
-        require_non_empty("feature_map_ref", &self.feature_map_ref)?;
-        require_non_empty("scoring_program_ref", &self.scoring_program_ref)?;
-        require_non_empty("synth_config_ref", &self.synth_config_ref)?;
+        if let Err(error) = require_non_empty("workload_image_ref", &self.workload_image_ref) {
+            errors.push(error);
+        }
+        if let Err(error) = require_non_empty("feature_map_ref", &self.feature_map_ref) {
+            errors.push(error);
+        }
+        if let Err(error) = require_non_empty("scoring_program_ref", &self.scoring_program_ref) {
+            errors.push(error);
+        }
+        if let Err(error) = require_non_empty("synth_config_ref", &self.synth_config_ref) {
+            errors.push(error);
+        }
 
         if !(1..=256).contains(&self.burst.k_per_expansion) {
-            return Err(ConfigError::OutOfRange("burst.k_per_expansion"));
+            errors.push(ConfigError::OutOfRange("burst.k_per_expansion"));
         }
         if self.burst.base_burst_len_frames > self.burst.max_burst_len_frames {
-            return Err(ConfigError::OutOfRange("burst.base_burst_len_frames"));
+            errors.push(ConfigError::OutOfRange("burst.base_burst_len_frames"));
         }
         if !finite_positive(self.selection.temperature) {
-            return Err(ConfigError::OutOfRange("selection.temperature"));
+            errors.push(ConfigError::OutOfRange("selection.temperature"));
         }
         let non_negative_selection_weights = [
             ("selection.alpha", self.selection.alpha),
@@ -585,56 +604,56 @@ impl ExperimentConfig {
         ];
         for (field, value) in non_negative_selection_weights {
             if !finite_non_negative(value) {
-                return Err(ConfigError::OutOfRange(field));
+                errors.push(ConfigError::OutOfRange(field));
             }
         }
         if !finite_unit_interval(self.selection.staged.epsilon_regress) {
-            return Err(ConfigError::OutOfRange("selection.staged.epsilon_regress"));
+            errors.push(ConfigError::OutOfRange("selection.staged.epsilon_regress"));
         }
         if self.selection.max_visits_per_node == 0 {
-            return Err(ConfigError::OutOfRange("selection.max_visits_per_node"));
+            errors.push(ConfigError::OutOfRange("selection.max_visits_per_node"));
         }
         if self.selection.exhaust_after_dup_expansions == 0 {
-            return Err(ConfigError::OutOfRange(
+            errors.push(ConfigError::OutOfRange(
                 "selection.exhaust_after_dup_expansions",
             ));
         }
         if self.selection.policy == PolicyKind::Staged
             && self.selection.staged.inner == PolicyKind::Staged
         {
-            return Err(ConfigError::InvalidStagedInnerPolicy);
+            errors.push(ConfigError::InvalidStagedInnerPolicy);
         }
         if self.burst.base_burst_len_frames == 0 {
-            return Err(ConfigError::OutOfRange("burst.base_burst_len_frames"));
+            errors.push(ConfigError::OutOfRange("burst.base_burst_len_frames"));
         }
         if self.burst.max_burst_len_frames == 0 {
-            return Err(ConfigError::OutOfRange("burst.max_burst_len_frames"));
+            errors.push(ConfigError::OutOfRange("burst.max_burst_len_frames"));
         }
         if self.plateau.window_n < 10 {
-            return Err(ConfigError::OutOfRange("plateau.window_n"));
+            errors.push(ConfigError::OutOfRange("plateau.window_n"));
         }
         if !finite_positive(self.plateau.epsilon_s) {
-            return Err(ConfigError::OutOfRange("plateau.epsilon_s"));
+            errors.push(ConfigError::OutOfRange("plateau.epsilon_s"));
         }
         if self.plateau.ladder.max_level > 4 {
-            return Err(ConfigError::OutOfRange("plateau.ladder.max_level"));
+            errors.push(ConfigError::OutOfRange("plateau.ladder.max_level"));
         }
         if self.scheduling.mode == SchedMode::Deterministic
             && self.scheduling.max_inflight_batches != 1
         {
-            return Err(ConfigError::OutOfRange("scheduling.max_inflight_batches"));
+            errors.push(ConfigError::OutOfRange("scheduling.max_inflight_batches"));
         }
         if self.scheduling.mode == SchedMode::Fast && self.scheduling.max_inflight_batches == 0 {
-            return Err(ConfigError::OutOfRange("scheduling.max_inflight_batches"));
+            errors.push(ConfigError::OutOfRange("scheduling.max_inflight_batches"));
         }
         if self.scheduling.job_timeout_s == 0 {
-            return Err(ConfigError::OutOfRange("scheduling.job_timeout_s"));
+            errors.push(ConfigError::OutOfRange("scheduling.job_timeout_s"));
         }
         if self.checkpoint.every_commits == 0 {
-            return Err(ConfigError::OutOfRange("checkpoint.every_commits"));
+            errors.push(ConfigError::OutOfRange("checkpoint.every_commits"));
         }
         if self.checkpoint.every_seconds == 0 {
-            return Err(ConfigError::OutOfRange("checkpoint.every_seconds"));
+            errors.push(ConfigError::OutOfRange("checkpoint.every_seconds"));
         }
 
         let ladder_factors_at_least_one = [
@@ -653,22 +672,22 @@ impl ExperimentConfig {
         ];
         for (field, value) in ladder_factors_at_least_one {
             if !value.is_finite() || value < 1.0 {
-                return Err(ConfigError::OutOfRange(field));
+                errors.push(ConfigError::OutOfRange(field));
             }
         }
         if !finite_non_negative(self.plateau.ladder.macro_weight_hot) {
-            return Err(ConfigError::OutOfRange("plateau.ladder.macro_weight_hot"));
+            errors.push(ConfigError::OutOfRange("plateau.ladder.macro_weight_hot"));
         }
         if !finite_non_negative(self.plateau.ladder.backtrack_kappa) {
-            return Err(ConfigError::OutOfRange("plateau.ladder.backtrack_kappa"));
+            errors.push(ConfigError::OutOfRange("plateau.ladder.backtrack_kappa"));
         }
         if !finite_unit_interval(self.plateau.ladder.backtrack_depth_quantile) {
-            return Err(ConfigError::OutOfRange(
+            errors.push(ConfigError::OutOfRange(
                 "plateau.ladder.backtrack_depth_quantile",
             ));
         }
 
-        Ok(())
+        errors
     }
 }
 
@@ -990,5 +1009,36 @@ mod tests {
 
         assert_eq!(decoded, config);
         assert!(decoded.validate().is_ok());
+    }
+}
+#[cfg(test)]
+mod validate_all_tests {
+    use super::*;
+
+    #[test]
+    fn validate_all_accumulates_every_violation() {
+        let mut config = ExperimentConfig::new(1, "w", "f", "s", "y");
+        config.workload_image_ref = String::new();
+        config.selection.temperature = 0.0;
+        config.plateau.window_n = 1;
+        config.checkpoint.every_commits = 0;
+
+        let errors = config.validate_all();
+
+        assert!(errors.len() >= 4, "all violations listed: {errors:?}");
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ConfigError::MissingRequiredField("workload_image_ref")
+        )));
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, ConfigError::OutOfRange("selection.temperature"))));
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, ConfigError::OutOfRange("plateau.window_n"))));
+        assert!(errors
+            .iter()
+            .any(|error| matches!(error, ConfigError::OutOfRange("checkpoint.every_commits"))));
+        assert_eq!(config.validate().expect_err("first violation"), errors[0]);
     }
 }

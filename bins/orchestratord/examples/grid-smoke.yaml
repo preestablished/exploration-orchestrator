@@ -1,0 +1,23 @@
+# Standalone smoke config for the simulated boss+credits grid world:
+#   orchestratord --experiment bins/orchestratord/examples/grid-smoke.yaml
+version: 1
+seed: 24301
+workload_image_ref: workload://grid
+feature_map_ref: featmap://grid
+scoring_program_ref: score://grid
+synth_config_ref: synth://grid
+budgets:
+  max_expansions: 4096
+burst:
+  k_per_expansion: 8
+  base_burst_len_frames: 3
+  max_burst_len_frames: 12
+selection:
+  temperature: 8.0
+  max_visits_per_node: 256
+  exhaust_after_dup_expansions: 32
+checkpoint:
+  every_commits: 16
+scheduling:
+  mode: deterministic
+  max_inflight_batches: 1
