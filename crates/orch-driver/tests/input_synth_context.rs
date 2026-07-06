@@ -250,6 +250,7 @@ fn populated_store() -> InMemorySnapshotStore {
     store
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_node(
     store: &mut InMemorySnapshotStore,
     node_id: NodeId,

@@ -4,14 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Pulls in the tonic-backed InputSynth adapter and DTO<->wire conversions.
+# Off by default so trait-generic consumers (orch-sched, orch-server) never
+# link tonic transitively through this crate.
+grpc = ["dep:orch-proto", "dep:tokio", "dep:tonic"]
+
 [dependencies]
 orch-clients = { path = "../orch-clients" }
 orch-core = { path = "../orch-core" }
-orch-proto = { path = "../orch-proto" }
+orch-proto = { path = "../orch-proto", optional = true }
 postcard.workspace = true
 serde.workspace = true
-tokio.workspace = true
-tonic.workspace = true
+tokio = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
 orch-fakes = { path = "../orch-fakes" }

@@ -1,3 +1,5 @@
+#![cfg(feature = "grpc")]
+
 use std::collections::BTreeMap;
 
 use orch_clients::{
@@ -338,11 +340,11 @@ fn mine_macros_request_preserves_optional_params_and_paths() {
     let params = wire.params.expect("params");
 
     assert_eq!(wire.paths.len(), 1);
-    assert_eq!(params.min_support, Some(2));
-    assert_eq!(params.min_paths, None);
-    assert_eq!(params.max_len_tokens, Some(24));
-    assert_eq!(params.containment_alpha, Some(0.8));
-    assert_eq!(params.dedup_edit_dist, None);
+    assert_eq!(params.min_support, 2);
+    assert_eq!(params.min_paths, 0);
+    assert_eq!(params.max_len_tokens, 24);
+    assert_eq!(params.containment_alpha, 0.8);
+    assert_eq!(params.dedup_edit_dist, 0.0);
 }
 
 #[test]
@@ -444,14 +446,12 @@ fn sample_wire_burst(slot: u32) -> wire::Burst {
         format_version: wire::BURST_FORMAT_VERSION,
         body: Some(wire::burst::Body::Pad(wire::PadBurst {
             segments: vec![wire::PadSegment {
-                start_frame: 0,
-                frames: 4,
                 buttons: slot,
+                hold_frames: 4,
             }],
             button_alphabet: "console16-12btn-v1".to_owned(),
         })),
         burst_id: [slot as u8; 32].to_vec(),
-        ..Default::default()
     }
 }
 

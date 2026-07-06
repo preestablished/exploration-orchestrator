@@ -22,11 +22,17 @@ jobs:
           repository: ${{ github.repository_owner }}/control-plane
           path: control-plane
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - run: cargo fmt --all -- --check
         working-directory: repo
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        working-directory: repo
+      # Both feature configurations must build: default (transport-free) and
+      # all-features (orch-driver's grpc adapter).
       - run: cargo build --workspace
         working-directory: repo
       - run: cargo test -p orch-core core_validation
         working-directory: repo
-      - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
         working-directory: repo
