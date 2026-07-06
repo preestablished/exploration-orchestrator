@@ -148,6 +148,18 @@ impl Pipeline {
         Arc::clone(&self.gauges)
     }
 
+    /// Cheap clonable submit handle so the S stage can run as its own task
+    /// while the C stage consumes results. The pipeline drains once every
+    /// submitter (and the pipeline's own handle, via [`Self::close`]) is
+    /// dropped.
+    #[must_use]
+    pub fn submitter(&self) -> PipelineSubmitter {
+        PipelineSubmitter {
+            submit_tx: self.submit_tx.clone(),
+            gauges: Arc::clone(&self.gauges),
+        }
+    }
+
     /// Feeds one batch into the execute stage; suspends while the bounded
     /// submit queue is full (backpressure into the S stage).
     pub async fn submit(&self, batch: Batch) -> ClientResult<()> {
@@ -196,6 +208,27 @@ impl Pipeline {
     pub fn close(&mut self) {
         let (closed_tx, _) = mpsc::channel(1);
         self.submit_tx = closed_tx;
+    }
+}
+
+/// Clonable submit-side handle (see [`Pipeline::submitter`]).
+#[derive(Clone)]
+pub struct PipelineSubmitter {
+    submit_tx: mpsc::Sender<Batch>,
+    gauges: Arc<Gauges>,
+}
+
+impl PipelineSubmitter {
+    /// Same contract as [`Pipeline::submit`].
+    pub async fn submit(&self, batch: Batch) -> ClientResult<()> {
+        Gauges::enqueue(
+            &self.gauges.queue_depth_submit,
+            &self.gauges.queue_depth_submit_peak,
+        );
+        self.submit_tx.send(batch).await.map_err(|_| {
+            Gauges::dequeue(&self.gauges.queue_depth_submit);
+            ClientError::new(ClientErrorKind::Internal, "pipeline executor stopped")
+        })
     }
 }
 

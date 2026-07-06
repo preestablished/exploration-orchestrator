@@ -17,6 +17,7 @@ serde.workspace = true
 tokio = { workspace = true, features = ["sync", "macros"] }
 
 [dev-dependencies]
+blake3.workspace = true
 orch-fakes = { path = "../orch-fakes" }
 tokio = { workspace = true, features = ["sync", "macros", "test-util"] }
 tokio-test = "0.4"

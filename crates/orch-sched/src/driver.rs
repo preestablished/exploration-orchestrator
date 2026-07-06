@@ -227,6 +227,25 @@ where
         &self.slots
     }
 
+    /// Destroys a lease, absorbing transient injected/transport errors with
+    /// a short salted retry ladder. A slot that stays undestroyed is leaked
+    /// capacity for the rest of the run, so destroy is never one-shot.
+    async fn destroy_with_retry(&self, lease: Lease) -> ClientResult<()> {
+        let mut attempts = 0u32;
+        loop {
+            match self.hypervisor.destroy_vm(DestroyVmRequest { lease }).await {
+                Ok(_) => return Ok(()),
+                // Already gone (e.g. a prior teardown pass won the race).
+                Err(error) if error.kind() == ClientErrorKind::NotFound => return Ok(()),
+                Err(error) if attempts >= 8 => return Err(error),
+                Err(_) => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        }
+    }
+
     /// Runs one job on the Restore path (also the retry path).
     pub async fn run_job(&self, spec: &JobSpec) -> ClientResult<JobResult> {
         self.run_job_deadline(spec, None).await
@@ -286,10 +305,10 @@ where
                 )),
             },
         };
-        // Best-effort teardown of a lease stranded by cancellation.
+        // Teardown of a lease stranded by cancellation.
         let stranded = active_lease.lock().expect("lease cell poisoned").take();
         if let Some(lease) = stranded {
-            let _ = self.hypervisor.destroy_vm(DestroyVmRequest { lease }).await;
+            let _ = self.destroy_with_retry(lease).await;
         }
         drop(permit);
         result
@@ -319,7 +338,9 @@ where
             }
         }
 
-        let mut results = Vec::with_capacity(bursts.len());
+        // Restore-path fallback: fan all K jobs out concurrently; each
+        // acquires its own slot permit, so the SlotView is the bound.
+        let mut jobs = Vec::with_capacity(bursts.len());
         for (job_idx, burst) in bursts.into_iter().enumerate() {
             let job_idx = u32::try_from(job_idx).unwrap_or(u32::MAX);
             let spec = JobSpec {
@@ -329,9 +350,10 @@ where
                 required_class: required_class.clone(),
                 burst,
             };
-            results.push((job_idx, self.run_job(&spec).await));
+            let driver = self.clone();
+            jobs.push(async move { (job_idx, driver.run_job(&spec).await) });
         }
-        results
+        futures_join_all(jobs).await
     }
 
     /// Fork-path dispatch; `None` means "not enough free slots right now,
@@ -395,12 +417,7 @@ where
         let fork_request = match ForkRequest::new(parent.lease, entropy_seeds) {
             Ok(request) => request,
             Err(error) => {
-                let _ = self
-                    .hypervisor
-                    .destroy_vm(DestroyVmRequest {
-                        lease: parent.lease,
-                    })
-                    .await;
+                let _ = self.destroy_with_retry(parent.lease).await;
                 drop(permits);
                 return Some(
                     (0..count)
@@ -412,12 +429,7 @@ where
         let children = match self.hypervisor.fork(fork_request).await {
             Ok(response) => response.children,
             Err(error) => {
-                let _ = self
-                    .hypervisor
-                    .destroy_vm(DestroyVmRequest {
-                        lease: parent.lease,
-                    })
-                    .await;
+                let _ = self.destroy_with_retry(parent.lease).await;
                 drop(permits);
                 if is_backpressure(&error) {
                     return None;
@@ -430,11 +442,15 @@ where
             }
         };
 
-        // Drive all children concurrently; each child job owns one permit
-        // implicitly (the whole permit set is held until the batch ends,
-        // including the frozen parent's — frozen parents are busy).
+        // Drive all children concurrently. Each child task owns one permit
+        // and releases it as soon as its slot is destroyed, so an
+        // early-finishing sibling's slot reads as free; the parent's permit
+        // is held until the parent is destroyed (frozen parents are busy).
+        let parent_permit = permits.pop().expect("permit set contains parent permit");
         let mut jobs = Vec::with_capacity(count);
-        for ((job_idx, burst), lease) in bursts.iter().enumerate().zip(children) {
+        for (((job_idx, burst), lease), permit) in
+            bursts.iter().enumerate().zip(children).zip(permits)
+        {
             let spec = JobSpec {
                 batch_seq,
                 job_idx: job_idx as u32,
@@ -445,21 +461,15 @@ where
             let driver = self.clone();
             let parent_frame = parent.frame_counter;
             jobs.push(async move {
-                (
-                    spec.job_idx,
-                    driver.drive_leased_job(&spec, lease, parent_frame).await,
-                )
+                let result = driver.drive_leased_job(&spec, lease, parent_frame).await;
+                drop(permit);
+                (spec.job_idx, result)
             });
         }
         let results = futures_join_all(jobs).await;
 
-        let _ = self
-            .hypervisor
-            .destroy_vm(DestroyVmRequest {
-                lease: parent.lease,
-            })
-            .await;
-        drop(permits);
+        let _ = self.destroy_with_retry(parent.lease).await;
+        drop(parent_permit);
         Some(results)
     }
 
@@ -472,8 +482,8 @@ where
     ) -> ClientResult<JobResult> {
         let result = self.drive_leased_job_inner(spec, lease, parent_frame).await;
         if result.is_err() {
-            // Best-effort teardown so a failed job never leaks its slot.
-            let _ = self.hypervisor.destroy_vm(DestroyVmRequest { lease }).await;
+            // Teardown so a failed job never leaks its slot.
+            let _ = self.destroy_with_retry(lease).await;
         }
         result
     }
@@ -504,9 +514,7 @@ where
         let sdk_events = run.sdk_event.clone().into_iter().collect();
 
         if verdict == JobVerdict::GuestCrash {
-            self.hypervisor
-                .destroy_vm(DestroyVmRequest { lease })
-                .await?;
+            self.destroy_with_retry(lease).await?;
             return Ok(JobResult {
                 job_idx: spec.job_idx,
                 verdict,
@@ -524,9 +532,7 @@ where
                 capture: Some(self.config.capture.clone()),
             })
             .await?;
-        self.hypervisor
-            .destroy_vm(DestroyVmRequest { lease })
-            .await?;
+        self.destroy_with_retry(lease).await?;
 
         Ok(JobResult {
             job_idx: spec.job_idx,
@@ -575,7 +581,7 @@ where
 
         let result = self.bootstrap_leased(spec, lease).await;
         if result.is_err() {
-            let _ = self.hypervisor.destroy_vm(DestroyVmRequest { lease }).await;
+            let _ = self.destroy_with_retry(lease).await;
         }
         drop(permit);
         result
@@ -618,9 +624,7 @@ where
                 capture: Some(self.config.capture.clone()),
             })
             .await?;
-        self.hypervisor
-            .destroy_vm(DestroyVmRequest { lease })
-            .await?;
+        self.destroy_with_retry(lease).await?;
 
         Ok(RootCapture {
             snapshot: snapshot.snapshot,

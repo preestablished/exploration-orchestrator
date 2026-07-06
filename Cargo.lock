@@ -617,6 +617,7 @@ dependencies = [
 name = "orch-sched"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "orch-clients",
  "orch-core",
  "orch-driver",
