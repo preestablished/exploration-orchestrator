@@ -517,3 +517,46 @@ fn contracts_hypervisor_slot_pool_shrinks_and_grows_mid_run() {
     hypervisor.set_slots_total(4);
     assert!(hypervisor.create_vm(sample_vm_request(0x33)).is_ok());
 }
+
+#[test]
+fn contracts_hypervisor_reclaim_session_frees_forked_families_child_first() {
+    let mut hypervisor = FakeHypervisor::with_slots(8);
+    let parent = hypervisor.create_vm(sample_vm_request(0x40)).expect("vm");
+    let children = hypervisor
+        .fork(
+            orch_clients::hypervisor::ForkRequest::new(
+                parent.lease,
+                vec![EntropySeed::new([0x41; 32]), EntropySeed::new([0x42; 32])],
+            )
+            .expect("fork request"),
+        )
+        .expect("fork")
+        .children;
+    assert_eq!(children.len(), 2);
+    hypervisor
+        .create_vm(sample_vm_request(0x43))
+        .expect("solo vm");
+
+    hypervisor.reclaim_session();
+
+    let listed = hypervisor
+        .list_slots(ListSlotsRequest)
+        .expect("list after reclaim");
+    assert!(listed.slots.is_empty(), "all slots reclaimed: {listed:?}");
+    let info = hypervisor
+        .worker_info(GetWorkerInfoRequest)
+        .expect("worker info");
+    assert_eq!(info.slots_free, info.slots_total);
+    // The next allocation succeeds — the pool is not wedged.
+    assert!(hypervisor.create_vm(sample_vm_request(0x44)).is_ok());
+    // Watch events recorded an Empty transition per reclaimed slot.
+    let events = hypervisor
+        .watch_slots(orch_clients::hypervisor::WatchSlotsRequest)
+        .expect("watch");
+    let empties = events
+        .events
+        .iter()
+        .filter(|event| event.slot.state == orch_clients::hypervisor::SlotState::Empty)
+        .count();
+    assert_eq!(empties, 4);
+}

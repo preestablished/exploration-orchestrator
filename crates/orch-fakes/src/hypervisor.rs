@@ -132,6 +132,50 @@ impl FakeHypervisor {
         self.slots_total = slots_total;
     }
 
+    /// Reclaims every live lease as a real worker would after observing its
+    /// client connection drop (session teardown): destroys leased slots
+    /// child-first, unfreezes fork-parents along the way, and emits the
+    /// corresponding WatchSlots transitions. Chaos harnesses invoke this at
+    /// each crash point so a dead orchestrator's leases never wedge the
+    /// pool. Deterministic: slots reclaim in slot-id order per pass.
+    ///
+    /// The real hypervisor's orphan-lease semantics are its owner doc's
+    /// territory; this models the settled direction (worker survives
+    /// orchestrator death and reclaims) and is re-verified at M6.
+    pub fn reclaim_session(&mut self) {
+        while !self.slots.is_empty() {
+            let leaves: Vec<SlotId> = self
+                .slots
+                .values()
+                .filter(|slot| {
+                    !self
+                        .slots
+                        .values()
+                        .any(|candidate| candidate.parent == Some(slot.lease.slot_id))
+                })
+                .map(|slot| slot.lease.slot_id)
+                .collect();
+            debug_assert!(!leaves.is_empty(), "slot parent graph must be acyclic");
+            for slot_id in leaves {
+                let Some(slot) = self.slots.remove(&slot_id) else {
+                    continue;
+                };
+                self.watch_events.push(SlotEvent {
+                    slot: SlotInfo {
+                        slot_id,
+                        state: SlotState::Empty,
+                        icount: slot.icount,
+                        base: slot.base,
+                        live_children: 0,
+                    },
+                });
+                if let Some(parent_id) = slot.parent {
+                    self.maybe_unfreeze_parent(parent_id);
+                }
+            }
+        }
+    }
+
     fn ensure_capacity(&self, needed: u32) -> ClientResult<()> {
         let used = u32::try_from(self.slots.len()).map_err(|_| {
             ClientError::new(ClientErrorKind::Internal, "active slot count exceeds u32")
