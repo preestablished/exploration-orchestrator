@@ -130,9 +130,11 @@ pub fn grid_config(seed: u64) -> ExperimentConfig {
         "score://grid",
         "synth://grid",
     );
-    config.burst.k_per_expansion = 6;
-    config.burst.base_burst_len_frames = 2;
+    config.burst.k_per_expansion = 8;
+    config.burst.base_burst_len_frames = 3;
     config.burst.max_burst_len_frames = 12;
+    config.selection.max_visits_per_node = 256;
+    config.selection.exhaust_after_dup_expansions = 32;
     config.budgets.max_expansions = 4_096;
     // Virtual clock: generous wall budget so only expansions bound runs.
     config.budgets.max_wall_clock_s = 86_400;
@@ -194,4 +196,38 @@ impl FakeWorld {
     pub fn observatory(&self) -> FakeObservatory {
         FakeObservatory::new()
     }
+}
+
+/// Event sink handle the test keeps while the runner owns the emitter.
+#[derive(Clone, Default)]
+pub struct SharedSink(pub std::sync::Arc<std::sync::Mutex<FakeObservatory>>);
+
+impl orch_clients::observatory::EventSink for SharedSink {
+    fn emit(
+        &mut self,
+        envelope: orch_clients::observatory::EventEnvelope,
+    ) -> orch_clients::ClientResult<()> {
+        self.0.lock().expect("sink lock").emit(envelope)
+    }
+
+    fn acked_seq(&self) -> orch_clients::ClientResult<u64> {
+        self.0.lock().expect("sink lock").acked_seq()
+    }
+}
+
+/// Seed-gate event hash: blake3 over each envelope's
+/// (ts_logical, event_type, canonical payload) — producer_id and seq are
+/// nondeterministic by the platform's own contract (plan D6, disclosed).
+pub fn event_sequence_hash(sink: &SharedSink) -> [u8; 32] {
+    let sink = sink.0.lock().expect("sink lock");
+    let mut hasher = blake3::Hasher::new();
+    for event in sink.events() {
+        hasher.update(&event.ts_logical.to_le_bytes());
+        hasher.update(&(event.event_type.len() as u64).to_le_bytes());
+        hasher.update(event.event_type.as_bytes());
+        let payload = postcard::to_allocvec(&event.payload).expect("payload encodes");
+        hasher.update(&(payload.len() as u64).to_le_bytes());
+        hasher.update(&payload);
+    }
+    *hasher.finalize().as_bytes()
 }
