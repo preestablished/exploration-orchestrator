@@ -1,0 +1,22 @@
+[package]
+name = "orch-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orch-clients = { path = "../orch-clients" }
+orch-core = { path = "../orch-core" }
+# Default features only: the transport-free pieces (request builders,
+# fingerprint guard, node attrs). The `grpc` feature must stay off so this
+# crate never links tonic (ARCHITECTURE.md §1: sched depends on traits, not
+# gRPC impls).
+orch-driver = { path = "../orch-driver" }
+postcard.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["sync", "macros"] }
+
+[dev-dependencies]
+orch-fakes = { path = "../orch-fakes" }
+tokio = { workspace = true, features = ["sync", "macros", "test-util"] }
+tokio-test = "0.4"
