@@ -9,6 +9,7 @@
 pub mod fault;
 pub mod grid;
 pub mod hypervisor;
+pub mod observatory;
 pub mod scorer;
 pub mod snapshot_store;
 pub mod synth;
@@ -19,6 +20,8 @@ mod tests {
     #[test]
     fn crate_exports_fake_modules() {
         #[allow(unused_imports)]
-        use crate::{fault, grid, hypervisor, scorer, snapshot_store, synth, transcript};
+        use crate::{
+            fault, grid, hypervisor, observatory, scorer, snapshot_store, synth, transcript,
+        };
     }
 }

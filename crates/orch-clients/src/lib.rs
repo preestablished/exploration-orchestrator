@@ -97,6 +97,8 @@ pub mod hypervisor;
 
 pub mod input_synth;
 
+pub mod observatory;
+
 pub mod scorer;
 
 pub mod snapshot_store;

@@ -16,6 +16,7 @@ pub enum FaultTarget {
     Scorer,
     Synth,
     Grid,
+    Observatory,
 }
 
 impl FaultTarget {
@@ -26,6 +27,7 @@ impl FaultTarget {
             Self::Scorer => b"scorer",
             Self::Synth => b"synth",
             Self::Grid => b"grid",
+            Self::Observatory => b"observatory",
         }
     }
 }
