@@ -164,7 +164,9 @@ impl CommitState {
             .copied()
     }
 
-    fn ensure_tracking(&mut self, id: NodeId) {
+    /// Grows the streak tracking to cover `id` (resume/replay paths insert
+    /// tree nodes outside `commit_batch`).
+    pub fn ensure_tracking(&mut self, id: NodeId) {
         let index = usize::try_from(id.get()).expect("node id fits in usize");
         if self.all_duplicate_streaks.len() <= index {
             self.all_duplicate_streaks.resize(index + 1, 0);
@@ -320,7 +322,10 @@ fn commit_child(
     ))
 }
 
-fn update_parent_exhaustion(
+/// Applies commit rules 4/5 for one expansion of `parent` (visit already
+/// incremented). Public for the resume replay path, which recomputes batch
+/// effects child-by-child.
+pub fn update_parent_exhaustion(
     state: &mut CommitState,
     parent: NodeId,
     parent_visits: u32,

@@ -247,6 +247,10 @@ where
     // search state
     commit_state: CommitState,
     runtimes: BTreeMap<NodeId, NodeRuntime>,
+    /// Committed child index by (parent, producing burst id): the replay
+    /// adoption check's identity (unique even when sibling rows share a
+    /// state hash, e.g. duplicate pruned-exhausted commits).
+    node_bursts: BTreeMap<(NodeId, orch_clients::input_synth::BurstId), NodeId>,
     policy: PolicyBox,
     stall: StallDetector,
     ladder: EscalationLadder,
@@ -260,6 +264,8 @@ where
     scorer_archive_seq: u64,
     ckpt_generation: Option<MetadataGeneration>,
     checkpointed_batch_seq: u64,
+    /// Lowest WAL seq that may still exist (truncation cursor).
+    wal_floor: u64,
     commits_since_checkpoint: u32,
     last_checkpoint_at: tokio::time::Instant,
     started_at: tokio::time::Instant,
@@ -402,6 +408,7 @@ where
             crash,
             commit_state: CommitState::from_root(placeholder_payload),
             runtimes: BTreeMap::new(),
+            node_bursts: BTreeMap::new(),
             policy,
             stall: StallDetector::from_knobs(&plateau_knobs),
             ladder: EscalationLadder::from_knobs(&plateau_knobs),
@@ -415,6 +422,7 @@ where
             scorer_archive_seq: 0,
             ckpt_generation: None,
             checkpointed_batch_seq: 0,
+            wal_floor: 0,
             commits_since_checkpoint: 0,
             last_checkpoint_at: now,
             started_at: now,
@@ -559,6 +567,10 @@ where
         }])
         .await?;
         self.observe_score(NodeId::ROOT, result.progress_score.get());
+        // Initial checkpoint: from here on every crash resumes through
+        // §8.2 instead of falling back to a fresh bootstrap over a
+        // non-empty store.
+        self.checkpoint().await?;
         Ok(())
     }
 
@@ -687,11 +699,6 @@ where
                 }
                 NodeStatus::Expanded => {
                     tree.mark_expanded(id).ok();
-                    if u32::try_from(meta.visit_count).unwrap_or(u32::MAX) > 0 {
-                        for _ in 0..meta.visit_count.min(1_000_000) {
-                            tree.increment_visits(id).ok();
-                        }
-                    }
                 }
                 NodeStatus::Pruned => {
                     tree.mark_pruned(id).ok();
@@ -704,6 +711,11 @@ where
                     class: attrs.determinism_class.clone(),
                 },
             );
+            if let (Some(parent), Some(burst)) =
+                (meta.parent_node_id, attrs.synth.created_by_burst.as_ref())
+            {
+                self.node_bursts.insert((parent, burst.burst.burst_id), id);
+            }
         }
         self.commit_state = CommitState::from_parts(tree, frontier, mirror, seen, &streaks);
         self.goal_nodes.sort_unstable();
@@ -746,12 +758,35 @@ where
         // Step 7: queue WAL replays; batch_seq advances past the checkpoint
         // and every replayed seq (fresh batches never reuse a replayed
         // client_batch_id).
+        // Entries below the checkpointed batch_seq are already covered by
+        // the checkpoint (a crash landed inside the truncation window):
+        // finish the interrupted truncation instead of double-replaying.
+        let mut replayable = Vec::new();
+        for intent in intents {
+            if intent.seq < checkpoint.batch_seq {
+                let store = self.store.clone();
+                let delete = DeleteMetadataRequest {
+                    key: MetadataKey::wal(&self.cfg.experiment_id, intent.seq),
+                    expected_generation: MetadataExpectation::unconditional(),
+                };
+                match retry_rpc(&self.retry, || store.delete_metadata(delete.clone())).await {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == ClientErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            } else {
+                replayable.push(intent);
+            }
+        }
         let mut next_seq = checkpoint.batch_seq;
-        for intent in &intents {
+        for intent in &replayable {
             next_seq = next_seq.max(intent.seq + 1);
         }
         self.batch_seq = next_seq;
-        self.replay_queue = intents.into();
+        self.wal_floor = replayable
+            .first()
+            .map_or(checkpoint.batch_seq, |intent| intent.seq);
+        self.replay_queue = replayable.into();
 
         self.expansions = checkpoint.expansions;
         self.guest_instructions_used = checkpoint.budgets_used.guest_instructions;
@@ -772,7 +807,11 @@ where
             EscalationLevel::from_capped_u32(checkpoint.plateau.level),
             checkpoint.feature_map_version,
         );
-        self.status = ExperimentState::Running;
+        // Durable PAUSED survives the restart: the loop parks until Resume.
+        self.status = match checkpoint.status {
+            ExperimentState::Paused => ExperimentState::Paused,
+            _ => ExperimentState::Running,
+        };
         Ok(())
     }
 
@@ -782,7 +821,7 @@ where
     /// flight, plus batches dispatched after the checkpoint whose commits
     /// had not landed).
     async fn load_wal_entries(
-        &self,
+        &mut self,
         checkpoint: &CheckpointV1,
     ) -> ClientResult<Vec<ExpansionIntent>> {
         let store = self.store.clone();
@@ -836,7 +875,7 @@ where
         );
         let mut inflight: BTreeMap<u64, ExpansionIntent> = BTreeMap::new();
 
-        let result = self.run_loop(&mut pipeline, &mut inflight).await;
+        let result = self.run_phases(&mut pipeline, &mut inflight).await;
         self.slots_drain.abort();
         match result {
             Ok(()) => {}
@@ -869,6 +908,60 @@ where
         })
     }
 
+    async fn run_phases(
+        &mut self,
+        pipeline: &mut Pipeline,
+        inflight: &mut BTreeMap<u64, ExpansionIntent>,
+    ) -> ClientResult<()> {
+        // A runner resumed from a durable PAUSED checkpoint parks until the
+        // served surface sends Resume (or Stop).
+        if self.status == ExperimentState::Paused {
+            self.publish_status();
+            loop {
+                match self.control_rx.recv().await {
+                    Some(Control::Resume) => {
+                        self.status = ExperimentState::Running;
+                        self.publish_status();
+                        break;
+                    }
+                    Some(Control::Stop) | None => {
+                        self.status = ExperimentState::Stopped;
+                        return Ok(());
+                    }
+                    Some(Control::Pause) => {}
+                }
+            }
+        }
+        // WAL replay phase: strictly sequential and identical in fast and
+        // deterministic mode (§8.2 step 2). Each surviving intent re-runs
+        // its pure jobs and re-commits with adoption of already-committed
+        // children, reproducing the original run's effects exactly.
+        while let Some(intent) = self.replay_queue.pop_front() {
+            if !self.handle_control(pipeline, inflight).await? {
+                return Ok(());
+            }
+            self.dispatch_replay(pipeline, &intent).await?;
+            let done = pipeline.next_completed().await?.ok_or_else(|| {
+                ClientError::new(ClientErrorKind::Internal, "pipeline ended during replay")
+            })?;
+            let goal = self.commit_replayed(done, &intent).await?;
+            self.publish_status();
+            self.crash_check(CrashPoint::AfterCommitBeforeCheckpoint)?;
+            if let Some(goal_node) = goal {
+                self.checkpoint().await?;
+                if self.cfg.config.on_goal == OnGoal::Stop {
+                    self.status = ExperimentState::GoalReached;
+                    let _ = goal_node;
+                    return Ok(());
+                }
+            } else {
+                self.maybe_checkpoint().await?;
+            }
+        }
+
+        self.run_loop(pipeline, inflight).await
+    }
+
     async fn run_loop(
         &mut self,
         pipeline: &mut Pipeline,
@@ -888,15 +981,11 @@ where
             // A. SELECT + SYNTHESIZE while capacity remains.
             let max_inflight = self.cfg.config.scheduling.max_inflight_batches.max(1) as usize;
             while inflight.len() < max_inflight {
-                let intent = if let Some(replay) = self.replay_queue.pop_front() {
-                    replay
-                } else if self.commit_state.frontier.is_empty() {
+                if self.commit_state.frontier.is_empty() {
                     break;
-                } else {
-                    match self.build_intent()? {
-                        Some(intent) => intent,
-                        None => break,
-                    }
+                }
+                let Some(intent) = self.build_intent()? else {
+                    break;
                 };
                 self.dispatch_intent(pipeline, inflight, intent).await?;
             }
@@ -1095,17 +1184,15 @@ where
         let wal_bytes = encode_intent(&intent)
             .map_err(|error| ClientError::new(ClientErrorKind::Internal, error.to_string()))?;
         let store = self.store.clone();
+        // Unconditional: a replayed intent's WAL entry already exists (same
+        // seq => bitwise-identical intent), and fresh seqs never collide
+        // because resume advances batch_seq past every surviving entry.
         let put = PutMetadataRequest {
             key: MetadataKey::wal(&self.cfg.experiment_id, intent.seq),
             value: wal_bytes,
-            expected_generation: MetadataExpectation::create_only(),
+            expected_generation: MetadataExpectation::unconditional(),
         };
-        match retry_rpc(&self.retry, || store.put_metadata(put.clone())).await {
-            Ok(_) => {}
-            // A replayed intent's WAL entry already exists — that is the point.
-            Err(error) if error.kind() == ClientErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
+        retry_rpc(&self.retry, || store.put_metadata(put.clone())).await?;
         self.crash_check(CrashPoint::AfterWalWrite)?;
 
         let runtime = self.runtimes.get(&intent.node).ok_or_else(|| {
@@ -1295,6 +1382,8 @@ where
                             class: capture.determinism_class.clone(),
                         },
                     );
+                    self.node_bursts
+                        .insert((done.parent, job.burst.burst.burst_id), node_id);
                     if status == NodeStatus::Pruned {
                         self.emitter.emit(
                             ts,
@@ -1426,20 +1515,6 @@ where
         self.observe_score(observed_node, observed);
         self.maybe_rebin().await?;
 
-        // WAL delete after commit.
-        self.crash_check(CrashPoint::BeforeWalDelete)?;
-        let store = self.store.clone();
-        let delete = DeleteMetadataRequest {
-            key: MetadataKey::wal(&self.cfg.experiment_id, intent.seq),
-            expected_generation: MetadataExpectation::unconditional(),
-        };
-        match retry_rpc(&self.retry, || store.delete_metadata(delete.clone())).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == ClientErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        self.crash_check(CrashPoint::AfterWalDelete)?;
-
         if let Some(goal) = outcome.goal_node {
             if !self.goal_nodes.contains(&goal) {
                 self.goal_nodes.push(goal);
@@ -1458,6 +1533,407 @@ where
             return Ok(Some(goal));
         }
         Ok(None)
+    }
+
+    /// Re-dispatches a surviving WAL intent. The WAL entry already exists;
+    /// jobs are pure, so the batch re-executes bit-identically.
+    async fn dispatch_replay(
+        &mut self,
+        pipeline: &Pipeline,
+        intent: &ExpansionIntent,
+    ) -> ClientResult<()> {
+        let request = self.store.build_propose_bursts(ProposeBurstsBuildSpec {
+            experiment_id: self.cfg.experiment_id.clone(),
+            node_id: intent.node,
+            k: intent.knobs.k,
+            length_hint: FrameCount::new(intent.knobs.length_hint_frames),
+            experiment_seed: self.cfg.config.seed,
+            batch_seq: intent.seq,
+            model: ModelKind::Pad,
+            config_overrides_yaml: intent.knobs.config_overrides_yaml.clone(),
+            context_limits: NodeContextLimits::default(),
+        })?;
+        let response = self.guarded_propose(request).await?;
+        self.crash_check(CrashPoint::AfterWalWrite)?;
+
+        let runtime = self.runtimes.get(&intent.node).ok_or_else(|| {
+            ClientError::new(
+                ClientErrorKind::Internal,
+                format!("no runtime for replayed node {}", intent.node.get()),
+            )
+        })?;
+        pipeline
+            .submit(Batch {
+                seq: intent.seq,
+                parent: intent.node,
+                parent_snapshot: runtime.snapshot,
+                required_class: Some(runtime.class.clone()),
+                bursts: response.bursts,
+            })
+            .await?;
+        self.crash_check(CrashPoint::AfterDispatch)?;
+        Ok(())
+    }
+
+    /// Replay-exact commit (§8.2 step 2): children the original run already
+    /// committed are adopted (their tree/seen/mirror effects landed during
+    /// resume adoption); everything else recomputes through the commit
+    /// rules with duplicate verdicts derived from the orchestrator's own
+    /// SeenMap (bitwise equal to the scorer's verdict on fakes, whose dedup
+    /// is the same seen-set — disclosed).
+    async fn commit_replayed(
+        &mut self,
+        done: BatchResult,
+        intent: &ExpansionIntent,
+    ) -> ClientResult<Option<NodeId>> {
+        use orch_core::commit::update_parent_exhaustion;
+
+        let jobs: Vec<&JobResult> = done
+            .jobs
+            .iter()
+            .filter_map(|job| match job {
+                JobOutcome::Completed(result) => Some(result.as_ref()),
+                JobOutcome::Abandoned { .. } => None,
+            })
+            .collect();
+        for job in &jobs {
+            if let Some(capture) = &job.capture {
+                self.guest_instructions_used = self
+                    .guest_instructions_used
+                    .saturating_add(capture.icount.get());
+            }
+        }
+        let scorable: Vec<&JobResult> = jobs
+            .iter()
+            .copied()
+            .filter(|job| job.capture.is_some())
+            .collect();
+        let results = if scorable.is_empty() {
+            Vec::new()
+        } else {
+            self.score_batch(
+                intent.client_batch_id.clone(),
+                scorable
+                    .iter()
+                    .map(|job| {
+                        let capture = job.capture.as_ref().expect("scorable");
+                        StateInput {
+                            node_ref: format!("{}-j{}", intent.client_batch_id, job.job_idx),
+                            feature_bytes: capture.feature_bytes.clone().unwrap_or_default(),
+                            framebuffer: None,
+                            fb_meta: None,
+                        }
+                    })
+                    .collect(),
+            )
+            .await?
+        };
+
+        let rules = CommitRules::from_config(&self.cfg.config);
+        let parent = done.parent;
+        let parent_score_value = parent_score(&self.commit_state, parent);
+        let ts = self.expansions;
+        let mut committed_states = Vec::new();
+        let mut committed_count = 0u64;
+        let mut discarded_count = 0u64;
+        let mut best_committed: Option<(NodeId, f64)> = None;
+        let mut goal_node: Option<NodeId> = None;
+        let mut all_duplicate = !scorable.is_empty();
+
+        for (index, (job, result)) in scorable.iter().zip(&results).enumerate() {
+            if index > 0 && index == scorable.len() / 2 {
+                self.crash_check(CrashPoint::MidBatchCommit)?;
+            }
+            let capture = job.capture.as_ref().expect("scorable");
+            let hash = result.state_hash;
+            let cell = result.novelty_detail.cell_key;
+
+            // Adoption: this exact child row already exists (same parent,
+            // same producing burst, same state hash).
+            if let Some(&existing) = self.node_bursts.get(&(parent, job.burst.burst.burst_id)) {
+                let adopted = self.commit_state.tree.get(existing).is_some_and(|record| {
+                    record.parent == Some(parent) && record.state_hash == hash
+                });
+                if adopted {
+                    all_duplicate = false;
+                    committed_count += 1;
+                    committed_states.push(CommittedState {
+                        state_hash: hash,
+                        cell_key: cell,
+                    });
+                    let record = self
+                        .commit_state
+                        .tree
+                        .get(existing)
+                        .expect("adopted node in tree");
+                    if best_committed.is_none_or(|(_, best)| record.score.get() > best) {
+                        best_committed = Some((existing, record.score.get()));
+                    }
+                    if record.goal && goal_node.is_none() {
+                        goal_node = Some(existing);
+                    }
+                    continue;
+                }
+            }
+
+            let prune = result.prune || job.verdict == JobVerdict::GuestHang;
+            let duplicate = self.commit_state.seen.get(hash).is_some();
+            let novelty =
+                Novelty::new(self.commit_state.cell_mirror.novelty(cell)).map_err(|error| {
+                    ClientError::new(ClientErrorKind::Internal, format!("novelty: {error}"))
+                })?;
+            let payload = NodePayload::new(
+                capture.snapshot,
+                result.progress_score,
+                novelty,
+                cell,
+                hash,
+                result.stage,
+                capture.frame_counter,
+            );
+
+            if prune {
+                all_duplicate = false;
+                match rules.prune_action {
+                    orch_core::types::PruneAction::Drop => {
+                        discarded_count += 1;
+                    }
+                    orch_core::types::PruneAction::Exhausted => {
+                        let node_id = self
+                            .commit_state
+                            .tree
+                            .insert_child(parent, payload)
+                            .map_err(|error| {
+                                ClientError::new(
+                                    ClientErrorKind::Internal,
+                                    format!("replay insert failed: {error:?}"),
+                                )
+                            })?;
+                        self.commit_state.ensure_tracking(node_id);
+                        self.commit_state.tree.mark_pruned(node_id).ok();
+                        self.commit_state.seen.insert(hash, node_id);
+                        self.commit_state.cell_mirror.bump(cell);
+                        self.create_child_node(node_id, parent, job, result, NodeStatus::Pruned)
+                            .await?;
+                        self.crash_check(CrashPoint::AfterCreateNode)?;
+                        self.register_committed_child(node_id, job, hash, cell);
+                        committed_count += 1;
+                        committed_states.push(CommittedState {
+                            state_hash: hash,
+                            cell_key: cell,
+                        });
+                        self.emitter.emit(
+                            ts,
+                            "node-pruned",
+                            events::node_pruned_payload(
+                                parent,
+                                PruneReason::Exhausted,
+                                Some(node_id),
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if duplicate {
+                discarded_count += 1;
+                self.commit_state.cell_mirror.bump(cell);
+                let route = self.commit_state.seen.get(hash);
+                if let Some(existing) = route {
+                    if existing != parent {
+                        self.commit_state.tree.increment_visits(existing).ok();
+                    }
+                    self.update_node(NodeUpdate {
+                        node_id: existing,
+                        status: None,
+                        progress_score: None,
+                        novelty_score: None,
+                        visit_count_delta: 1,
+                        expand_count_delta: 0,
+                        touch_visited: true,
+                        attrs: None,
+                    })
+                    .await?;
+                }
+                self.emitter.emit(
+                    ts,
+                    "node-pruned",
+                    events::node_pruned_payload(parent, PruneReason::Duplicate, None),
+                );
+                continue;
+            }
+
+            all_duplicate = false;
+            let worse = payload.score.get() + rules.epsilon_keep < parent_score_value;
+            let known_cell = self.commit_state.cell_mirror.count(cell) > 0;
+            if worse && known_cell {
+                discarded_count += 1;
+                self.emitter.emit(
+                    ts,
+                    "node-pruned",
+                    events::node_pruned_payload(parent, PruneReason::Regression, None),
+                );
+                continue;
+            }
+
+            let node_id = self
+                .commit_state
+                .tree
+                .insert_child(parent, payload)
+                .map_err(|error| {
+                    ClientError::new(
+                        ClientErrorKind::Internal,
+                        format!("replay insert failed: {error:?}"),
+                    )
+                })?;
+            self.commit_state.ensure_tracking(node_id);
+            self.commit_state.seen.insert(hash, node_id);
+            self.commit_state.cell_mirror.bump(cell);
+            let status = if result.goal_hit {
+                self.commit_state.tree.mark_goal(node_id).ok();
+                if goal_node.is_none() {
+                    goal_node = Some(node_id);
+                }
+                NodeStatus::Goal
+            } else {
+                self.commit_state.frontier.insert(node_id).ok();
+                NodeStatus::Frontier
+            };
+            self.create_child_node(node_id, parent, job, result, status)
+                .await?;
+            self.crash_check(CrashPoint::AfterCreateNode)?;
+            self.register_committed_child(node_id, job, hash, cell);
+            committed_count += 1;
+            committed_states.push(CommittedState {
+                state_hash: hash,
+                cell_key: cell,
+            });
+            if best_committed.is_none_or(|(_, best)| payload.score.get() > best) {
+                best_committed = Some((node_id, payload.score.get()));
+            }
+            let features = decoded_pairs(&self.cfg.config, &self.bringup, result);
+            self.emitter.emit(
+                ts,
+                "node-added",
+                events::node_added_payload(
+                    node_id,
+                    parent,
+                    payload.score.get(),
+                    payload.novelty_at_commit.get(),
+                    payload.cell.get(),
+                    u32::from(payload.stage.get()),
+                    &features,
+                ),
+            );
+        }
+
+        // Rules 4/5 exactly as commit_batch applies them.
+        let parent_visits = self
+            .commit_state
+            .tree
+            .increment_visits(parent)
+            .map_err(|error| {
+                ClientError::new(
+                    ClientErrorKind::Internal,
+                    format!("replay visit failed: {error:?}"),
+                )
+            })?;
+        let evicted = update_parent_exhaustion(
+            &mut self.commit_state,
+            parent,
+            parent_visits,
+            all_duplicate,
+            &rules,
+        )
+        .map_err(|error| {
+            ClientError::new(
+                ClientErrorKind::Internal,
+                format!("replay exhaustion failed: {error:?}"),
+            )
+        })?;
+        let parent_status = self
+            .commit_state
+            .tree
+            .get(parent)
+            .expect("parent in tree")
+            .status;
+        self.update_node(NodeUpdate {
+            node_id: parent,
+            status: Some(parent_status),
+            progress_score: None,
+            novelty_score: None,
+            visit_count_delta: 1,
+            expand_count_delta: 1,
+            touch_visited: true,
+            attrs: None,
+        })
+        .await?;
+        if evicted.is_some() {
+            self.emitter.emit(
+                ts,
+                "node-pruned",
+                events::node_pruned_payload(parent, PruneReason::FrontierEvict, None),
+            );
+        }
+
+        self.replay_commits(committed_states).await?;
+        self.expansions += 1;
+        self.commits_since_checkpoint += 1;
+        self.emitter.emit(
+            ts,
+            "batch-completed",
+            events::batch_completed_payload(done.seq, parent, committed_count, discarded_count),
+        );
+        let observed = best_committed
+            .map(|(_, score)| score)
+            .unwrap_or_else(|| parent_score(&self.commit_state, parent));
+        let observed_node = best_committed.map_or(parent, |(node, _)| node);
+        self.observe_score(observed_node, observed);
+        self.maybe_rebin().await?;
+
+        if let Some(goal) = goal_node {
+            if !self.goal_nodes.contains(&goal) {
+                self.goal_nodes.push(goal);
+            }
+            let score = self
+                .commit_state
+                .tree
+                .get(goal)
+                .map(|record| record.score.get())
+                .unwrap_or_default();
+            self.emitter.emit(
+                ts,
+                "goal-reached",
+                events::goal_reached_payload(goal, score),
+            );
+            return Ok(Some(goal));
+        }
+        Ok(None)
+    }
+
+    fn register_committed_child(
+        &mut self,
+        node_id: NodeId,
+        job: &JobResult,
+        _hash: orch_core::types::StateHash,
+        _cell: orch_core::types::CellKey,
+    ) {
+        let capture = job.capture.as_ref().expect("scorable");
+        self.runtimes.insert(
+            node_id,
+            NodeRuntime {
+                snapshot: capture.snapshot,
+                class: capture.determinism_class.clone(),
+            },
+        );
+        // register_committed_child parent context: the tree row itself.
+        if let Some(record) = self.commit_state.tree.get(node_id) {
+            if let Some(parent) = record.parent {
+                self.node_bursts
+                    .insert((parent, job.burst.burst.burst_id), node_id);
+            }
+        }
     }
 
     fn observe_score(&mut self, node: NodeId, score_value: f64) {
@@ -1590,7 +2066,7 @@ where
         }
     }
 
-    async fn update_node(&self, update: NodeUpdate) -> ClientResult<()> {
+    async fn update_node(&mut self, update: NodeUpdate) -> ClientResult<()> {
         let store = self.store.clone();
         let request = UpdateNodesRequest {
             experiment_id: self.cfg.experiment_id.clone(),
@@ -1717,6 +2193,24 @@ where
         };
         self.ckpt_generation = Some(response.generation);
         self.crash_check(CrashPoint::AfterCasPut)?;
+
+        // WAL truncation: the checkpoint covers every batch below
+        // batch_seq, so their entries are no longer needed for replay.
+        self.crash_check(CrashPoint::BeforeWalDelete)?;
+        let store = self.store.clone();
+        for seq in self.wal_floor..self.batch_seq {
+            let delete = DeleteMetadataRequest {
+                key: MetadataKey::wal(&self.cfg.experiment_id, seq),
+                expected_generation: MetadataExpectation::unconditional(),
+            };
+            match retry_rpc(&self.retry, || store.delete_metadata(delete.clone())).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == ClientErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.wal_floor = self.batch_seq;
+        self.crash_check(CrashPoint::AfterWalDelete)?;
 
         self.checkpointed_batch_seq = self.batch_seq;
         self.commits_since_checkpoint = 0;
