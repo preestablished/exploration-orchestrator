@@ -17,6 +17,10 @@ pub enum RngPurpose {
     Selection,
     Synth,
     Misc,
+    /// Guest entropy for the bootstrap `CreateVm` (API.md §2.1 step 1).
+    Boot,
+    /// Per-job guest entropy for expansion dispatch (API.md §2.2).
+    Entropy,
 }
 
 impl RngPurpose {
@@ -25,6 +29,8 @@ impl RngPurpose {
             Self::Selection => b"selection",
             Self::Synth => b"synth",
             Self::Misc => b"misc",
+            Self::Boot => b"boot",
+            Self::Entropy => b"entropy",
         }
     }
 }
@@ -151,6 +157,29 @@ pub fn derive_synth_request_seed(experiment_seed: u64, batch_seq: u64) -> u64 {
     DeterministicRng::synth(experiment_seed, batch_seq).next_u64()
 }
 
+/// Derives the guest entropy seed for the bootstrap `CreateVm`.
+///
+/// One boot per experiment run: the stream is `("boot", batch_seq = 0)`.
+pub fn derive_boot_entropy_seed(experiment_seed: u64) -> [u8; STREAM_SEED_LEN] {
+    derive_stream_seed(experiment_seed, RngPurpose::Boot, 0)
+}
+
+/// Derives the guest entropy seed for one expansion job.
+///
+/// Per-batch stream `("entropy", batch_seq)`, then one blake3 fold per job
+/// index so sibling jobs draw independent seeds without stream cursors.
+pub fn derive_job_entropy_seed(
+    experiment_seed: u64,
+    batch_seq: u64,
+    job_idx: u32,
+) -> [u8; STREAM_SEED_LEN] {
+    let stream_seed = derive_stream_seed(experiment_seed, RngPurpose::Entropy, batch_seq);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&stream_seed);
+    hasher.update(&job_idx.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +304,43 @@ mod tests {
 
         assert_ne!(bytes, [0u8; 16]);
         assert_eq!(rng.draw_count(), 2);
+    }
+
+    const BOOT_SEED: [u8; STREAM_SEED_LEN] = [
+        16, 101, 214, 49, 28, 131, 117, 31, 96, 50, 46, 62, 76, 138, 163, 176, 249, 133, 249, 3,
+        120, 175, 20, 14, 175, 183, 246, 201, 113, 186, 216, 222,
+    ];
+    const ENTROPY_BATCH_3_JOB_0: [u8; STREAM_SEED_LEN] = [
+        42, 120, 70, 143, 7, 200, 191, 91, 47, 254, 5, 203, 250, 139, 224, 121, 240, 134, 147, 105,
+        144, 89, 229, 197, 71, 43, 55, 149, 160, 93, 21, 218,
+    ];
+    const ENTROPY_BATCH_3_JOB_5: [u8; STREAM_SEED_LEN] = [
+        182, 89, 135, 122, 253, 134, 116, 55, 211, 168, 13, 34, 114, 37, 236, 191, 73, 91, 37, 92,
+        237, 36, 167, 218, 204, 82, 27, 37, 68, 187, 251, 183,
+    ];
+
+    #[test]
+    fn boot_and_job_entropy_seed_golden_vectors() {
+        assert_eq!(derive_boot_entropy_seed(GOLDEN_SEED), BOOT_SEED);
+        assert_eq!(
+            derive_boot_entropy_seed(GOLDEN_SEED),
+            derive_stream_seed(GOLDEN_SEED, RngPurpose::Boot, 0)
+        );
+        assert_eq!(
+            derive_job_entropy_seed(GOLDEN_SEED, 3, 0),
+            ENTROPY_BATCH_3_JOB_0
+        );
+        assert_eq!(
+            derive_job_entropy_seed(GOLDEN_SEED, 3, 5),
+            ENTROPY_BATCH_3_JOB_5
+        );
+        assert_ne!(
+            derive_job_entropy_seed(GOLDEN_SEED, 4, 0),
+            ENTROPY_BATCH_3_JOB_0
+        );
+        assert_ne!(
+            derive_job_entropy_seed(GOLDEN_SEED + 1, 3, 0),
+            ENTROPY_BATCH_3_JOB_0
+        );
     }
 }

@@ -8,5 +8,6 @@
 //! exercised against `orch-fakes` on a paused-clock tokio runtime; real
 //! transport adapters arrive at M6 behind the same ports.
 
+pub mod driver;
 pub mod ports;
 pub mod slots;

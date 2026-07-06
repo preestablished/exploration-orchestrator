@@ -224,19 +224,7 @@ impl SlotView {
         required_class: Option<&DeterminismClass>,
     ) -> ClientResult<SlotPermit> {
         if let Some(required) = required_class {
-            let state = self.state.lock().expect("slot view state poisoned");
-            if !self.allow_class_mismatch && *required != state.worker_class {
-                return Err(ClientError::new(
-                    ClientErrorKind::FailedPrecondition,
-                    format!(
-                        "{CLASS_MISMATCH_REASON}: job requires cpu_model={} vmm={}, worker offers cpu_model={} vmm={}",
-                        required.cpu_model,
-                        required.vmm_version,
-                        state.worker_class.cpu_model,
-                        state.worker_class.vmm_version,
-                    ),
-                ));
-            }
+            self.acquire_class_check(required)?;
         }
 
         loop {
@@ -255,6 +243,42 @@ impl SlotView {
             };
             // A closed sender (view dropped mid-shutdown) just re-loops.
             let _ = receiver.await;
+        }
+    }
+
+    /// Gates a job's determinism-class requirement against the worker class
+    /// (fixed grep-able reason on mismatch unless `allow_class_mismatch`).
+    pub fn acquire_class_check(&self, required: &DeterminismClass) -> ClientResult<()> {
+        let state = self.state.lock().expect("slot view state poisoned");
+        if !self.allow_class_mismatch && *required != state.worker_class {
+            return Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                format!(
+                    "{CLASS_MISMATCH_REASON}: job requires cpu_model={} vmm={}, worker offers cpu_model={} vmm={}",
+                    required.cpu_model,
+                    required.vmm_version,
+                    state.worker_class.cpu_model,
+                    state.worker_class.vmm_version,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserves a slot only if one is free right now. Used by fork dispatch
+    /// to grab sibling slots all-or-nothing without deadlocking against
+    /// other in-flight batches.
+    #[must_use]
+    pub fn try_acquire(&self) -> Option<SlotPermit> {
+        let mut state = self.state.lock().expect("slot view state poisoned");
+        if state.free() > 0 {
+            state.advance_integrals(Instant::now());
+            state.reserved += 1;
+            Some(SlotPermit {
+                state: Arc::clone(&self.state),
+            })
+        } else {
+            None
         }
     }
 
