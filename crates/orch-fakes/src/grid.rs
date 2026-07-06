@@ -114,9 +114,9 @@ pub struct GridWorld {
     pub goal: GridPos,
     /// Scoring the fake scorer applies: per-room base score.
     pub room_base_score: [f64; 3],
-    /// Score weight along +x and -y (progress direction pull).
-    pub x_weight: f64,
-    pub y_weight: f64,
+    /// Per-room score weight along +x and -y (progress direction pull).
+    pub room_x_weight: [f64; 3],
+    pub room_y_weight: [f64; 3],
     /// Cell the fake scorer marks prune-on-sight, if any.
     pub prune_cell: Option<GridPos>,
 }
@@ -165,49 +165,48 @@ impl GridWorld {
             boss: Some(GridPos::new(Room::Boss, 2, 2)),
             goal: GridPos::new(Room::Boss, 4, 0),
             room_base_score: [0.0, 100.0, 200.0],
-            x_weight: 10.0,
-            y_weight: 1.0,
+            room_x_weight: [10.0, 10.0, 10.0],
+            room_y_weight: [1.0, 1.0, 1.0],
             prune_cell: Some(GridPos::new(Room::Start, 0, 0)),
         }
     }
 
     /// Plateau-ladder fixture: a rightward corridor whose score gradient
     /// pulls toward a locked stage gate, with the key hidden at the end of
-    /// a zero-gradient detour. Short greedy bursts saturate at the gate;
-    /// unsticking needs longer bursts / hotter selection / backtracking.
+    /// a zero-gradient detour reached by climbing at the corridor's start.
+    /// Short greedy bursts saturate at the gate; unsticking needs longer
+    /// bursts / hotter selection / backtracking. (Solvable with Up, Right,
+    /// and Left only — the fake synthesizer's pad alphabet has no Down.)
     #[must_use]
     pub fn corridor_hidden_key() -> Self {
         let mut walls = Vec::new();
-        // Start room: a corridor along y=2 walled above and below except a
-        // single gap at x=0 leading down toward the key annex door.
+        // Start room: a corridor along y=2 walled below, and walled above
+        // except a single climb shaft at x=0.
         for x in 0..GRID_WIDTH {
-            walls.push(GridPos::new(Room::Start, x, 1));
+            walls.push(GridPos::new(Room::Start, x, 3));
+            walls.push(GridPos::new(Room::Start, x, 4));
             if x != 0 {
-                walls.push(GridPos::new(Room::Start, x, 3));
+                walls.push(GridPos::new(Room::Start, x, 1));
+                walls.push(GridPos::new(Room::Start, x, 0));
             }
         }
-        // Key annex: a switchback so reaching the key costs many
-        // zero-score steps.
-        walls.push(GridPos::new(Room::KeyVault, 1, 1));
-        walls.push(GridPos::new(Room::KeyVault, 1, 2));
-        walls.push(GridPos::new(Room::KeyVault, 3, 2));
-        walls.push(GridPos::new(Room::KeyVault, 3, 3));
         Self {
             name: "corridor-hidden-key".to_owned(),
             start: GridPos::new(Room::Start, 0, 2),
             walls,
             doors: vec![
                 GridDoor {
-                    // The detour: drop out of the corridor at its start.
-                    at: GridPos::new(Room::Start, 0, 4),
-                    action: GridAction::Down,
+                    // Top of the climb shaft: into the key annex.
+                    at: GridPos::new(Room::Start, 0, 0),
+                    action: GridAction::Up,
                     to: GridPos::new(Room::KeyVault, 0, 0),
                     requires_key: false,
                 },
                 GridDoor {
-                    at: GridPos::new(Room::KeyVault, 0, 0),
+                    // The key cell doubles as the way back to the corridor.
+                    at: GridPos::new(Room::KeyVault, 4, 0),
                     action: GridAction::Up,
-                    to: GridPos::new(Room::Start, 0, 4),
+                    to: GridPos::new(Room::Start, 0, 2),
                     requires_key: false,
                 },
                 GridDoor {
@@ -218,12 +217,15 @@ impl GridWorld {
                     requires_key: true,
                 },
             ],
-            key: Some(GridPos::new(Room::KeyVault, 4, 4)),
+            key: Some(GridPos::new(Room::KeyVault, 4, 0)),
             boss: None,
             goal: GridPos::new(Room::Boss, 4, 2),
             room_base_score: [0.0, 0.0, 200.0],
-            x_weight: 10.0,
-            y_weight: 0.0,
+            // The key annex is score-flat: crossing it never pays until the
+            // key itself, so only novelty/backtracking (the ladder) sustains
+            // the detour.
+            room_x_weight: [10.0, 0.0, 10.0],
+            room_y_weight: [0.0, 0.0, 0.0],
             prune_cell: None,
         }
     }
@@ -335,9 +337,10 @@ impl GridWorld {
     /// Fake-scorer progress score for a state in this world.
     #[must_use]
     pub fn progress_score_value(&self, state: GridState) -> f64 {
-        self.room_base_score[state.room.id() as usize]
-            + f64::from(state.x) * self.x_weight
-            + f64::from(GRID_HEIGHT - 1 - state.y) * self.y_weight
+        let room = state.room.id() as usize;
+        self.room_base_score[room]
+            + f64::from(state.x) * self.room_x_weight[room]
+            + f64::from(GRID_HEIGHT - 1 - state.y) * self.room_y_weight[room]
             + if state.has_key() { 25.0 } else { 0.0 }
             + f64::from(self.boss_hp_max().saturating_sub(state.boss_hp)) * 40.0
             + if self.goal_reached(state) {
@@ -628,20 +631,17 @@ mod tests {
         assert_eq!(blocked_outcome, StepOutcome::BlockedByDoor);
         assert_eq!(blocked, at_gate);
 
-        // The detour: down at the corridor start, through the annex
-        // switchback to the hidden key, back, then through the gate.
+        // The detour: climb at the corridor start, cross the annex to the
+        // hidden key (whose cell doubles as the way back), then through the
+        // gate. Up/Right only — the fake synth's alphabet has no Down.
         let scripted = [
-            GridAction::Down,
-            GridAction::Down, // Start(0,4) -> door
-            GridAction::Down, // KeyVault(0,0)
-            GridAction::Down,
-            GridAction::Down,
-            GridAction::Down,
-            GridAction::Down, // (0,4)
+            GridAction::Up, // (0,1)
+            GridAction::Up, // (0,0)
+            GridAction::Up, // door -> KeyVault(0,0)
             GridAction::Right,
             GridAction::Right,
             GridAction::Right,
-            GridAction::Right, // (4,4) key
+            GridAction::Right, // (4,0) key
         ];
         let with_key = world.apply_actions(start, &scripted);
         assert!(
@@ -650,17 +650,7 @@ mod tests {
         );
 
         let back_and_through = [
-            GridAction::Left,
-            GridAction::Left,
-            GridAction::Left,
-            GridAction::Left, // (0,4)
-            GridAction::Up,
-            GridAction::Up,
-            GridAction::Up,
-            GridAction::Up, // (0,0)
-            GridAction::Up, // door -> Start(0,4)
-            GridAction::Up, // (0,3)
-            GridAction::Up, // (0,2) corridor
+            GridAction::Up, // key-cell door -> Start(0,2)
             GridAction::Right,
             GridAction::Right,
             GridAction::Right,
@@ -677,16 +667,13 @@ mod tests {
             "scripted solve must reach credits: {solved:?}"
         );
 
-        // The score gradient pulls toward the gate, not into the detour:
-        // entering the annex reads far below sitting at the gate.
-        let mid_detour = world.apply_actions(
-            start,
-            &[GridAction::Down, GridAction::Down, GridAction::Down],
-        );
-        assert_eq!(mid_detour.room, Room::KeyVault);
+        // The score gradient pulls toward the gate, not into the climb
+        // shaft: the shaft reads far below sitting at the gate.
+        let mid_detour = world.apply_actions(start, &[GridAction::Up, GridAction::Up]);
+        assert_eq!(mid_detour.room, Room::Start);
         assert!(
             world.progress_score_value(at_gate) > world.progress_score_value(mid_detour) + 30.0,
-            "the detour must be a score trap: gate {} vs detour {}",
+            "the detour must be a score trap: gate {} vs shaft {}",
             world.progress_score_value(at_gate),
             world.progress_score_value(mid_detour)
         );

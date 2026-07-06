@@ -1225,14 +1225,21 @@ where
         let response = retry_rpc(&self.retry, || synth.propose_bursts(request.clone())).await?;
         validate_propose_bursts_response(&request, &response)?;
 
-        if let Some(expected) = self.fingerprint {
-            if response.config_fingerprint != expected {
-                return Err(ClientError::new(
-                    ClientErrorKind::FailedPrecondition,
-                    format!(
-                        "{REASON_FINGERPRINT_MISMATCH}: response fingerprint diverged from the pinned bring-up fingerprint"
-                    ),
-                ));
+        // The fingerprint is a function of the effective synth config, so it
+        // legitimately differs per request profile (e.g. L3 overrides). The
+        // registry guards per profile; the checkpointed fingerprint pins the
+        // base (no-overrides) profile across restarts.
+        let base_profile = request.config_overrides_yaml.is_empty();
+        if base_profile {
+            if let Some(expected) = self.fingerprint {
+                if response.config_fingerprint != expected {
+                    return Err(ClientError::new(
+                        ClientErrorKind::FailedPrecondition,
+                        format!(
+                            "{REASON_FINGERPRINT_MISMATCH}: base-profile fingerprint diverged from the checkpointed bring-up fingerprint"
+                        ),
+                    ));
+                }
             }
         }
         match self
@@ -1240,7 +1247,9 @@ where
             .check_or_insert(profile, response.config_fingerprint)
         {
             Ok(FingerprintCheck::Inserted | FingerprintCheck::Matched) => {
-                self.fingerprint = Some(response.config_fingerprint);
+                if base_profile {
+                    self.fingerprint = Some(response.config_fingerprint);
+                }
                 Ok(response)
             }
             Err(mismatch) => Err(mismatch.into_client_error()),
