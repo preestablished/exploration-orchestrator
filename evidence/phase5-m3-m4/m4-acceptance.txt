@@ -1,0 +1,18 @@
+== M4 autonomy (10 seeds) ==
+test ten_of_ten_seeds_reach_credits_within_budget ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 46.41s
+== M4 plateau ladder ==
+test ladder_unsticks_the_corridor_and_the_control_fails_the_budget ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.08s
+== M4 fast replay ==
+test every_committed_node_re_derives_from_its_parent ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.22s
+== M4 pause/resume ==
+test pause_survives_a_process_swap_and_resume_finishes_the_run ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+== M4 gRPC surface ==
+test all_six_rpcs_work_end_to_end ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.18s
+== M4 runner smoke ==
+test fresh_run_reaches_credits_and_checkpoints ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.55s

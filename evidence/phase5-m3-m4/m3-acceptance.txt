@@ -1,0 +1,18 @@
+== M3 utilization ==
+test sensitivity_control_serialized_dispatch_fails_the_bar ... ok
+test slot_utilization_exceeds_95_percent_under_latency_jitter ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+== M3 backpressure ==
+test queues_cap_at_configured_bounds_under_a_slow_scorer ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+== M3 retry equivalence ==
+test five_percent_injected_errors_leave_the_search_bit_identical ... ok
+test different_seeds_still_differ_under_the_same_fault_plan ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+== M3 shrink/grow ==
+test acquire_is_pending_at_shrunken_capacity_and_wakes_on_grow ... ok
+test pool_shrinks_to_one_and_regrows_without_deadlock ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+== M3 expansion context ==
+test synth_context_flows_through_the_real_expansion_path ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s

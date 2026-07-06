@@ -36,3 +36,7 @@ jobs:
         working-directory: repo
       - run: cargo test --workspace --all-features
         working-directory: repo
+      # Determinism gate: same seed twice must be bit-identical (tree +
+      # event-sequence hashes) on both matrix arms.
+      - run: cargo test -p orch-server --test seed_gate
+        working-directory: repo

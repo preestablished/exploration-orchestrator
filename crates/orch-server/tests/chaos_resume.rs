@@ -160,7 +160,7 @@ async fn chaos_run(seed: u64, point: CrashPoint) -> ([u8; 32], RunOutcome, u32) 
         } else {
             None
         };
-        let (runner, _handle, _mode) = ExperimentRunner::start(
+        let started = ExperimentRunner::start(
             runner_config(seed),
             sources(),
             world.hypervisor.clone(),
@@ -170,8 +170,18 @@ async fn chaos_run(seed: u64, point: CrashPoint) -> ([u8; 32], RunOutcome, u32) 
             world.observatory(),
             policy,
         )
-        .await
-        .expect("runner (re)starts against surviving fakes");
+        .await;
+        let (runner, _handle, _mode) = match started {
+            Ok(parts) => parts,
+            // The bootstrap/initial checkpoint contains crash points too: a
+            // SIGKILL during start() is just another crash incarnation.
+            Err(error) if error.message().starts_with(CRASHED_MARKER) => {
+                crashes += 1;
+                world.hypervisor.service().lock().await.reclaim_session();
+                continue;
+            }
+            Err(error) => panic!("non-crash start failure under chaos: {error}"),
+        };
         match runner.run().await {
             Err(error) if error.message().starts_with(CRASHED_MARKER) => {
                 crashes += 1;
