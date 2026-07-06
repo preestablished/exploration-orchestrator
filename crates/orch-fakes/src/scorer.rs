@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget},
-    grid::{GridState, Room, BOSS_MAX_HP, GRID_HEIGHT, GRID_WIDTH},
+    grid::{GridState, GridWorld, Room, BOSS_MAX_HP, GRID_HEIGHT, GRID_WIDTH},
 };
 
 pub const MAX_SCORE_BATCH_ITEMS: usize = 256;
@@ -41,6 +41,8 @@ const STAGE_NAMES: [&str; 4] = ["start", "key", "boss", "credits"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FakeScorer {
+    #[serde(default = "GridWorld::three_room")]
+    world: GridWorld,
     experiments: BTreeMap<String, ExperimentArchive>,
     checkpoints: BTreeMap<CheckpointKey, ArchiveSnapshot>,
     #[serde(skip, default = "default_fault_injector")]
@@ -63,7 +65,18 @@ impl FakeScorer {
 
     #[must_use]
     pub fn with_fault_plan(fault_plan: FaultPlan) -> Self {
+        Self::with_world_and_fault_plan(GridWorld::three_room(), fault_plan)
+    }
+
+    #[must_use]
+    pub fn with_world(world: GridWorld) -> Self {
+        Self::with_world_and_fault_plan(world, FaultPlan::disabled(0))
+    }
+
+    #[must_use]
+    pub fn with_world_and_fault_plan(world: GridWorld, fault_plan: FaultPlan) -> Self {
         Self {
+            world,
             experiments: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             fault_injector: FaultInjector::new(fault_plan),
@@ -236,6 +249,7 @@ impl StateScorerClient for FakeScorer {
             request.states.len() as u32,
         )?;
         let keep_items = decision.truncate_len(request.states.len());
+        let world = self.world.clone();
 
         let archive = self.loaded_archive_mut(&request.experiment_id)?;
         if let Some(cached) = archive.batch_cache.get(&request.client_batch_id) {
@@ -252,6 +266,7 @@ impl StateScorerClient for FakeScorer {
         let mut scored_states = Vec::new();
         for input in request.states.iter().take(keep_items) {
             let scored = score_state_input(
+                &world,
                 input.node_ref.clone(),
                 &input.feature_bytes,
                 input.framebuffer.as_ref(),
@@ -534,6 +549,7 @@ fn decode_grid_features(bytes: &[u8]) -> Result<GridState, ItemError> {
 
 #[allow(clippy::too_many_arguments)]
 fn score_state_input(
+    world: &GridWorld,
     node_ref: String,
     feature_bytes: &[u8],
     framebuffer: Option<&Framebuffer>,
@@ -565,7 +581,7 @@ fn score_state_input(
     let cell_count = cell_counts_before.get(&cell_key).copied().unwrap_or(0);
     let count_novelty = novelty(1.0 / f64::from(cell_count + 1).sqrt());
     let visual_novelty = framebuffer.map_or(novelty(0.0), |_| novelty(1.0));
-    let progress_score = progress_score(state);
+    let progress_score = progress_score(world, state);
 
     ScoredItem {
         result: ScoreResult {
@@ -574,16 +590,16 @@ fn score_state_input(
             progress_score,
             novelty_score: count_novelty,
             state_hash,
-            goal_hit: state.goal_reached(),
+            goal_hit: world.goal_reached(state),
             duplicate,
-            stage: stage(state),
-            prune: prune(state),
+            stage: stage(world, state),
+            prune: world.prune(state),
             decoded: if return_decoded {
                 decoded_values(state)
             } else {
                 Vec::new()
             },
-            component_breakdown: component_breakdown(state),
+            component_breakdown: component_breakdown(world, state),
             novelty_detail: NoveltyDetail {
                 count_novelty,
                 cell_key,
@@ -677,13 +693,13 @@ fn decoded_values(state: GridState) -> Vec<DecodedValue> {
     ]
 }
 
-fn component_breakdown(state: GridState) -> Vec<ComponentScore> {
+fn component_breakdown(world: &GridWorld, state: GridState) -> Vec<ComponentScore> {
     vec![
         component("stage/start", state.room == Room::Start, 10.0),
         component("stage/key", state.has_key(), 25.0),
         component("stage/boss", state.room == Room::Boss, 50.0),
         component("shape/x-progress", true, f64::from(state.x)),
-        component("penalty/prune", prune(state), 0.0),
+        component("penalty/prune", world.prune(state), 0.0),
     ]
 }
 
@@ -695,32 +711,15 @@ fn component(name: &str, unlocked: bool, value: f64) -> ComponentScore {
     }
 }
 
-fn progress_score(state: GridState) -> Score {
-    let value = f64::from(state.room.id()) * 100.0
-        + f64::from(state.x) * 10.0
-        + f64::from(GRID_HEIGHT - 1 - state.y)
-        + if state.has_key() { 25.0 } else { 0.0 }
-        + f64::from(BOSS_MAX_HP - state.boss_hp) * 40.0
-        + if state.goal_reached() { 1_000.0 } else { 0.0 };
-    score(value)
+fn progress_score(world: &GridWorld, state: GridState) -> Score {
+    score(world.progress_score_value(state))
 }
 
-fn stage(state: GridState) -> Stage {
-    if state.goal_reached() {
-        Stage::new(4)
-    } else if state.room == Room::Boss {
-        Stage::new(3)
-    } else if state.has_key() {
-        Stage::new(2)
-    } else if state.room == Room::Start {
-        Stage::new(1)
-    } else {
-        Stage::NONE
+fn stage(world: &GridWorld, state: GridState) -> Stage {
+    match world.stage_value(state) {
+        0 => Stage::NONE,
+        value => Stage::new(u16::try_from(value).unwrap_or(u16::MAX)),
     }
-}
-
-fn prune(state: GridState) -> bool {
-    state.room == Room::Start && state.x == 0 && state.y == 0
 }
 
 fn visual_novelty_hash(state: GridState, framebuffer: Option<&Framebuffer>) -> u64 {

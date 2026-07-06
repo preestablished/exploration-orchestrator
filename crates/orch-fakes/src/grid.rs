@@ -65,6 +65,315 @@ pub enum StepOutcome {
     Noop,
 }
 
+/// Position in a world: room + cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GridPos {
+    pub room: Room,
+    pub x: u8,
+    pub y: u8,
+}
+
+impl GridPos {
+    #[must_use]
+    pub const fn new(room: Room, x: u8, y: u8) -> Self {
+        Self { room, x, y }
+    }
+
+    #[must_use]
+    pub const fn matches(self, state: GridState) -> bool {
+        state.room as u8 == self.room as u8 && state.x == self.x && state.y == self.y
+    }
+}
+
+/// A door edge: standing at `at` and moving `action` crosses to `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GridDoor {
+    pub at: GridPos,
+    pub action: GridAction,
+    pub to: GridPos,
+    /// Locked doors block (`BlockedByDoor`) until the key bit is held.
+    pub requires_key: bool,
+}
+
+/// Data-driven deterministic grid world: room graph, wall/door/key
+/// placement, boss and goal (credits) cells, plus the score plan the fake
+/// scorer derives progress from. The default fixture reproduces the
+/// original hardcoded three-room world bit-for-bit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GridWorld {
+    pub name: String,
+    pub start: GridPos,
+    /// Cells that block movement, per room.
+    pub walls: Vec<GridPos>,
+    pub doors: Vec<GridDoor>,
+    /// Standing on this cell picks up the boss-door key.
+    pub key: Option<GridPos>,
+    /// Boss cell; attacking here decrements hp from `BOSS_MAX_HP`.
+    pub boss: Option<GridPos>,
+    /// Goal (credits) cell; requires the boss defeated when one exists.
+    pub goal: GridPos,
+    /// Scoring the fake scorer applies: per-room base score.
+    pub room_base_score: [f64; 3],
+    /// Score weight along +x and -y (progress direction pull).
+    pub x_weight: f64,
+    pub y_weight: f64,
+    /// Cell the fake scorer marks prune-on-sight, if any.
+    pub prune_cell: Option<GridPos>,
+}
+
+impl GridWorld {
+    /// The original hardcoded three-room world (start -> key vault ->
+    /// boss + credits): the boss+credits autonomy fixture and the default
+    /// everywhere.
+    #[must_use]
+    pub fn three_room() -> Self {
+        let mut walls = Vec::new();
+        for y in 0..GRID_HEIGHT {
+            if y != 2 {
+                walls.push(GridPos::new(Room::Start, 1, y));
+            }
+        }
+        walls.push(GridPos::new(Room::KeyVault, 3, 1));
+        for x in [1, 3] {
+            walls.push(GridPos::new(Room::Boss, x, 3));
+        }
+        Self {
+            name: "three-room".to_owned(),
+            start: GridPos::new(Room::Start, 0, 2),
+            walls,
+            doors: vec![
+                GridDoor {
+                    at: GridPos::new(Room::Start, 4, 2),
+                    action: GridAction::Right,
+                    to: GridPos::new(Room::KeyVault, 0, 2),
+                    requires_key: false,
+                },
+                GridDoor {
+                    at: GridPos::new(Room::KeyVault, 0, 2),
+                    action: GridAction::Left,
+                    to: GridPos::new(Room::Start, 4, 2),
+                    requires_key: false,
+                },
+                GridDoor {
+                    at: GridPos::new(Room::Start, 2, 0),
+                    action: GridAction::Up,
+                    to: GridPos::new(Room::Boss, 2, 4),
+                    requires_key: true,
+                },
+            ],
+            key: Some(GridPos::new(Room::KeyVault, 2, 2)),
+            boss: Some(GridPos::new(Room::Boss, 2, 2)),
+            goal: GridPos::new(Room::Boss, 4, 0),
+            room_base_score: [0.0, 100.0, 200.0],
+            x_weight: 10.0,
+            y_weight: 1.0,
+            prune_cell: Some(GridPos::new(Room::Start, 0, 0)),
+        }
+    }
+
+    /// Plateau-ladder fixture: a rightward corridor whose score gradient
+    /// pulls toward a locked stage gate, with the key hidden at the end of
+    /// a zero-gradient detour. Short greedy bursts saturate at the gate;
+    /// unsticking needs longer bursts / hotter selection / backtracking.
+    #[must_use]
+    pub fn corridor_hidden_key() -> Self {
+        let mut walls = Vec::new();
+        // Start room: a corridor along y=2 walled above and below except a
+        // single gap at x=0 leading down toward the key annex door.
+        for x in 0..GRID_WIDTH {
+            walls.push(GridPos::new(Room::Start, x, 1));
+            if x != 0 {
+                walls.push(GridPos::new(Room::Start, x, 3));
+            }
+        }
+        // Key annex: a switchback so reaching the key costs many
+        // zero-score steps.
+        walls.push(GridPos::new(Room::KeyVault, 1, 1));
+        walls.push(GridPos::new(Room::KeyVault, 1, 2));
+        walls.push(GridPos::new(Room::KeyVault, 3, 2));
+        walls.push(GridPos::new(Room::KeyVault, 3, 3));
+        Self {
+            name: "corridor-hidden-key".to_owned(),
+            start: GridPos::new(Room::Start, 0, 2),
+            walls,
+            doors: vec![
+                GridDoor {
+                    // The detour: drop out of the corridor at its start.
+                    at: GridPos::new(Room::Start, 0, 4),
+                    action: GridAction::Down,
+                    to: GridPos::new(Room::KeyVault, 0, 0),
+                    requires_key: false,
+                },
+                GridDoor {
+                    at: GridPos::new(Room::KeyVault, 0, 0),
+                    action: GridAction::Up,
+                    to: GridPos::new(Room::Start, 0, 4),
+                    requires_key: false,
+                },
+                GridDoor {
+                    // The stage gate at the far end of the corridor.
+                    at: GridPos::new(Room::Start, 4, 2),
+                    action: GridAction::Right,
+                    to: GridPos::new(Room::Boss, 0, 2),
+                    requires_key: true,
+                },
+            ],
+            key: Some(GridPos::new(Room::KeyVault, 4, 4)),
+            boss: None,
+            goal: GridPos::new(Room::Boss, 4, 2),
+            room_base_score: [0.0, 0.0, 200.0],
+            x_weight: 10.0,
+            y_weight: 0.0,
+            prune_cell: None,
+        }
+    }
+
+    #[must_use]
+    pub fn initial_state(&self) -> GridState {
+        GridState {
+            x: self.start.x,
+            y: self.start.y,
+            room: self.start.room,
+            keys: 0,
+            boss_hp: self.boss.map_or(0, |_| BOSS_MAX_HP),
+        }
+    }
+
+    #[must_use]
+    pub fn goal_reached(&self, state: GridState) -> bool {
+        self.goal.matches(state) && state.boss_hp == 0
+    }
+
+    fn is_wall(&self, room: Room, x: u8, y: u8) -> bool {
+        self.walls
+            .iter()
+            .any(|wall| wall.room == room && wall.x == x && wall.y == y)
+    }
+
+    #[must_use]
+    pub fn step(&self, mut state: GridState, action: GridAction) -> (GridState, StepOutcome) {
+        let outcome = match action {
+            GridAction::Wait => StepOutcome::Noop,
+            GridAction::Attack => self.attack(&mut state),
+            GridAction::Up | GridAction::Down | GridAction::Left | GridAction::Right => {
+                self.move_dir(&mut state, action)
+            }
+        };
+
+        if let Some(key) = self.key {
+            if key.matches(state) && !state.has_key() {
+                state.keys |= KEY_BOSS_DOOR;
+                return (state, StepOutcome::PickedKey);
+            }
+        }
+        if self.goal_reached(state) {
+            return (state, StepOutcome::GoalReached);
+        }
+
+        (state, outcome)
+    }
+
+    #[must_use]
+    pub fn apply_actions(&self, mut state: GridState, actions: &[GridAction]) -> GridState {
+        for action in actions {
+            state = self.step(state, *action).0;
+        }
+        state
+    }
+
+    fn attack(&self, state: &mut GridState) -> StepOutcome {
+        let Some(boss) = self.boss else {
+            return StepOutcome::Noop;
+        };
+        if !boss.matches(*state) || state.boss_hp == 0 {
+            return StepOutcome::Noop;
+        }
+        state.boss_hp -= 1;
+        if state.boss_hp == 0 {
+            StepOutcome::BossDefeated
+        } else {
+            StepOutcome::HitBoss
+        }
+    }
+
+    fn move_dir(&self, state: &mut GridState, action: GridAction) -> StepOutcome {
+        for door in &self.doors {
+            if door.at.matches(*state) && door.action == action {
+                if door.requires_key && !state.has_key() {
+                    return StepOutcome::BlockedByDoor;
+                }
+                state.room = door.to.room;
+                state.x = door.to.x;
+                state.y = door.to.y;
+                return StepOutcome::Moved;
+            }
+        }
+
+        let (dx, dy) = match action {
+            GridAction::Up => (0i8, -1i8),
+            GridAction::Down => (0, 1),
+            GridAction::Left => (-1, 0),
+            GridAction::Right => (1, 0),
+            GridAction::Wait | GridAction::Attack => (0, 0),
+        };
+        let Some(next_x) = add_delta(state.x, dx) else {
+            return StepOutcome::BlockedByWall;
+        };
+        let Some(next_y) = add_delta(state.y, dy) else {
+            return StepOutcome::BlockedByWall;
+        };
+        if next_x >= GRID_WIDTH || next_y >= GRID_HEIGHT || self.is_wall(state.room, next_x, next_y)
+        {
+            return StepOutcome::BlockedByWall;
+        }
+
+        state.x = next_x;
+        state.y = next_y;
+        StepOutcome::Moved
+    }
+
+    /// Fake-scorer progress score for a state in this world.
+    #[must_use]
+    pub fn progress_score_value(&self, state: GridState) -> f64 {
+        self.room_base_score[state.room.id() as usize]
+            + f64::from(state.x) * self.x_weight
+            + f64::from(GRID_HEIGHT - 1 - state.y) * self.y_weight
+            + if state.has_key() { 25.0 } else { 0.0 }
+            + f64::from(self.boss_hp_max().saturating_sub(state.boss_hp)) * 40.0
+            + if self.goal_reached(state) {
+                1_000.0
+            } else {
+                0.0
+            }
+    }
+
+    #[must_use]
+    pub fn boss_hp_max(&self) -> u8 {
+        self.boss.map_or(0, |_| BOSS_MAX_HP)
+    }
+
+    /// Fake-scorer stage for a state in this world.
+    #[must_use]
+    pub fn stage_value(&self, state: GridState) -> u32 {
+        if self.goal_reached(state) {
+            4
+        } else if state.room == Room::Boss {
+            3
+        } else if state.has_key() {
+            2
+        } else if state.room == Room::Start {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[must_use]
+    pub fn prune(&self, state: GridState) -> bool {
+        self.prune_cell.is_some_and(|cell| cell.matches(state))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GridState {
     pub x: u8,
@@ -97,6 +406,7 @@ impl GridState {
         self.keys & KEY_BOSS_DOOR != 0
     }
 
+    /// Goal check in the default three-room world (back-compat shortcut).
     #[must_use]
     pub const fn goal_reached(self) -> bool {
         matches!(self.room, Room::Boss) && self.boss_hp == 0 && self.x == 4 && self.y == 0
@@ -118,98 +428,17 @@ impl GridState {
         CellKey::new((room << 32) | (x << 16) | y)
     }
 
+    /// Steps in the default three-room world (back-compat shortcut for
+    /// existing tests; world-aware callers use [`GridWorld::step`]).
     #[must_use]
-    pub fn step(mut self, action: GridAction) -> (Self, StepOutcome) {
-        let outcome = match action {
-            GridAction::Wait => StepOutcome::Noop,
-            GridAction::Attack => self.attack(),
-            GridAction::Up | GridAction::Down | GridAction::Left | GridAction::Right => {
-                self.move_dir(action)
-            }
-        };
-
-        if self.room == Room::KeyVault && self.x == 2 && self.y == 2 && !self.has_key() {
-            self.keys |= KEY_BOSS_DOOR;
-            return (self, StepOutcome::PickedKey);
-        }
-        if self.goal_reached() {
-            return (self, StepOutcome::GoalReached);
-        }
-
-        (self, outcome)
+    pub fn step(self, action: GridAction) -> (Self, StepOutcome) {
+        GridWorld::three_room().step(self, action)
     }
 
+    /// Applies actions in the default three-room world.
     #[must_use]
-    pub fn apply_actions(mut self, actions: &[GridAction]) -> Self {
-        for action in actions {
-            self = self.step(*action).0;
-        }
-        self
-    }
-
-    fn attack(&mut self) -> StepOutcome {
-        if self.room != Room::Boss || self.x != 2 || self.y != 2 || self.boss_hp == 0 {
-            return StepOutcome::Noop;
-        }
-
-        self.boss_hp -= 1;
-        if self.boss_hp == 0 {
-            StepOutcome::BossDefeated
-        } else {
-            StepOutcome::HitBoss
-        }
-    }
-
-    fn move_dir(&mut self, action: GridAction) -> StepOutcome {
-        if let Some(outcome) = self.try_door(action) {
-            return outcome;
-        }
-
-        let (dx, dy) = match action {
-            GridAction::Up => (0i8, -1i8),
-            GridAction::Down => (0, 1),
-            GridAction::Left => (-1, 0),
-            GridAction::Right => (1, 0),
-            GridAction::Wait | GridAction::Attack => (0, 0),
-        };
-        let Some(next_x) = add_delta(self.x, dx) else {
-            return StepOutcome::BlockedByWall;
-        };
-        let Some(next_y) = add_delta(self.y, dy) else {
-            return StepOutcome::BlockedByWall;
-        };
-        if next_x >= GRID_WIDTH || next_y >= GRID_HEIGHT || is_wall(self.room, next_x, next_y) {
-            return StepOutcome::BlockedByWall;
-        }
-
-        self.x = next_x;
-        self.y = next_y;
-        StepOutcome::Moved
-    }
-
-    fn try_door(&mut self, action: GridAction) -> Option<StepOutcome> {
-        match (self.room, self.x, self.y, action) {
-            (Room::Start, 4, 2, GridAction::Right) => {
-                self.room = Room::KeyVault;
-                self.x = 0;
-                self.y = 2;
-                Some(StepOutcome::Moved)
-            }
-            (Room::KeyVault, 0, 2, GridAction::Left) => {
-                self.room = Room::Start;
-                self.x = 4;
-                self.y = 2;
-                Some(StepOutcome::Moved)
-            }
-            (Room::Start, 2, 0, GridAction::Up) if self.has_key() => {
-                self.room = Room::Boss;
-                self.x = 2;
-                self.y = 4;
-                Some(StepOutcome::Moved)
-            }
-            (Room::Start, 2, 0, GridAction::Up) => Some(StepOutcome::BlockedByDoor),
-            _ => None,
-        }
+    pub fn apply_actions(self, actions: &[GridAction]) -> Self {
+        GridWorld::three_room().apply_actions(self, actions)
     }
 }
 
@@ -218,14 +447,6 @@ fn add_delta(value: u8, delta: i8) -> Option<u8> {
         value.checked_sub(delta.unsigned_abs())
     } else {
         value.checked_add(delta as u8)
-    }
-}
-
-fn is_wall(room: Room, x: u8, y: u8) -> bool {
-    match room {
-        Room::Start => x == 1 && y != 2,
-        Room::KeyVault => x == 3 && y == 1,
-        Room::Boss => (x == 1 || x == 3) && y == 3,
     }
 }
 
@@ -340,5 +561,132 @@ mod tests {
         assert_eq!(a.cell_key(), same.cell_key());
         assert_ne!(a.state_hash(), other_room_same_xy.state_hash());
         assert_ne!(a.cell_key(), other_room_same_xy.cell_key());
+    }
+
+    #[test]
+    fn world_default_fixture_reproduces_the_original_semantics() {
+        let world = GridWorld::three_room();
+        assert_eq!(world.initial_state(), GridState::new());
+
+        // Sweep every reachable-ish state cell x action in both engines.
+        for room in [Room::Start, Room::KeyVault, Room::Boss] {
+            for x in 0..GRID_WIDTH {
+                for y in 0..GRID_HEIGHT {
+                    for keys in [0, KEY_BOSS_DOOR] {
+                        for boss_hp in 0..=BOSS_MAX_HP {
+                            let state = GridState {
+                                x,
+                                y,
+                                room,
+                                keys,
+                                boss_hp,
+                            };
+                            for action in [
+                                GridAction::Wait,
+                                GridAction::Up,
+                                GridAction::Down,
+                                GridAction::Left,
+                                GridAction::Right,
+                                GridAction::Attack,
+                            ] {
+                                assert_eq!(
+                                    world.step(state, action),
+                                    state.step(action),
+                                    "state {state:?} action {action:?}"
+                                );
+                            }
+                            assert_eq!(world.goal_reached(state), state.goal_reached());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corridor_hidden_key_world_is_solvable_and_gates_on_the_key() {
+        let world = GridWorld::corridor_hidden_key();
+        let start = world.initial_state();
+
+        // Greedy rightward run saturates at the locked stage gate.
+        let at_gate = world.apply_actions(
+            start,
+            &[
+                GridAction::Right,
+                GridAction::Right,
+                GridAction::Right,
+                GridAction::Right,
+            ],
+        );
+        assert_eq!((at_gate.x, at_gate.y, at_gate.room), (4, 2, Room::Start));
+        let (blocked, blocked_outcome) = world.step(at_gate, GridAction::Right);
+        assert_eq!(blocked_outcome, StepOutcome::BlockedByDoor);
+        assert_eq!(blocked, at_gate);
+
+        // The detour: down at the corridor start, through the annex
+        // switchback to the hidden key, back, then through the gate.
+        let scripted = [
+            GridAction::Down,
+            GridAction::Down, // Start(0,4) -> door
+            GridAction::Down, // KeyVault(0,0)
+            GridAction::Down,
+            GridAction::Down,
+            GridAction::Down,
+            GridAction::Down, // (0,4)
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right, // (4,4) key
+        ];
+        let with_key = world.apply_actions(start, &scripted);
+        assert!(
+            with_key.has_key(),
+            "detour must reach the key: {with_key:?}"
+        );
+
+        let back_and_through = [
+            GridAction::Left,
+            GridAction::Left,
+            GridAction::Left,
+            GridAction::Left, // (0,4)
+            GridAction::Up,
+            GridAction::Up,
+            GridAction::Up,
+            GridAction::Up, // (0,0)
+            GridAction::Up, // door -> Start(0,4)
+            GridAction::Up, // (0,3)
+            GridAction::Up, // (0,2) corridor
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right, // gate cell (4,2)
+            GridAction::Right, // through the gate -> Boss room (0,2)
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right, // (4,2) goal
+        ];
+        let solved = world.apply_actions(with_key, &back_and_through);
+        assert!(
+            world.goal_reached(solved),
+            "scripted solve must reach credits: {solved:?}"
+        );
+
+        // The score gradient pulls toward the gate, not into the detour:
+        // entering the annex reads far below sitting at the gate.
+        let mid_detour = world.apply_actions(
+            start,
+            &[GridAction::Down, GridAction::Down, GridAction::Down],
+        );
+        assert_eq!(mid_detour.room, Room::KeyVault);
+        assert!(
+            world.progress_score_value(at_gate) > world.progress_score_value(mid_detour) + 30.0,
+            "the detour must be a score trap: gate {} vs detour {}",
+            world.progress_score_value(at_gate),
+            world.progress_score_value(mid_detour)
+        );
+        assert_eq!(world.stage_value(at_gate), 1);
+        assert_eq!(world.stage_value(with_key), 2);
+        assert_eq!(world.stage_value(solved), 4);
     }
 }

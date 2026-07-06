@@ -19,7 +19,7 @@ use orch_core::types::{FrameCount, GuestInstructions, SnapshotRef};
 
 use crate::{
     fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget},
-    grid::{GridAction, GridState},
+    grid::{GridAction, GridState, GridWorld},
     scorer::encode_grid_features,
 };
 
@@ -43,6 +43,7 @@ const GRID_LAYOUT_VERSION: u32 = 1;
 #[derive(Clone, Debug, PartialEq)]
 pub struct FakeHypervisor {
     worker_id: String,
+    world: GridWorld,
     slots_total: u32,
     class: DeterminismClass,
     next_slot_id: u64,
@@ -78,8 +79,23 @@ impl FakeHypervisor {
 
     #[must_use]
     pub fn with_slots_and_fault_plan(slots_total: u32, fault_plan: FaultPlan) -> Self {
+        Self::with_world_slots_and_fault_plan(GridWorld::three_room(), slots_total, fault_plan)
+    }
+
+    #[must_use]
+    pub fn with_world(world: GridWorld) -> Self {
+        Self::with_world_slots_and_fault_plan(world, DEFAULT_SLOTS_TOTAL, FaultPlan::disabled(0))
+    }
+
+    #[must_use]
+    pub fn with_world_slots_and_fault_plan(
+        world: GridWorld,
+        slots_total: u32,
+        fault_plan: FaultPlan,
+    ) -> Self {
         Self {
             worker_id: "fake-grid-worker-0".to_owned(),
+            world,
             slots_total,
             class: fake_determinism_class(),
             next_slot_id: 1,
@@ -100,6 +116,11 @@ impl FakeHypervisor {
     #[must_use]
     pub fn deterministic_class(&self) -> &DeterminismClass {
         &self.class
+    }
+
+    #[must_use]
+    pub fn world(&self) -> &GridWorld {
+        &self.world
     }
 
     /// Changes the advertised slot pool size mid-run (shrink/grow drills).
@@ -235,7 +256,7 @@ impl HypervisorWorkerClient for FakeHypervisor {
         self.decide_fault("create_vm", request_identity(&request), 0)?;
         self.ensure_capacity(1)?;
         let lease = self.allocate_lease(&request.config, request.entropy_seed);
-        let slot = Slot::new_root(lease, request.config);
+        let slot = Slot::new_root(lease, request.config, self.world.initial_state());
         self.slots.insert(lease.slot_id, slot);
         self.push_slot_event(lease.slot_id);
 
@@ -346,8 +367,9 @@ impl HypervisorWorkerClient for FakeHypervisor {
         self.push_slot_event(lease.slot_id);
 
         let run_result = {
+            let world = self.world.clone();
             let slot = self.slot_mut(lease)?;
-            run_slot(slot, request.until, request.hard_icount_cap)
+            run_slot(&world, slot, request.until, request.hard_icount_cap)
         };
         let (reason, frames_elapsed, sdk_event) = match run_result {
             Ok(result) => result,
@@ -523,11 +545,11 @@ struct Slot {
 }
 
 impl Slot {
-    fn new_root(lease: Lease, config: MachineConfig) -> Self {
+    fn new_root(lease: Lease, config: MachineConfig, state: GridState) -> Self {
         Self {
             lease,
             config,
-            state: GridState::new(),
+            state,
             icount: GuestInstructions::new(0),
             frame_counter: FrameCount::new(0),
             vns: 0,
@@ -603,6 +625,7 @@ struct CaptureResponse {
 }
 
 fn run_slot(
+    world: &GridWorld,
     slot: &mut Slot,
     until: RunUntil,
     hard_icount_cap: Option<GuestInstructions>,
@@ -618,7 +641,8 @@ fn run_slot(
             Ok((StopReason::NextSdkEvent, 0, Some(sdk_event)))
         }
         RunUntil::FrameBudget(frames) => {
-            let (frames_elapsed, reason) = advance_frames(slot, frames.get(), hard_icount_cap)?;
+            let (frames_elapsed, reason) =
+                advance_frames(world, slot, frames.get(), hard_icount_cap)?;
             Ok((reason, u64::from(frames_elapsed), None))
         }
         RunUntil::IcountBudget(budget) => {
@@ -629,10 +653,12 @@ fn run_slot(
             let reason = advance_vns_budget(slot, budget)?;
             Ok((reason, 0, None))
         }
-        RunUntil::Goal(_) if slot.state.goal_reached() => Ok((StopReason::GoalSatisfied, 0, None)),
+        RunUntil::Goal(_) if world.goal_reached(slot.state) => {
+            Ok((StopReason::GoalSatisfied, 0, None))
+        }
         RunUntil::Goal(_) => {
-            let (frames_elapsed, reason) = advance_frames(slot, 1, hard_icount_cap)?;
-            let reason = if slot.state.goal_reached() {
+            let (frames_elapsed, reason) = advance_frames(world, slot, 1, hard_icount_cap)?;
+            let reason = if world.goal_reached(slot.state) {
                 StopReason::GoalSatisfied
             } else {
                 reason
@@ -643,6 +669,7 @@ fn run_slot(
 }
 
 fn advance_frames(
+    world: &GridWorld,
     slot: &mut Slot,
     requested_frames: u32,
     hard_icount_cap: Option<GuestInstructions>,
@@ -670,7 +697,7 @@ fn advance_frames(
         .ok_or_else(|| ClientError::new(ClientErrorKind::Internal, "frame counter overflow"))?;
     let due_actions = drain_due_actions(&mut slot.pending_actions, end_frame);
     for pending in due_actions {
-        slot.state = slot.state.step(pending.action).0;
+        slot.state = world.step(slot.state, pending.action).0;
     }
     slot.frame_counter = FrameCount::new(end_frame);
     slot.icount = GuestInstructions::new(
