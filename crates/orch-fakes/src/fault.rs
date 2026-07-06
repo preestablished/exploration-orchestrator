@@ -1,6 +1,6 @@
 //! Deterministic fault-injection controls for fake service tests.
 
-use std::fmt;
+use std::{cell::RefCell, collections::BTreeMap, fmt};
 
 use orch_clients::{
     input_synth::{ConfigFingerprint, CONFIG_FINGERPRINT_LEN},
@@ -8,7 +8,7 @@ use orch_clients::{
 };
 
 /// Fault-injection target used to keep per-service streams independent.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FaultTarget {
     #[default]
     Hypervisor,
@@ -390,15 +390,25 @@ impl FaultPlan {
 }
 
 /// Deterministic fault injector used by fakes at request boundaries.
+///
+/// Draws are salted with a per-`(target, operation)` attempt counter so a
+/// retried request with identical bytes draws a fresh outcome, while a whole
+/// run replayed against a fresh injector stays seed-deterministic. Ops whose
+/// request identity is attempt-invariant (same `client_batch_id`, unit-struct
+/// requests) would otherwise re-draw the identical terminal fault forever.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FaultInjector {
     plan: FaultPlan,
+    attempts: RefCell<BTreeMap<(FaultTarget, String), u64>>,
 }
 
 impl FaultInjector {
     #[must_use]
     pub const fn new(plan: FaultPlan) -> Self {
-        Self { plan }
+        Self {
+            plan,
+            attempts: RefCell::new(BTreeMap::new()),
+        }
     }
 
     #[must_use]
@@ -406,18 +416,55 @@ impl FaultInjector {
         &self.plan
     }
 
+    /// Decides the fault outcome for one request attempt and consumes the
+    /// attempt counter for its `(target, operation)` stream.
     #[must_use]
     pub fn decide(&self, request: FaultRequest<'_>, response_items: u32) -> FaultDecision {
-        let latency_ticks =
-            self.plan
-                .latency
-                .decide(draw_u64(self.plan.seed, request, FaultChannel::Latency));
+        let attempt = {
+            let mut attempts = self.attempts.borrow_mut();
+            let counter = attempts
+                .entry((request.target, request.operation.to_owned()))
+                .or_insert(0);
+            let attempt = *counter;
+            *counter += 1;
+            attempt
+        };
+        self.decide_with_attempt(request, response_items, attempt)
+    }
+
+    /// Computes the decision the next [`Self::decide`] call for this
+    /// `(target, operation)` stream would return, without consuming the
+    /// attempt counter. Latency-probe seams use this to pre-charge virtual
+    /// latency before making the (instant) sync call.
+    #[must_use]
+    pub fn peek(&self, request: FaultRequest<'_>, response_items: u32) -> FaultDecision {
+        let attempt = self
+            .attempts
+            .borrow()
+            .get(&(request.target, request.operation.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        self.decide_with_attempt(request, response_items, attempt)
+    }
+
+    fn decide_with_attempt(
+        &self,
+        request: FaultRequest<'_>,
+        response_items: u32,
+        attempt: u64,
+    ) -> FaultDecision {
+        let latency_ticks = self.plan.latency.decide(draw_u64(
+            self.plan.seed,
+            request,
+            attempt,
+            FaultChannel::Latency,
+        ));
 
         let terminal = decide_terminal(
             self.plan.timeout_rate,
             self.plan.error_rate,
             self.plan.error_kind,
-            draw_u64(self.plan.seed, request, FaultChannel::Terminal),
+            draw_u64(self.plan.seed, request, attempt, FaultChannel::Terminal),
         );
 
         let has_response = matches!(terminal, FaultTerminal::None);
@@ -425,8 +472,18 @@ impl FaultInjector {
             .then(|| {
                 self.plan.partial_response.decide(
                     response_items,
-                    draw_u64(self.plan.seed, request, FaultChannel::PartialResponse),
-                    draw_u64(self.plan.seed, request, FaultChannel::PartialResponseLen),
+                    draw_u64(
+                        self.plan.seed,
+                        request,
+                        attempt,
+                        FaultChannel::PartialResponse,
+                    ),
+                    draw_u64(
+                        self.plan.seed,
+                        request,
+                        attempt,
+                        FaultChannel::PartialResponseLen,
+                    ),
                 )
             })
             .flatten();
@@ -436,12 +493,14 @@ impl FaultInjector {
             && self.plan.synth_fingerprint_flip_rate.fires(draw_u64(
                 self.plan.seed,
                 request,
+                attempt,
                 FaultChannel::SynthFingerprintFlip,
             )))
         .then(|| {
             let draw = draw_u64(
                 self.plan.seed,
                 request,
+                attempt,
                 FaultChannel::SynthFingerprintFlipBit,
             );
             SynthFingerprintFlip::new(
@@ -504,10 +563,11 @@ fn decide_terminal(
     }
 }
 
-fn draw_u64(seed: u64, request: FaultRequest<'_>, channel: FaultChannel) -> u64 {
+fn draw_u64(seed: u64, request: FaultRequest<'_>, attempt: u64, channel: FaultChannel) -> u64 {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"orch-fakes/fault/v1");
+    hasher.update(b"orch-fakes/fault/v2");
     hasher.update(&seed.to_le_bytes());
+    hasher.update(&attempt.to_le_bytes());
     update_len_prefixed(&mut hasher, channel.tag());
     update_len_prefixed(&mut hasher, request.target.tag());
     update_len_prefixed(&mut hasher, request.operation.as_bytes());
@@ -533,22 +593,71 @@ mod tests {
         FaultRequest::new(FaultTarget::Synth, "propose_bursts", b"node=8;batch=3");
 
     #[test]
-    fn fault_same_seed_and_request_gives_same_outcome() {
+    fn fault_same_seed_and_call_sequence_gives_same_outcome() {
+        let plan = FaultPlan::disabled(0x5eed)
+            .with_latency(LatencyFault::new(3, 19))
+            .with_partial_response(PartialResponseFault::new(FaultRate::always(), 1))
+            .with_synth_fingerprint_flip(FaultRate::always());
+        let replay_one = FaultInjector::new(plan.clone());
+        let replay_two = FaultInjector::new(plan);
+
+        let first_run: Vec<_> = (0..3).map(|_| replay_one.decide(REQUEST_A, 16)).collect();
+        let second_run: Vec<_> = (0..3).map(|_| replay_two.decide(REQUEST_A, 16)).collect();
+
+        assert_eq!(first_run, second_run);
+        for decision in &first_run {
+            assert!((3..=22).contains(&decision.latency_ticks));
+            assert_eq!(decision.terminal, FaultTerminal::None);
+            assert!(decision.partial.expect("partial should fire").keep_items < 16);
+            assert_ne!(decision.apply_synth_fingerprint(FINGERPRINT), FINGERPRINT);
+        }
+    }
+
+    #[test]
+    fn fault_retries_draw_fresh_outcomes_for_identical_request_bytes() {
         let injector = FaultInjector::new(
-            FaultPlan::disabled(0x5eed)
-                .with_latency(LatencyFault::new(3, 19))
-                .with_partial_response(PartialResponseFault::new(FaultRate::always(), 1))
-                .with_synth_fingerprint_flip(FaultRate::always()),
+            FaultPlan::disabled(0x5eed).with_latency(LatencyFault::new(0, u32::MAX)),
         );
 
-        let first = injector.decide(REQUEST_A, 16);
-        let second = injector.decide(REQUEST_A, 16);
+        let draws: Vec<_> = (0..4)
+            .map(|_| injector.decide(REQUEST_A, 16).latency_ticks)
+            .collect();
 
-        assert_eq!(first, second);
-        assert!((3..=22).contains(&first.latency_ticks));
-        assert_eq!(first.terminal, FaultTerminal::None);
-        assert!(first.partial.expect("partial should fire").keep_items < 16);
-        assert_ne!(first.apply_synth_fingerprint(FINGERPRINT), FINGERPRINT);
+        assert!(
+            draws.windows(2).any(|pair| pair[0] != pair[1]),
+            "attempt salt must vary retried draws: {draws:?}"
+        );
+    }
+
+    #[test]
+    fn fault_peek_previews_next_decision_without_consuming_attempt() {
+        let injector = FaultInjector::new(
+            FaultPlan::disabled(0x5eed).with_latency(LatencyFault::new(0, u32::MAX)),
+        );
+
+        let peeked = injector.peek(REQUEST_A, 16);
+        assert_eq!(injector.peek(REQUEST_A, 16), peeked);
+        assert_eq!(injector.decide(REQUEST_A, 16), peeked);
+
+        let next_peek = injector.peek(REQUEST_A, 16);
+        assert_eq!(injector.decide(REQUEST_A, 16), next_peek);
+    }
+
+    #[test]
+    fn fault_attempt_streams_are_independent_per_target_and_operation() {
+        let plan = FaultPlan::disabled(0x5eed).with_latency(LatencyFault::new(0, u32::MAX));
+        let interleaved = FaultInjector::new(plan.clone());
+        let solo = FaultInjector::new(plan);
+        let other_op = FaultRequest::new(FaultTarget::Synth, "health", b"");
+        let other_target = FaultRequest::new(FaultTarget::Scorer, "propose_bursts", b"");
+
+        let first = interleaved.decide(REQUEST_A, 16);
+        let _ = interleaved.decide(other_op, 16);
+        let _ = interleaved.decide(other_target, 16);
+        let second = interleaved.decide(REQUEST_A, 16);
+
+        assert_eq!(solo.decide(REQUEST_A, 16), first);
+        assert_eq!(solo.decide(REQUEST_A, 16), second);
     }
 
     #[test]
