@@ -639,6 +639,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "orch-server"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "orch-checkpoint",
+ "orch-clients",
+ "orch-core",
+ "orch-driver",
+ "orch-fakes",
+ "orch-sched",
+ "postcard",
+ "proptest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

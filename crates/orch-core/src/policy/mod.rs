@@ -8,7 +8,7 @@ use core::fmt;
 
 use crate::frontier::{Frontier, FrontierError};
 use crate::mirror::CellMirror;
-use crate::plateau::PlateauKnobs;
+use crate::plateau::{BacktrackKnobs, PlateauKnobs};
 use crate::rng::DeterministicRng;
 use crate::tree::Tree;
 use crate::types::{CellKey, NodeId, Stage};
@@ -67,6 +67,9 @@ pub struct PolicyContext<'a> {
     pub mirror: &'a CellMirror,
     pub plateau: &'a PlateauKnobs,
     pub selection: &'a SelectionConfig,
+    /// L3 escalation: shallow candidates (depth at or below the configured
+    /// quantile of frontier depths) get a `kappa * novelty` priority bonus.
+    pub backtrack: Option<BacktrackKnobs>,
 }
 
 impl<'a> PolicyContext<'a> {
@@ -84,7 +87,15 @@ impl<'a> PolicyContext<'a> {
             mirror,
             plateau,
             selection,
+            backtrack: None,
         }
+    }
+
+    /// Applies the L3 backtrack bonus during candidate scoring.
+    #[must_use]
+    pub const fn with_backtrack(mut self, backtrack: Option<BacktrackKnobs>) -> Self {
+        self.backtrack = backtrack;
+        self
     }
 
     pub fn candidate_snapshots(&self) -> PolicyResult<Vec<CandidateSnapshot>> {
@@ -171,6 +182,26 @@ pub fn candidate_snapshots(context: &PolicyContext<'_>) -> PolicyResult<Vec<Cand
         .collect();
     let normalized_scores = normalize_scores(&raw_scores)?;
 
+    let backtrack_cutoff = context.backtrack.map(|knobs| {
+        let mut depths: Vec<u32> = context
+            .frontier
+            .deterministic_candidates(context.tree)
+            .expect("candidates already validated")
+            .iter()
+            .map(|id| {
+                context
+                    .tree
+                    .get(*id)
+                    .expect("frontier candidates exist in tree")
+                    .depth
+            })
+            .collect();
+        depths.sort_unstable();
+        let quantile = knobs.depth_quantile.clamp(0.0, 1.0);
+        let rank = ((depths.len().saturating_sub(1)) as f64 * quantile).floor() as usize;
+        (knobs.kappa, depths[rank])
+    });
+
     let mut snapshots = Vec::with_capacity(ids.len());
     for (index, id) in ids.into_iter().enumerate() {
         let record = context
@@ -186,6 +217,13 @@ pub fn candidate_snapshots(context: &PolicyContext<'_>) -> PolicyResult<Vec<Cand
             visit_penalty(record.visits)?,
             depth_penalty(record.depth)?,
         );
+        let mut priority = terms.weighted_priority(context.selection)?;
+        if let Some((kappa, cutoff_depth)) = backtrack_cutoff {
+            if record.depth <= cutoff_depth {
+                priority += kappa * novelty;
+                ensure_finite("priority.backtrack", priority)?;
+            }
+        }
         snapshots.push(CandidateSnapshot {
             id,
             parent: record.parent,
@@ -195,7 +233,7 @@ pub fn candidate_snapshots(context: &PolicyContext<'_>) -> PolicyResult<Vec<Cand
             cell: record.cell,
             stage: record.stage,
             raw_score: raw_scores[index],
-            priority: terms.weighted_priority(context.selection)?,
+            priority,
             priority_terms: terms,
         });
     }

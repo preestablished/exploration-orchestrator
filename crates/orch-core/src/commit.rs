@@ -130,6 +130,34 @@ impl CommitState {
         }
     }
 
+    /// Rebuilds commit state from resume-recovered parts (§8.2): the tree
+    /// adopted from the store, frontier membership from FRONTIER rows,
+    /// mirrors from checkpoint vectors plus post-checkpoint attrs, and
+    /// all-duplicate streaks from the checkpoint's frontier weights.
+    #[must_use]
+    pub fn from_parts(
+        tree: Tree,
+        frontier: Frontier,
+        cell_mirror: CellMirror,
+        seen: SeenMap,
+        streaks: &[(NodeId, u32)],
+    ) -> Self {
+        let mut all_duplicate_streaks = vec![0; tree.next_id().get() as usize];
+        for (id, streak) in streaks {
+            let index = id.get() as usize;
+            if index < all_duplicate_streaks.len() {
+                all_duplicate_streaks[index] = *streak;
+            }
+        }
+        Self {
+            tree,
+            frontier,
+            cell_mirror,
+            seen,
+            all_duplicate_streaks,
+        }
+    }
+
     pub fn all_duplicate_streak(&self, id: NodeId) -> Option<u32> {
         self.all_duplicate_streaks
             .get(usize::try_from(id.get()).ok()?)

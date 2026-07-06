@@ -420,12 +420,17 @@ impl GridState {
         StateHash::new(*hasher.finalize().as_bytes())
     }
 
+    /// Go-Explore cell: position plus the progress dimensions (key bits,
+    /// boss hp), so states that differ in progress occupy distinct cells
+    /// and rule-2 regressions toward unexplored progress stay commit-able.
     #[must_use]
     pub const fn cell_key(self) -> CellKey {
         let room = self.room.id() as u64;
         let x = self.x as u64;
         let y = self.y as u64;
-        CellKey::new((room << 32) | (x << 16) | y)
+        let keys = self.keys as u64;
+        let boss_hp = self.boss_hp as u64;
+        CellKey::new((boss_hp << 48) | (keys << 40) | (room << 32) | (x << 16) | y)
     }
 
     /// Steps in the default three-room world (back-compat shortcut for

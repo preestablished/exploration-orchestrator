@@ -141,6 +141,23 @@ impl<T: Send + 'static> SyncAdapter<T> {
         Arc::clone(&self.inner)
     }
 
+    /// Runs a synchronous closure against the wrapped service without
+    /// charging latency. Startup-only seam (e.g. synth bring-up reusing the
+    /// sync `SynthBringup` composition before the loop spawns concurrent
+    /// callers); fails rather than blocks if the service is contended.
+    pub fn with_service_sync<R>(
+        &self,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, orch_clients::ClientError> {
+        let mut guard = self.inner.try_lock().map_err(|_| {
+            orch_clients::ClientError::new(
+                orch_clients::ClientErrorKind::Unavailable,
+                "service is busy; sync access is startup-only",
+            )
+        })?;
+        Ok(f(&mut guard))
+    }
+
     /// Charges virtual latency, then takes the service lock and makes the
     /// (instant) sync call. Sleep placement per D2: before the lock, so the
     /// state change lands at the response instant and calls overlap in
