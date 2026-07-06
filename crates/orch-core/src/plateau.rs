@@ -187,6 +187,25 @@ impl StallDetector {
         self.completed_stall_windows = 0;
     }
 
+    /// Reconstructs a detector from checkpointed counters (resume path).
+    #[must_use]
+    pub const fn restore(
+        knobs: &PlateauKnobs,
+        observations: u64,
+        best_score: Option<Score>,
+        observations_since_improvement: u64,
+        completed_stall_windows: u64,
+    ) -> Self {
+        Self {
+            window_n: knobs.window_n,
+            epsilon_s: knobs.epsilon_s,
+            observations,
+            best_score,
+            observations_since_improvement,
+            completed_stall_windows,
+        }
+    }
+
     pub fn observe(&mut self, score: Score) -> StallObservation {
         self.observations = self.observations.saturating_add(1);
         let observation_index = self.observations - 1;
@@ -282,6 +301,21 @@ impl EscalationLadder {
     #[must_use]
     pub const fn from_knobs(knobs: &PlateauKnobs) -> Self {
         Self::new(knobs.ladder)
+    }
+
+    /// Reconstructs a ladder from a checkpointed level and feature-map
+    /// version (resume path).
+    #[must_use]
+    pub const fn restore(
+        knobs: EscalationKnobs,
+        level: EscalationLevel,
+        feature_map_version: u32,
+    ) -> Self {
+        Self {
+            knobs,
+            level,
+            feature_map_version,
+        }
     }
 
     #[must_use]

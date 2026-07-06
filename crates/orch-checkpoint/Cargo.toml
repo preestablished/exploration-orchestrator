@@ -1,0 +1,13 @@
+[package]
+name = "orch-checkpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orch-core = { path = "../orch-core" }
+postcard.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
