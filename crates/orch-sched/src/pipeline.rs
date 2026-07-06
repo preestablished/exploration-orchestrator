@@ -45,7 +45,7 @@ pub struct Batch {
 /// Outcome of one job within a batch.
 #[derive(Clone, Debug)]
 pub enum JobOutcome {
-    Completed(JobResult),
+    Completed(Box<JobResult>),
     /// Fast mode only: retries exhausted; the batch continues without this
     /// child and the gap is journaled here.
     Abandoned {
@@ -221,7 +221,7 @@ where
     let mut jobs = Vec::with_capacity(first_pass.len());
     for (job_idx, outcome) in first_pass {
         match outcome {
-            Ok(result) => jobs.push(JobOutcome::Completed(result)),
+            Ok(result) => jobs.push(JobOutcome::Completed(Box::new(result))),
             Err(first_error) => {
                 // Re-run on the Restore path with the full retry ladder.
                 let spec = JobSpec {
@@ -232,7 +232,7 @@ where
                     burst: batch.bursts[job_idx as usize].clone(),
                 };
                 match run_job_with_retry(driver, retry, &spec).await {
-                    Ok(result) => jobs.push(JobOutcome::Completed(result)),
+                    Ok(result) => jobs.push(JobOutcome::Completed(Box::new(result))),
                     Err(error) => match mode {
                         SchedMode::Fast => {
                             gauges
