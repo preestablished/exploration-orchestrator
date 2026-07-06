@@ -102,6 +102,15 @@ impl FakeHypervisor {
         &self.class
     }
 
+    /// Changes the advertised slot pool size mid-run (shrink/grow drills).
+    ///
+    /// Shrinking below the number of active slots is allowed: existing
+    /// leases stay valid, free capacity saturates at zero, and new
+    /// allocations see `ResourceExhausted` until enough slots are destroyed.
+    pub fn set_slots_total(&mut self, slots_total: u32) {
+        self.slots_total = slots_total;
+    }
+
     fn ensure_capacity(&self, needed: u32) -> ClientResult<()> {
         let used = u32::try_from(self.slots.len()).map_err(|_| {
             ClientError::new(ClientErrorKind::Internal, "active slot count exceeds u32")

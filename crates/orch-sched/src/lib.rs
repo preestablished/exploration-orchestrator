@@ -9,3 +9,4 @@
 //! transport adapters arrive at M6 behind the same ports.
 
 pub mod ports;
+pub mod slots;

@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use orch_clients::{
     hypervisor::{
-        BootSpec, CreateVmRequest, Digest32 as HypervisorDigest32, ElfBoot, EntropySeed,
-        HashEpochs, HypervisorWorkerClient, InjectInputsRequest, InputEvent, ListSlotsRequest,
-        MachineConfig, PadSet, RunRequest, RunUntil, ScheduleAt, ScheduledEvent,
-        TakeSnapshotRequest,
+        BootSpec, CreateVmRequest, DestroyVmRequest, Digest32 as HypervisorDigest32, ElfBoot,
+        EntropySeed, GetWorkerInfoRequest, HashEpochs, HypervisorWorkerClient, InjectInputsRequest,
+        InputEvent, ListSlotsRequest, MachineConfig, PadSet, RunRequest, RunUntil, ScheduleAt,
+        ScheduledEvent, TakeSnapshotRequest,
     },
     input_synth::{
         DocumentKind, HealthRequest, HealthStatus, InputSynthClient, LoadMacroPackRequest,
@@ -490,4 +490,30 @@ fn score(value: f64) -> Score {
 
 fn novelty(value: f64) -> Novelty {
     Novelty::new(value).expect("finite novelty")
+}
+
+#[test]
+fn contracts_hypervisor_slot_pool_shrinks_and_grows_mid_run() {
+    let mut hypervisor = FakeHypervisor::with_slots(2);
+    let first = hypervisor.create_vm(sample_vm_request(0x30)).expect("vm 1");
+    hypervisor.create_vm(sample_vm_request(0x31)).expect("vm 2");
+
+    hypervisor.set_slots_total(1);
+    let info = hypervisor
+        .worker_info(GetWorkerInfoRequest)
+        .expect("worker info");
+    assert_eq!(info.slots_total, 1);
+    assert_eq!(info.slots_free, 0);
+    let exhausted = hypervisor
+        .create_vm(sample_vm_request(0x32))
+        .expect_err("shrunken pool is exhausted");
+    assert_eq!(exhausted.kind(), ClientErrorKind::ResourceExhausted);
+
+    // Existing leases stay valid across the shrink.
+    hypervisor
+        .destroy_vm(DestroyVmRequest { lease: first.lease })
+        .expect("destroy across shrink");
+
+    hypervisor.set_slots_total(4);
+    assert!(hypervisor.create_vm(sample_vm_request(0x33)).is_ok());
 }
