@@ -14,7 +14,7 @@ Reference files (read before starting):
   `crates/orch-proto/protos/determinism/orchestrator/v1/orchestrator.proto`
 - Placeholder to replace:
   `../control-plane/proto/determinism/orchestrator/v1/orchestrator.proto`
-  (9 lines: divergent `StartExperimentRequest`, empty service — no
+  (11 lines: divergent `StartExperimentRequest`, empty service — no
   consumers)
 - The pattern to copy: `../control-plane/crates/determinism-proto/`
   (`Cargo.toml` features, `build.rs` `CARGO_FEATURE_*` gating +
@@ -37,9 +37,12 @@ their `03-verification-offer.md`). Contents:
    `PolicyKind`, `SchedMode`; orchestrator is source of truth; embed-vs-
    duplicate is their choice (we mildly prefer embedding). Ask for a
    one-line acknowledgement before we merge the upstream.
-2. **Lint posture** per D-P2: the two `ignore_only` exemptions we ship
-   and why (semantic zero values; API.md-fixed service name), plus the
-   pre-agreed renumbering escape hatch if they insist pre-tag.
+2. **Lint posture** per D-P2: the three `ignore_only` exemptions we
+   ship and why (semantic zero values; API.md-fixed service name;
+   `ExperimentStatus` doubling as both a response and an embedded
+   message), plus the pre-agreed renumbering escape hatch if they
+   insist pre-tag — including its real cost (persisted `config_hash`
+   changes; see D-P2).
 3. **Sequencing reminder** (their item 3's own words): gates first (with
    placeholder exemptions), then this upstream as a lint-only concern,
    then the tag. Also: their `orchestrator` feature's Rust API changes
@@ -117,7 +120,7 @@ All in `../control-plane` (one reviewable commit / PR):
 ## W1.3 — Lint conformance (state-dependent)
 
 If control-plane's item 1 (buf gates) has landed by the time W1.2 merges:
-add the two `ignore_only` exemptions from D-P2 to their `buf.yaml`
+add the three `ignore_only` exemptions from D-P2 to their `buf.yaml`
 (scoped to the orchestrator file, comment with rationale) and show
 `buf lint` green in their CI. If the gates haven't landed yet: put the
 exemption stanza + rationale in the W1.1 note instead, explicitly marked
@@ -164,6 +167,10 @@ Per the request's `03-verification-offer.md`:
    output in **both** request dirs. Only possible once their gate exists;
    if the gate lands after us, note the pending demo in our resolution
    and let their resolution carry the evidence — do not silently skip it.
+   Likewise, if the upstream itself lands before their gates exist
+   (their item 3 orders gates → upstream → tag; we can't control their
+   timing), disclose the inversion in the resolution — the only hard
+   constraint is upstream-before-tag.
 3. `bd close exploration-orchestrator-777 -r "determinism.orchestrator.v1
    canonical in control-plane @ <SHA>; orch-proto reduced to re-export;
    no local proto copy remains"` (fill the real SHA).

@@ -35,8 +35,13 @@ shim then.
 
 ## D-P2 — buf lint posture: keep the wire shape, exempt the two unfixable rules
 
-The control-plane request names three lint rules: package version suffix
-(we pass — `v1`), enum zero-values, service suffix. Our file violates two:
+The control-plane request names three lint rules (package version
+suffix — we pass, `v1` — enum zero-values, service suffix), but their
+gate will run a whole DEFAULT-category lint ("expect the existing ~21
+placeholder stubs to need cleanup or exemption"). Against DEFAULT, our
+file violates three rules (the rest of DEFAULT passes — request/response
+uniqueness, enum value prefixes, package/directory match, casing all
+verified clean):
 
 - `ENUM_ZERO_VALUE_SUFFIX` — all five enums have semantic zero values
   (`EXPERIMENT_STATE_PENDING = 0`, `PRUNE_ACTION_EXHAUSTED = 0`,
@@ -44,6 +49,12 @@ The control-plane request names three lint rules: package version suffix
   not `*_UNSPECIFIED = 0`.
 - `SERVICE_SUFFIX` — the service is `ExplorationOrchestrator`, not
   `…Service`, fixed by API.md §1.
+- `RPC_RESPONSE_STANDARD_NAME` — twice: `GetExperimentStatus` returns
+  `ExperimentStatus` (deliberately, because the same message is embedded
+  in `ProgressEvent.status`; renaming it `GetExperimentStatusResponse`
+  would be a semantic lie there, and wrapping it in a new response
+  message *is* wire-breaking) and `StreamProgress` returns
+  `stream ProgressEvent` (an event stream, not a response envelope).
 
 **Decision:** neither is fixable within the request's own constraint
 ("style fixes … wire-compatibly"):
@@ -60,17 +71,25 @@ The control-plane request names three lint rules: package version suffix
 
 So the upstream PR ships `buf.yaml` `ignore_only` entries (or the
 equivalent under whatever config their item 1 lands) for
-`ENUM_ZERO_VALUE_SUFFIX` and `SERVICE_SUFFIX` scoped to
+`ENUM_ZERO_VALUE_SUFFIX`, `SERVICE_SUFFIX`, and
+`RPC_RESPONSE_STANDARD_NAME`, scoped to
 `proto/determinism/orchestrator/v1/orchestrator.proto`, with this
 rationale in a comment. Control-plane's request already accepts
 exemptions as a mechanism ("cleanup or exemption").
 
 **Escape hatch, pre-agreed:** if control-plane's review insists on full
 conformance *before the tag*, renumbering is uniquely cheap right now —
-no tag exists, no external consumer exists, and no persisted artifact
-embeds proto enum numbers (`orch-checkpoint` serializes its own Rust
-enums via postcard; `config_hash` is blake3 over the postcard-encoded
-core config, not proto bytes — verified). The bounded fallout is: proto
+no tag exists and no external consumer exists. But it is **not**
+persistence-free: the production `config_hash` is blake3 over the
+canonical **proto** encoding (`orch-server/src/config.rs:302`,
+`blake3(to_wire(config).encode_to_vec())` — the postcard-over-core-types
+hash is only the test helper in `tests/support/mod.rs`), and that hash
+is persisted in `CheckpointV1.config_hash` and checked on resume
+(`orch-checkpoint/src/lib.rs:93,193`). Renumbering therefore changes the
+`config_hash` of any config carrying a non-default enum value — no
+checkpoint (including a Tier-2 state-dir) may straddle the renumber.
+That's acceptable today (fakes-only, no long-lived state-dirs, no
+pinned hash literals in tests), plus the bounded code fallout: proto
 enum blocks, `orch-server/src/config.rs` + `service.rs` wire↔core enum
 conversions, `grpc_surface.rs` expectations. That path is a *disclosed
 deviation* to record in the resolution, taken only on their explicit ask.
@@ -139,35 +158,59 @@ test.
 
 **Decision:** one append-only journal file per state-dir
 (`<state-dir>/journal.v1`), shared by all four wrappers behind a
-`Mutex<Journal>` (execution is already serialized — deterministic mode,
-`max_inflight_batches = 1` — so the journal's total order equals the
-op order). Record frame:
+`Mutex<Journal>`. Note execution is **not** serialized at op
+granularity even in deterministic mode: `run_batch` fans the K sibling
+jobs out as concurrent `tokio::spawn` tasks
+(`orch-sched/src/driver.rs:342-362,484-502`), so ops on *different*
+services interleave. What holds is per-service atomicity — each
+wrapper's journal-append + apply happens while that service's
+`SyncAdapter` mutex is held — and per-fake state only depends on that
+fake's own op order, so the journal's total order is a valid
+linearization for replay. Record frame:
 
 ```
 u32 LE payload length | u64 LE truncated blake3 of payload | payload
 ```
 
 payload = postcard-encoded `JournalRecord` enum: one variant per
-**mutating** client-trait method across the four boundaries (hypervisor
-create/fork/destroy/run + reclaim, scorer submit/checkpoint/restore/rebin,
-store create-node/update/put-metadata/delete-metadata, synth
-load-pack/load-experiment — implementer enumerates from the
-`orch-clients` traits; when in doubt whether a method mutates, journal
-it), each carrying the request DTO **and a `u64` truncated-blake3 digest
-of the postcard-encoded response**.
+**mutating** client-trait method across the four boundaries. The rule
+is mechanical and exact for all four traits: **journal every `&mut self`
+trait method, never journal `&self` methods** — synth's
+`propose_bursts`/`mine_macros` are `&mut` but pure, journaling them is
+harmless; `&self` queries never mutate. Two additional hard rules:
+**errored ops are journaled too** (e.g. the hypervisor's `run()` mutates
+slot state and pushes watch events even on error), and **ops issued
+from background tasks are never journaled** — `list_slots` /
+`watch_slots` / `worker_info` fire from the SlotView drain task on a
+5 ms real-time timer (`orch-sched/src/slots.rs:208-219`) at
+nondeterministic instants; they're `&self` so the rule already excludes
+them, but don't "improve" on it. Each op frame carries the request DTO
+and a monotonically assigned `op_id` (issued under the journal mutex).
 
-Write path (write-ahead): append frame → `File::sync_data()` → apply to
-the in-memory fake → return the fake's response. A SIGKILL between
-append and apply is indistinguishable from "server executed, response
-lost" — exactly the crash semantics real clients face. Reload path:
-rebuild fresh fakes from `GridWorld::three_room()`, scan the journal
-verifying length + checksum per frame, **truncate the torn tail**
-(`set_len` + sync) at the first short/corrupt frame, then re-invoke every
-op in order; each re-invoked response's digest must equal the journaled
-digest — a mismatch is a loud panic naming the record index (this is the
-tripwire for any hidden nondeterminism in the fakes, e.g. `HashMap`
-iteration order leaking into a response). The dir is fsynced at journal
-creation so the file itself survives.
+Write path (write-ahead, all under the service's mutex): append op
+frame → `File::sync_data()` → apply to the in-memory fake → append an
+advisory `Applied { op_id, digest }` frame (no fsync — losing it is
+fine) → return the fake's response. The digest is a `u64`
+truncated-blake3 of the postcard-encoded response; since `ClientError`
+has no serde derives (`#[non_exhaustive]` kind), digest errors via a
+small local mirror in `orch-simstate` (kind-as-string + message). A
+SIGKILL between append and apply is indistinguishable from "server
+executed, response lost" — exactly the crash semantics real clients
+face. Reload path: rebuild fresh fakes from `GridWorld::three_room()`,
+scan the journal verifying length + checksum per frame, **truncate the
+torn tail** (`set_len` + sync) at the first short/corrupt frame, then
+re-invoke every op in order, pairing each op frame with its `Applied`
+frame **by `op_id`** (never "the next frame" — frames from other
+services interleave); where the pair exists, the re-invoked response's
+digest must equal it — a mismatch is a loud panic naming the op id
+(the tripwire for any hidden nondeterminism in the fakes); a missing
+`Applied` frame means the crash landed between append and apply, and
+the re-invoked result is authoritative. The dir is fsynced at journal
+creation so the file itself survives. Known benign wart to document:
+`FakeHypervisor::watch_slots` advances a cursor through a `Cell`
+despite `&self`, so after reload the drain task re-sees old events —
+convergent (last-write-wins into `SlotView.known`) and invisible to
+the digest check, but worth a comment so nobody chases it as a bug.
 
 **Rejected:** (a) journaling full state snapshots per op — O(world) per
 write, and it wouldn't exercise replay determinism at all; (b) journaling
@@ -225,8 +268,13 @@ client choreography per incarnation. Config mirrors the Tier-1 grid
 tuning (`support::grid_config`: deterministic mode, `max_inflight_batches
 = 1`, `every_commits = 16`, small bursts) expressed as the standalone
 YAML that `wire_config_from_yaml` accepts. `FaultPlan` stays disabled —
-fault injection is Tier-1's dimension; mixing it in here would make the
-control run's tree seed-unstable for no accept-bar gain.
+and this is a **soundness invariant of the journal, not a tuning
+choice**: `FaultInjector::decide` advances a per-`(target, operation)`
+attempt counter on every call *including read-only ops*
+(`orch-fakes/src/fault.rs:396-420`), and read-only ops are not
+replayed, so any nonzero plan would diverge under replay. With the plan
+disabled all decisions are counter-independent. State this in
+`orch-simstate`'s docs: the wrappers require a disabled fault plan.
 
 One additional smoke case runs `--simulate --state-dir`, starts an
 experiment over gRPC, random-kills the process, relaunches, and calls
@@ -259,7 +307,13 @@ on every push, on both arches. The full matrix runs via
 lands under `evidence/phase5-tier2-chaos/`. **If** the measured full
 runtime is under ~10 minutes, promote it into CI and say so in the
 resolution; otherwise the evidence lane is the documented manual lane
-the request explicitly allows ("say which and why").
+the request explicitly allows ("say which and why"). Expectation to
+plan around: fsync-per-mutating-op dominates — seconds to tens of
+seconds per incarnation on CI disks, plausibly 15–40 min for the full
+lane (65 forced rounds × multiple incarnations + randoms), a few
+minutes for the ~9-round smoke. Batching syncs is **not** an acceptable
+mitigation (it would defeat the torn-write points); the only knob is
+matrix size.
 
 **Rejected:** full matrix in CI sight-unseen (could double CI time for a
 lattice that Tier-1 already sweeps exhaustively in-process), or

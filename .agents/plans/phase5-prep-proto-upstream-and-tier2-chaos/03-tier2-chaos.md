@@ -16,9 +16,10 @@ Reference files (read before starting):
   torn-truncation repair (:615-899)
 - Fake world state to persist (bead 6ft's checklist):
   `orch-fakes/src/hypervisor.rs` (:44-103 slots + snapshots,
-  `reclaim_session` :145), `scorer.rs` (:43-81 archives + batch_cache +
-  checkpoints), `snapshot_store.rs` (:21-45 — **metadata holds the
-  checkpoint + WAL blobs**), `synth.rs` (:43-68)
+  `reclaim_session` :145), `scorer.rs` (:43-52 archives + checkpoints;
+  each `ExperimentArchive`'s `batch_cache` is at :409),
+  `snapshot_store.rs` (:21-45 — **metadata holds the checkpoint + WAL
+  blobs**), `synth.rs` (:43-68)
 - Bin: `bins/orchestratord/src/main.rs` (flags :37-68, standalone
   :113-169, serve :171-218), `simulate.rs` (`SimulatedWorld` :19-40)
 - Test fixture conventions: `crates/orch-server/tests/support/mod.rs`
@@ -35,7 +36,9 @@ New workspace crate (add to root `Cargo.toml` members). `journal.rs`:
   file (a SIGKILL right after create must not lose the file itself).
 - `append(&mut self, record: &JournalRecord) -> io::Result<()>`:
   postcard-encode, write `u32 LE len | u64 LE truncated-blake3(payload) |
-  payload`, then `sync_data()`. One frame per call.
+  payload`, then `sync_data()`. One frame per call. `Applied` frames
+  skip the `sync_data()` — they're advisory (W2.2/D-T2); expose that as
+  an `append_advisory` variant or a flag.
 - `load(dir) -> io::Result<(Vec<JournalRecord>, LoadStats)>`: scan
   frames; on a short read, length running past EOF, or checksum
   mismatch, **truncate the file to the last good frame boundary**
@@ -66,38 +69,44 @@ lives in `append` with the match done by the caller passing a
 `orch-simstate/src/world.rs` + `records.rs`:
 
 - `JournalRecord` variants: one per mutating method of the four
-  `orch-clients` sync traits (enumerate from the trait definitions —
-  hypervisor create/fork/run/destroy etc., scorer submit-batch /
-  checkpoint-archive / restore / replay-commits / rebin, store
-  create-node / update-node / put-metadata / delete-metadata, synth
-  load-macro-pack / load-experiment-config …), each carrying the request
-  DTO plus `response_digest: u64` (truncated blake3 of the
-  postcard-encoded `Result`-payload). Plus `Header { version }` and
-  `ReclaimSession`. Read-only methods (queries, list/watch, propose) are
-  **not** journaled. When a method's mutability is unclear from the
-  trait, journal it and note it in a comment.
-- Request/response DTOs need `Serialize`/`Deserialize`. Preferred: add
-  derives to `orch-clients` DTOs behind a `serde` cargo feature
-  (orch-clients is transport-free; postcard/serde is already the repo's
-  canonical encoding — see `orch-checkpoint`). If some DTO resists
-  (borrowed data, non-serde field), mirror just that one as a local
-  struct with `From`/`Into` — don't fork the whole DTO layer.
+  `orch-clients` sync traits. The selection rule is D-T2's, mechanical:
+  **every `&mut self` trait method gets a variant; `&self` methods are
+  never journaled.** Applied to the actual traits that means — beyond
+  the obvious hypervisor create/fork/run/destroy and store create-node
+  / update-node / put-metadata / delete-metadata — also the store's
+  **`prune_subtree`** (mutates node statuses + the logical clock,
+  `snapshot_store.rs:403-440`), the scorer's **`load_feature_map`**
+  (rebinning is a flag on it, not a separate method) **and
+  `load_scoring_program`** (archive bindings — replay fails its first
+  `score_batch` without them) alongside submit / checkpoint-archive /
+  restore / replay-commits, and synth load-pack / load-experiment.
+  Synth's `propose_bursts` / `mine_macros` are `&mut` but pure —
+  journaled by the rule, harmlessly. **Errored ops are journaled too**
+  (hypervisor `run()` mutates slot state and pushes watch events even
+  on the error path, `hypervisor.rs:402-427`). Never journal the
+  background-task read-onlys (`list_slots`/`watch_slots`/`worker_info`
+  — the SlotView drain calls them on a 5 ms timer at nondeterministic
+  instants; they're `&self`, so the rule already excludes them). Plus
+  `Header { version }`, `ReclaimSession`, and `Applied { op_id, digest }`.
+- Serde: the `orch-clients` DTOs already derive
+  `Serialize`/`Deserialize` (serde is an unconditional dep of the
+  crate; the fakes postcard-encode requests today via
+  `request_identity`) — add plain derives only to any straggler
+  hypervisor DTOs that lack them, no feature gate. `ClientError` has
+  none and its kind is `#[non_exhaustive]`: digest errors via a small
+  local mirror in `orch-simstate` (kind-as-string + message), per D-T2.
 - `Persistent<Fake>` wrappers implement the same sync client traits,
-  holding `(inner_fake, Arc<Mutex<Journal>>, kind_tag)`. Mutating
-  methods: build record → `journal.append` (write-ahead) → apply to
-  inner → digest the response into… note the digest is *of* the
-  response, which doesn't exist at append time. Resolution: append the
-  record with `response_digest = 0`, apply, then **amend is forbidden**
-  (append-only) — so instead journal the digest in a paired follow-up
-  record? No — keep it simple and honest: the record carries the request
-  only; the **response digest goes in a trailing `Applied { digest }`
-  frame appended (no fsync needed — advisory) after the op applies.** On
-  replay, re-invoke the op; if the *next* frame is its `Applied` record,
-  compare digests and panic on mismatch (naming the record index); if
-  the journal ends before the `Applied` frame (crash between append and
-  apply), the re-invoked result is authoritative — exactly the
-  "executed, response lost" semantics from D-T2. Loader pairs each op
-  frame with an optional immediately-following `Applied` frame.
+  holding `(inner_fake, Option<Arc<Mutex<Journal>>>, kind_tag)` —
+  `None` is a pure passthrough, which is also how `--state-dir`-less
+  mode reuses the same concrete type (see W2.3). Mutating methods, all
+  within the one `SyncAdapter`-held `&mut self` call: take the journal
+  mutex, assign the next `op_id`, append the op frame (fsync), release
+  nothing yet — apply to inner — append `Applied { op_id, digest }`
+  (advisory, no fsync), return. On replay, re-invoke each op in journal
+  order and pair `Applied` frames **by op_id** (frames from different
+  services interleave — see D-T2); digest mismatch panics naming the
+  op id; a missing `Applied` frame means the re-invoked result is
+  authoritative ("executed, response lost").
 - `PersistentWorld::create(dir)` — fresh fakes
   (`FakeHypervisor::with_world(GridWorld::three_room())` etc., matching
   `simulate.rs`), new journal. `PersistentWorld::reload(dir)` — fresh
@@ -105,15 +114,21 @@ lives in `append` with the match done by the caller passing a
   above), then invoke + append `ReclaimSession` per D-T4. Both return
   the same shape `SimulatedWorld` uses (`SyncAdapter<Persistent<…>>` ×4).
 - `compare.rs`: extract Tier-1's comparator so both tiers share it —
-  `store_tree_hash(&InMemorySnapshotStore) -> [u8; 32]` (blake3 over
+  `store_tree_hash(&InMemorySnapshotStore, experiment_id: &str) ->
+  [u8; 32]` (Tier-1's copy hard-codes its `EXPERIMENT_ID`; the shared
+  version takes it as a parameter, blake3 over
   sorted nodes: node_id, parent, synth state_hash, progress_score,
   cell_key; dense-id assertion), `assert_no_stranded_frontier`, plus new
   `scorer_archive_fingerprint(&FakeScorer, experiment_id) -> [u8; 32]`
   (blake3 over sorted cell counts + `archive_seq` + feature-map/program
   hashes) — Tier-2's bar says tree **/archive** state. Rework
   `chaos_resume.rs` to import the shared comparator (dev-dependency on
-  `orch-simstate`) instead of its private copy; its assertions must not
-  change.
+  `orch-simstate` — no cycle: orch-simstate depends only on
+  orch-clients/orch-core/orch-fakes/orch-driver, none of which depend
+  on orch-server) instead of its private copy; its assertions must not
+  change. `Persistent<T>` needs an `inner()` accessor so the comparator
+  can reach the wrapped fake through
+  `SyncAdapter::service() -> Arc<Mutex<Persistent<T>>>`.
 - Unit test: drive a scripted op sequence (mirror
   `orch-fakes/tests/search_loop.rs`'s shape) against
   `PersistentWorld::create`, reload into a second world, assert equal
@@ -128,8 +143,15 @@ lives in `append` with the match done by the caller passing a
 - New flag `--state-dir <dir>`, valid with both `--simulate` and
   `--experiment`. Present ⇒ `SimulatedWorld` is backed by
   `PersistentWorld::reload(dir)` if `<dir>/journal.v1` exists, else
-  `::create(dir)`. Absent ⇒ today's in-memory world (zero behavior
-  change; Tier-1 and all existing tests unaffected).
+  `::create(dir)`. Absent ⇒ journal-less passthrough (zero behavior
+  change; Tier-1 and all existing tests unaffected). **Type plumbing:**
+  `run_standalone`/`serve_simulate` are not generic and the sched ports
+  are RPITIT (not dyn-safe, `orch-sched/src/ports.rs:200-206`) — do NOT
+  reach for `Box<dyn>` or duplicated monomorphized branches. The
+  `Option<journal>` passthrough inside `Persistent<T>` (W2.2) exists
+  precisely so **one concrete type serves both modes**:
+  `SimulatedWorld` always wraps `SyncAdapter<Persistent<Fake…>>`, with
+  the journal `None` when `--state-dir` is absent.
 - `ORCH_CHAOS_HANG_AT=<CrashPoint>:<nth>` (per D-T3): parsed only in
   `--experiment` mode; builds the hang-and-marker `CrashPolicy`
   (`TIER2_CHAOS_HANG point=<point>` on stdout, flush, park) passed where
@@ -160,9 +182,14 @@ default 1 in CI, 5 in the evidence lane):
    generous timeout — a missing marker after clean exit means the point
    wasn't reached this incarnation: relaunch without the hook counts it
    as converged, mirroring Tier-1's ≤3-crash policy); SIGKILL; relaunch
-   against the same dir. After the final clean exit: reload B, assert
+   against the same dir **without `ORCH_CHAOS_HANG_AT`** (one kill per
+   lattice round — the relaunch runs clean to completion). After the
+   final clean exit: reload B, assert exit 0 **and** persisted
+   checkpoint `status == GoalReached` (exit 0 alone also covers
+   BudgetExhausted/Stopped — `main.rs:163-168` only errors on Failed),
    tree hash + archive fingerprint + goal nodes == control's, and
-   `assert_no_stranded_frontier`.
+   `assert_no_stranded_frontier`. That exit-0-plus-status pairing is
+   mandatory in **every** round of every class, not just the control.
 4. **Forced torn writes:** two rounds (`ORCH_SIM_TORN_AT=wal-append:2`,
    `ckpt-put:1`) — marker, SIGKILL, relaunch loop as above. These are
    the accept bar's "mid-WAL-append" and "mid-checkpoint-write"; the
@@ -176,9 +203,13 @@ default 1 in CI, 5 in the evidence lane):
 6. **Served-gRPC smoke** (once per suite, not per seed): `--simulate
    --state-dir C --listen 127.0.0.1:0`… `--listen` needs a concrete
    port — pick an ephemeral port in the harness and pass it. Start an
-   experiment over gRPC (`StartExperiment`), random-kill, relaunch,
-   `StartExperiment(resume_if_exists = true)` must return `resumed_at_
-   batch_seq > 0` and the run must reach `GoalReached` via
+   experiment over gRPC (`StartExperiment`), then **poll
+   `GetExperimentStatus` until `checkpointed_batch_seq > 0` before
+   killing** (a random kill landing before the first checkpoint would
+   make the `resumed_at_batch_seq > 0` assertion flaky — the first
+   checkpoint needs 16 commits); SIGKILL, relaunch,
+   `StartExperiment(resume_if_exists = true)` must return
+   `resumed_at_batch_seq > 0` and the run must reach `GoalReached` via
    `GetExperimentStatus` polling; compare state-dir C against a control
    as above. (The tonic client comes via `orch-proto` — dev-dependency
    of the bin.)
@@ -193,24 +224,41 @@ Tier-1) and fail loudly on non-convergence.
 ## W2.5 — The demonstrated negative
 
 A comparator that can't detect a real divergence proves nothing (accept
-bar 3). In `orch-simstate`, `PersistentWorld::reload_broken(dir,
-BreakMode::DropWal)` — identical to `reload` except it **skips replaying
-`put_metadata` records whose key is a WAL key** (the documented
-mutation: "WAL replay skipped" — the resumed runner sees the checkpoint
-but no surviving WAL entries).
+bar 3). **Do not use "skip WAL replay" as the mutation** — it converges:
+the request's suggested example doesn't survive contact with the resume
+design. A resume with the checkpoint present but zero surviving WAL
+entries does not fail (`load_wal_entries` returns empty on all-NotFound,
+`experiment.rs:886-912`) and simply re-selects — and intents are pure
+functions of `(config.seed, batch_seq)` plus the checkpoint-restored
+frontier (`experiment.rs:1173,1208`), so the re-derived batches produce
+the identical tree. Dropped WAL entries are self-healing instructions,
+not state.
 
-Harness test `negative_control_detects_wal_loss`: seed 0x5EED, kill at
-`AfterWalWrite:1` (a point where the WAL entry *matters* — the batch was
-dispatched but not committed), relaunch **via a broken world**: this
-needs the bin to reload broken, so `--state-dir` gains a test-only env
-`ORCH_SIM_BREAK=drop-wal` honored on reload (documented alongside the
-other hooks). Run to completion, reload the dir, and assert the tree
-hash **differs** from control (or the run fails/wedges — assert
-"comparator would have failed", i.e. `hash != control || outcome !=
-GoalReached`). Also assert the *unbroken* reload of a copy of the same
-pre-relaunch dir still converges to equality — pinning that the
-divergence is caused by the mutation, not the kill point. Record the
-exact mutation + observed divergence in the evidence file.
+Instead, corrupt **committed state** on replay. Primary mutation:
+`PersistentWorld::reload_broken(dir, BreakMode::PerturbNode)` —
+identical to `reload` except it bumps one journaled `create_node`
+request's `progress_score` during replay (documented mutation:
+"replayed store diverges by one committed node's score"). Divergence is
+structural: `store_tree_hash` covers `progress_score` directly, and the
+perturbed frontier also steers subsequent selection. Alternative worth
+a second case if cheap: `BreakMode::DropScorerReplay` (skip replaying
+scorer `score_batch`/`replay_commits` records) — resume then fails with
+`REASON_ARCHIVE_SEQ_MISMATCH` (`experiment.rs:75,777-786`), proving the
+archive-lockstep guard fires across the process boundary.
+
+Harness test `negative_control_detects_divergence`: seed 0x5EED, kill
+at any mid-run point that guarantees ≥1 committed node before the kill
+(e.g. `BeforeCasPut:1` — 16 commits have happened), relaunch **via a
+broken world**: the bin honors a test-only env `ORCH_SIM_BREAK=
+perturb-node` (documented alongside the other hooks) on reload. Run to
+completion and assert the comparator **fails**: `hash != control ||
+outcome != GoalReached`. The implementer must demonstrate the first arm
+actually fires for PerturbNode (a vacuous pass through the second arm
+alone means the mutation was too weak — strengthen it, don't ship it).
+Also assert the *unbroken* reload of a copy of the same pre-relaunch
+dir still converges to equality — pinning that the divergence is caused
+by the mutation, not the kill point. Record the exact mutation +
+observed divergence in the evidence file.
 
 ## W2.6 — Evidence + CI
 

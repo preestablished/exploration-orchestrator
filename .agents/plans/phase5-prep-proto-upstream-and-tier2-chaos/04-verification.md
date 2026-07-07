@@ -28,7 +28,7 @@ implement that env passthrough.
 | replay response-digest mismatch panics | `orch-simstate` unit (deliberately perturbed fake) | our CI |
 | Tier-1 lattice unchanged, now on the shared comparator | `chaos_resume.rs` (refactor only — assertions identical) | our CI |
 | Tier-2 lattice + torn-writes + random kills + gRPC resume smoke | `bins/orchestratord/tests/tier2_chaos.rs` | CI smoke (reduced) + evidence lane (full) |
-| Negative control (drop-WAL reload diverges) | same harness file | CI smoke + evidence |
+| Negative control (perturbed-node replay diverges; drop-WAL rejected as convergent — see W2.5) | same harness file | CI smoke + evidence |
 
 Existing suites must stay untouched and green: the M3/M4 acceptance
 suites, `seed_gate`, `grpc_surface` (W1.4 proves the re-export by
@@ -71,7 +71,12 @@ D5-style discipline by name):
   disclosure); (d) `Applied`-frame response-digest design if it deviated
   from D-T2's sketch; (e) anything the fakes' determinism audit turned
   up (a digest mismatch forcing a fake-side fix is a finding to
-  disclose, not silently patch).
+  disclose, not silently patch); (f) the negative-control mutation
+  actually shipped — the request's own "e.g. WAL replay skipped"
+  example is convergent by design and was replaced (W2.5), which is
+  itself a disclosed reinterpretation of the request text; (g) if the
+  upstream landed before control-plane's buf gates existed, the
+  gates→upstream→tag inversion (W1.5).
 - The phases track responds with `05-verification.md` (their clean-
   checkout re-run at a fresh `CHAOS_SEED`).
 

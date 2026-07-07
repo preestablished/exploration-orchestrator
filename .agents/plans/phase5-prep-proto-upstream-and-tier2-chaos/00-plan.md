@@ -71,6 +71,30 @@ Both items are fakes-only/proto-only. M5+ stays untouched (beads `cww`,
 | `03-tier2-chaos.md` | Item 2 work items W2.1–W2.7 (journal crate, orchestratord wiring, harness, negative control, evidence) |
 | `04-verification.md` | Acceptance-criteria mapping, evidence conventions, CI changes, resolution/handback shape |
 
+## Review status
+
+Two independent reviews completed 2026-07-07 (contract-fidelity /
+cross-repo lens; feasibility / test-design lens). All accepted findings
+are folded into these files, the load-bearing ones: third buf-lint
+violation (`RPC_RESPONSE_STANDARD_NAME`) added to D-P2's exemptions;
+D-P2's renumbering escape hatch corrected — the production
+`config_hash` is prost-encoded and persisted/checked in checkpoints, so
+renumbering is not persistence-free; the negative control redesigned
+(the request's "skip WAL replay" example provably converges — replaced
+with a perturbed-node replay mutation, W2.5); `Applied` frames pair by
+`op_id` (ops interleave across services — K sibling jobs run
+concurrently even in deterministic mode); the journaling rule made
+mechanical (`&mut self` ⇒ journal, `&self` ⇒ never — adding
+`prune_subtree`, `load_feature_map`, `load_scoring_program`; errored
+ops journaled; background-task read-onlys never); `ClientError` digest
+mirror (no serde on it; DTOs already derive serde — no feature gate);
+`Persistent<T>` carries `Option<journal>` so one concrete type serves
+both `--state-dir` modes (ports are RPITIT, not dyn-safe); gRPC smoke
+polls for the first checkpoint before killing; exit-0 must always pair
+with persisted `GoalReached`; `FaultPlan`-disabled promoted to a
+journal soundness invariant; runtime expectations (fsync-dominated,
+est. 15–40 min full lane) recorded in D-T5.
+
 ## Sequencing
 
 ```
