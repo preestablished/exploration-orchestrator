@@ -90,7 +90,7 @@ impl FakeScorer {
     }
 
     #[must_use]
-    pub fn preview_fault(
+    pub fn draw_fault(
         &self,
         operation: &'static str,
         request_identity: &[u8],
@@ -143,7 +143,7 @@ impl FakeScorer {
         request_identity: Vec<u8>,
         response_items: u32,
     ) -> ClientResult<FaultDecision> {
-        let decision = self.preview_fault(operation, &request_identity, response_items);
+        let decision = self.draw_fault(operation, &request_identity, response_items);
         self.last_fault.set(Some(decision));
         if let Some(error) = decision.client_error() {
             return Err(error);

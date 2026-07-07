@@ -20,14 +20,20 @@ fn or_default_u32(value: u32, default: u32) -> u32 {
     }
 }
 
-fn or_default_u64(value: u64, default: u64) -> u64 {
-    if value == 0 {
-        default
-    } else {
-        value
-    }
-}
-
+/// proto3 scalars cannot distinguish "unset" from an explicit zero, so a
+/// zero f64 knob takes its documented default.
+///
+/// KNOWN TRAP (review finding, disclosed): for knobs where 0.0 would be a
+/// meaningful "off" value — selection.beta / .gamma / .delta,
+/// ladder.backtrack_kappa, ladder.macro_weight_hot — an explicit 0.0 is
+/// therefore not expressible; the nearest representable off-value is a
+/// denormal-adjacent epsilon (e.g. 1e-12). Keying on submessage presence
+/// instead was rejected: it silently zeroes every knob a sparse block
+/// omits, a worse footgun. The real fix is proto3 `optional` presence on
+/// those five fields — a wire-format change deferred to the proto
+/// upstreaming bead. Knobs validated strictly positive (temperature,
+/// epsilon_s, epsilon_regress, ladder factors >= 1.0) are unaffected: an
+/// explicit 0.0 could never validate anyway.
 fn or_default_f64(value: f64, default: f64) -> f64 {
     if value == 0.0 {
         default
@@ -79,16 +85,21 @@ pub fn effective_config(config: &wire::ExperimentConfig) -> ExperimentConfig {
         scoring_program_ref: config.scoring_program_ref.clone(),
         synth_config_ref: config.synth_config_ref.clone(),
         macro_pack_refs: config.macro_pack_refs.clone(),
+        // Budgets: presence of the submessage is the "explicitly configured"
+        // signal, so an explicit 0 (= unlimited) is honored on every axis —
+        // including max_wall_clock_s (review finding: it used to coerce an
+        // explicit 0 back to the 24 h default, unlike its three siblings).
         budgets: Budgets {
             max_nodes: if config.budgets.is_none() {
                 defaults.budgets.max_nodes
             } else {
                 budgets.max_nodes
             },
-            max_wall_clock_s: or_default_u64(
-                budgets.max_wall_clock_s,
-                defaults.budgets.max_wall_clock_s,
-            ),
+            max_wall_clock_s: if config.budgets.is_none() {
+                defaults.budgets.max_wall_clock_s
+            } else {
+                budgets.max_wall_clock_s
+            },
             max_guest_instructions: budgets.max_guest_instructions,
             max_expansions: budgets.max_expansions,
         },

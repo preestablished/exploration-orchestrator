@@ -21,7 +21,10 @@ fn corridor_config(seed: u64, max_level: u32) -> RunnerConfig {
     config.selection.gamma = 0.02;
     config.selection.max_visits_per_node = 1_000_000;
     config.selection.exhaust_after_dup_expansions = 1_000_000;
-    config.budgets.max_expansions = 250;
+    // Measured solve points for this seed: ladder 222, control 324. The
+    // shared budget sits at the midpoint so both outcomes carry >=15%
+    // margin (review finding: no single-expansion cliff).
+    config.budgets.max_expansions = 273;
     config.plateau.window_n = 12;
     config.plateau.ladder.backtrack_kappa = 5.0;
     config.plateau.ladder.temp_factor = 4.0;
@@ -61,6 +64,9 @@ async fn run_corridor(seed: u64, max_level: u32) -> (RunOutcome, SharedSink) {
 async fn ladder_unsticks_the_corridor_and_the_control_fails_the_budget() {
     let seed = 0x001A_DDE4;
 
+    // Both arms share the budget; the assertion is the *relative* gap, not
+    // a co-tuned cliff (review finding): the ladder run must reach the goal
+    // inside the budget the control exhausts, with clear headroom.
     let (control, _) = run_corridor(seed, 0).await;
     assert_ne!(
         control.state,
@@ -74,8 +80,20 @@ async fn ladder_unsticks_the_corridor_and_the_control_fails_the_budget() {
         ExperimentState::GoalReached,
         "ladder run must unstick: {ladder:?}"
     );
+    // Headroom: the ladder solved with at least 15% of the shared budget
+    // unspent, so the pass/fail gap is not a single-expansion cliff (the
+    // control side carries the same margin by construction).
+    let budget = corridor_config(seed, 4).config.budgets.max_expansions;
+    assert!(
+        ladder.expansions * 100 <= budget * 85,
+        "ladder must clear the budget with headroom: {} of {budget}",
+        ladder.expansions
+    );
 
-    // Escalation events observed, levels ascending from L0.
+    // Escalation assertions (review finding: `contains(&1)` alone was
+    // weaker than the claimed L0 -> L1 -> ... path). Levels reset to L0 on
+    // improvement, so the raw sequence legitimately restarts; within a
+    // stall episode each escalation climbs exactly one level.
     let levels: Vec<u64> = {
         let sink = sink.0.lock().expect("sink");
         sink.events_of_type("escalation-changed")
@@ -92,8 +110,16 @@ async fn ladder_unsticks_the_corridor_and_the_control_fails_the_budget() {
         !levels.is_empty(),
         "escalation-changed events must be observed"
     );
+    assert_eq!(levels[0], 1, "the ladder starts at L0 -> L1: {levels:?}");
+    let max_level = levels.iter().copied().max().unwrap_or(0);
     assert!(
-        levels.contains(&1),
-        "L0 -> L1 escalation observed: {levels:?}"
+        max_level >= 2,
+        "the run must escalate past L1 to unstick: {levels:?}"
     );
+    for pair in levels.windows(2) {
+        assert!(
+            pair[1] == pair[0] + 1 || pair[1] <= pair[0],
+            "escalations climb one level at a time (resets allowed): {levels:?}"
+        );
+    }
 }

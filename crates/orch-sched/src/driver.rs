@@ -255,6 +255,12 @@ where
     /// everything after the slot permit is acquired. On expiry, any lease
     /// the attempt allocated is torn down best-effort so a timed-out job
     /// never leaks its slot (ARCHITECTURE.md §6.4).
+    ///
+    /// M6 note: the lease is registered only once the restore await
+    /// resolves; a real transport can allocate server-side and then be
+    /// cancelled mid-flight, which this seam cannot see. The real adapter
+    /// needs a cancellation-safe restore (e.g. server-side lease TTL or a
+    /// two-phase allocate/confirm) before this path leaves the fakes.
     pub async fn run_job_deadline(
         &self,
         spec: &JobSpec,
@@ -353,7 +359,12 @@ where
             let driver = self.clone();
             jobs.push(async move { (job_idx, driver.run_job(&spec).await) });
         }
-        futures_join_all(jobs).await
+        futures_join_all(jobs)
+            .await
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| join_result_to_job(index, result))
+            .collect()
     }
 
     /// Fork-path dispatch; `None` means "not enough free slots right now,
@@ -427,7 +438,27 @@ where
             }
         };
         let children = match self.hypervisor.fork(fork_request).await {
-            Ok(response) => response.children,
+            Ok(response) if response.children.len() == count => response.children,
+            // A wrong child count is a boundary violation, not a shape we
+            // can zip over: too few silently drops jobs, too many leaks
+            // child VMs (review finding, both reviewers). Tear down and let
+            // the retry ladder re-run every job on the Restore path.
+            Ok(response) => {
+                for lease in response.children {
+                    let _ = self.destroy_with_retry(lease).await;
+                }
+                let _ = self.destroy_with_retry(parent.lease).await;
+                drop(permits);
+                let error = ClientError::new(
+                    ClientErrorKind::DataLoss,
+                    "fork returned a wrong child count",
+                );
+                return Some(
+                    (0..count)
+                        .map(|idx| (idx as u32, Err(error.clone())))
+                        .collect(),
+                );
+            }
             Err(error) => {
                 let _ = self.destroy_with_retry(parent.lease).await;
                 drop(permits);
@@ -466,7 +497,14 @@ where
                 (spec.job_idx, result)
             });
         }
-        let results = futures_join_all(jobs).await;
+        // Parent teardown happens even if a child task panicked (the panic
+        // surfaces as a per-job error, review finding).
+        let results: Vec<(u32, ClientResult<JobResult>)> = futures_join_all(jobs)
+            .await
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| join_result_to_job(index, result))
+            .collect();
 
         let _ = self.destroy_with_retry(parent.lease).await;
         drop(parent_permit);
@@ -532,7 +570,11 @@ where
                 capture: Some(self.config.capture.clone()),
             })
             .await?;
-        self.destroy_with_retry(lease).await?;
+        // The job semantically succeeded once the sealed snapshot exists;
+        // a destroy failure after that must not discard the capture and
+        // force a full re-run (review finding). Teardown is best-effort —
+        // destroy_with_retry already absorbed transient faults.
+        let _ = self.destroy_with_retry(lease).await;
 
         Ok(JobResult {
             job_idx: spec.job_idx,
@@ -643,8 +685,10 @@ where
 }
 
 /// Minimal ordered join for a homogeneous future set (avoids a futures-util
-/// dependency): results arrive in spawn order.
-async fn futures_join_all<F, T>(futures: Vec<F>) -> Vec<T>
+/// dependency): results arrive in spawn order. Panics are surfaced as
+/// `Err(JoinError)` per slot so callers can finish their teardown (e.g.
+/// destroy a frozen fork-parent) instead of unwinding past it.
+async fn futures_join_all<F, T>(futures: Vec<F>) -> Vec<Result<T, tokio::task::JoinError>>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -655,9 +699,25 @@ where
     }
     let mut results = Vec::with_capacity(handles.len());
     for handle in handles {
-        results.push(handle.await.expect("driver job task panicked"));
+        results.push(handle.await);
     }
     results
+}
+
+fn join_result_to_job<T>(
+    index: usize,
+    result: Result<(u32, ClientResult<T>), tokio::task::JoinError>,
+) -> (u32, ClientResult<T>) {
+    match result {
+        Ok(pair) => pair,
+        Err(join_error) => (
+            index as u32,
+            Err(ClientError::new(
+                ClientErrorKind::Internal,
+                format!("job task panicked: {join_error}"),
+            )),
+        ),
+    }
 }
 
 #[cfg(test)]

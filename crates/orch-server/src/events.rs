@@ -73,6 +73,11 @@ impl<S: EventSink> EventEmitter<S> {
         &self.sink
     }
 
+    #[cfg(test)]
+    fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     #[must_use]
     pub fn dropped_total(&self) -> u64 {
         self.dropped_total
@@ -138,11 +143,19 @@ impl<S> Clone for SharedSink<S> {
 
 impl<S: EventSink> EventSink for SharedSink<S> {
     fn emit(&mut self, envelope: EventEnvelope) -> orch_clients::ClientResult<()> {
-        self.0.lock().expect("shared sink lock").emit(envelope)
+        // Tolerate poisoning: a panicked emitter elsewhere must not take
+        // the telemetry path down with it (review suggestion).
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .emit(envelope)
     }
 
     fn acked_seq(&self) -> orch_clients::ClientResult<u64> {
-        self.0.lock().expect("shared sink lock").acked_seq()
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .acked_seq()
     }
 }
 
@@ -317,7 +330,7 @@ mod tests {
 
         // Outage clears: the ring drains in order, seq gaps mark the drops.
         // (Direct field poke: the sink is owned by the emitter.)
-        emitter.sink_mut_for_tests().accept = true;
+        emitter.sink_mut().accept = true;
         emitter.emit(5, "batch-completed", Payload::new());
         assert_eq!(emitter.pending(), 0);
         let seqs: Vec<u64> = emitter
@@ -328,11 +341,5 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![3, 4, 5, 6]);
         assert_eq!(emitter.sink().acked_seq().expect("acked"), 6);
-    }
-
-    impl EventEmitter<FlakySink> {
-        fn sink_mut_for_tests(&mut self) -> &mut FlakySink {
-            &mut self.sink
-        }
     }
 }

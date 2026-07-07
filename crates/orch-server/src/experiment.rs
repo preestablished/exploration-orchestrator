@@ -221,6 +221,21 @@ struct NodeRuntime {
     class: DeterminismClass,
 }
 
+impl<H, S, St, Sy, E> Drop for ExperimentRunner<H, S, St, Sy, E>
+where
+    H: AsyncHypervisor + Clone + 'static,
+    S: AsyncScorer + Clone + 'static,
+    St: AsyncStore + SyncStoreAccess + Clone + 'static,
+    Sy: AsyncSynth + SynthBringupPort + Clone + 'static,
+    E: EventSink,
+{
+    fn drop(&mut self) {
+        // The SlotView drain task must not outlive its runner (a runner
+        // that is started but never run() would otherwise leak it).
+        self.slots_drain.abort();
+    }
+}
+
 /// How the runner came up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartMode {
@@ -769,6 +784,9 @@ where
             ));
         }
         self.scorer_archive_seq = restored.archive_seq;
+        // Post-checkpoint states may be replayed again when their WAL batch
+        // re-commits below; ReplayCommits is idempotent (seen-set inserts),
+        // which the scorer contract guarantees and the fakes implement.
         self.replay_commits(post_checkpoint).await?;
 
         // Step 6: synth fingerprint assert (bring-up already ran).
@@ -779,35 +797,21 @@ where
         // Step 7: queue WAL replays; batch_seq advances past the checkpoint
         // and every replayed seq (fresh batches never reuse a replayed
         // client_batch_id).
-        // Entries below the checkpointed batch_seq are already covered by
-        // the checkpoint (a crash landed inside the truncation window):
-        // finish the interrupted truncation instead of double-replaying.
-        let mut replayable = Vec::new();
-        for intent in intents {
-            if intent.seq < checkpoint.batch_seq {
-                let store = self.store.clone();
-                let delete = DeleteMetadataRequest {
-                    key: MetadataKey::wal(&self.cfg.experiment_id, intent.seq),
-                    expected_generation: MetadataExpectation::unconditional(),
-                };
-                match retry_rpc(&self.retry, || store.delete_metadata(delete.clone())).await {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == ClientErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            } else {
-                replayable.push(intent);
-            }
-        }
+        // load_wal_entries already finished any interrupted truncation, so
+        // every loaded intent is at or above checkpoint.batch_seq and
+        // replayable.
+        debug_assert!(intents
+            .iter()
+            .all(|intent| intent.seq >= checkpoint.batch_seq));
         let mut next_seq = checkpoint.batch_seq;
-        for intent in &replayable {
+        for intent in &intents {
             next_seq = next_seq.max(intent.seq + 1);
         }
         self.batch_seq = next_seq;
-        self.wal_floor = replayable
+        self.wal_floor = intents
             .first()
             .map_or(checkpoint.batch_seq, |intent| intent.seq);
-        self.replay_queue = replayable.into();
+        self.replay_queue = intents.into();
 
         self.expansions = checkpoint.expansions;
         self.guest_instructions_used = checkpoint.budgets_used.guest_instructions;
@@ -836,23 +840,54 @@ where
         Ok(())
     }
 
-    /// Loads surviving WAL entries. WAL keys are seq-addressed and batches
-    /// delete on commit, so surviving entries live in a bounded window
-    /// around the checkpointed seq (at most `max_inflight_batches` were in
-    /// flight, plus batches dispatched after the checkpoint whose commits
-    /// had not landed).
+    /// Loads surviving WAL entries.
+    ///
+    /// Entries at or above `checkpoint.batch_seq` are the replayable window
+    /// (contiguous: dispatch writes them in seq order and only checkpoints
+    /// truncate). Entries *below* it are covered by the checkpoint; a crash
+    /// inside the ascending truncation loop leaves them as one contiguous
+    /// segment ending at `batch_seq - 1`, so scanning downward from there
+    /// until the first miss finds and deletes every stale survivor — no
+    /// matter where in the (up to `every_commits`-wide) window the crash
+    /// landed.
     async fn load_wal_entries(
         &mut self,
         checkpoint: &CheckpointV1,
     ) -> ClientResult<Vec<ExpansionIntent>> {
         let store = self.store.clone();
+
+        // Finish any interrupted truncation: downward from batch_seq - 1.
+        let mut seq = checkpoint.batch_seq;
+        while seq > 0 {
+            seq -= 1;
+            let key = MetadataKey::wal(&self.cfg.experiment_id, seq);
+            match store.get_metadata(GetMetadataRequest { key }).await {
+                Ok(_) => {
+                    let delete = DeleteMetadataRequest {
+                        key: MetadataKey::wal(&self.cfg.experiment_id, seq),
+                        expected_generation: MetadataExpectation::unconditional(),
+                    };
+                    match retry_rpc(&self.retry, || store.delete_metadata(delete.clone())).await {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == ClientErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) if error.kind() == ClientErrorKind::NotFound => break,
+                Err(error) if is_retryable(&error) => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    seq += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        // Collect the replayable window: upward from batch_seq.
         let inflight = u64::from(self.cfg.config.scheduling.max_inflight_batches.max(1));
-        let start = checkpoint.batch_seq.saturating_sub(inflight);
         let mut intents = Vec::new();
-        let mut seq = start;
+        let mut seq = checkpoint.batch_seq;
         let mut consecutive_misses = 0u64;
-        // Bounded probe: entries are contiguous-ish; stop after a miss run
-        // longer than the largest possible in-flight window.
         while consecutive_misses <= inflight + 1 {
             let key = MetadataKey::wal(&self.cfg.experiment_id, seq);
             match store.get_metadata(GetMetadataRequest { key }).await {
@@ -2148,6 +2183,15 @@ where
 
     // ── checkpoint (§8 lockstep) ────────────────────────────────────────────
 
+    /// The seq a checkpoint may claim as fully covered: everything below
+    /// the first still-queued replay intent (or batch_seq once the replay
+    /// queue has drained).
+    fn effective_checkpoint_seq(&self) -> u64 {
+        self.replay_queue
+            .front()
+            .map_or(self.batch_seq, |intent| intent.seq)
+    }
+
     async fn maybe_checkpoint(&mut self) -> ClientResult<()> {
         let cadence = &self.cfg.config.checkpoint;
         let due_commits =
@@ -2231,11 +2275,16 @@ where
         self.ckpt_generation = Some(response.generation);
         self.crash_check(CrashPoint::AfterCasPut)?;
 
-        // WAL truncation: the checkpoint covers every batch below
-        // batch_seq, so their entries are no longer needed for replay.
+        // WAL truncation: the checkpoint covers every batch below the
+        // effective seq. While WAL replay is still outstanding (a Pause or
+        // goal checkpoint can fire mid-replay) the effective seq is capped
+        // at the first un-replayed intent, so queued replays are never
+        // truncated and a restart re-loads a batch_seq that still points at
+        // them (review finding).
+        let effective_seq = self.effective_checkpoint_seq();
         self.crash_check(CrashPoint::BeforeWalDelete)?;
         let store = self.store.clone();
-        for seq in self.wal_floor..self.batch_seq {
+        for seq in self.wal_floor..effective_seq {
             let delete = DeleteMetadataRequest {
                 key: MetadataKey::wal(&self.cfg.experiment_id, seq),
                 expected_generation: MetadataExpectation::unconditional(),
@@ -2246,10 +2295,10 @@ where
                 Err(error) => return Err(error),
             }
         }
-        self.wal_floor = self.batch_seq;
+        self.wal_floor = effective_seq;
         self.crash_check(CrashPoint::AfterWalDelete)?;
 
-        self.checkpointed_batch_seq = self.batch_seq;
+        self.checkpointed_batch_seq = effective_seq;
         self.commits_since_checkpoint = 0;
         self.last_checkpoint_at = tokio::time::Instant::now();
         self.emitter.emit(
@@ -2291,7 +2340,7 @@ where
             last_committed_node: NodeId::new(
                 self.commit_state.tree.next_id().get().saturating_sub(1),
             ),
-            batch_seq: self.batch_seq,
+            batch_seq: self.effective_checkpoint_seq(),
             expansions: self.expansions,
             budgets_used: BudgetsUsed {
                 nodes: self.commit_state.tree.len() as u64,
@@ -2314,6 +2363,11 @@ where
                 .map_or([0u8; 32], ConfigFingerprint::into_bytes),
             cell_mirror: self.commit_state.cell_mirror.sorted_counts(),
             seen,
+            // knobs_in_effect is deliberately write-only: resume re-derives
+            // knobs from the config (pinned by config_hash), and the copy in
+            // the checkpoint exists for forensics — a checkpoint must be
+            // interpretable without the config document (review suggestion,
+            // documented rather than dropped to keep the golden format).
             plateau: PlateauCheckpoint {
                 best_score: self.best_score,
                 observations: self.stall.observations(),

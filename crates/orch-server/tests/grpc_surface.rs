@@ -159,21 +159,25 @@ async fn all_six_rpcs_work_end_to_end() {
         .await
         .expect("stream")
         .into_inner();
-    let mut saw_goal_edge = false;
-    for _ in 0..600 {
-        let Some(event) = stream.message().await.expect("stream item") else {
-            break;
-        };
-        assert!(event.status.is_some());
-        if let Some(wire::progress_event::Edge::Goal(goal)) = event.edge {
-            assert!(goal.node_id > 0);
-            assert!(!goal.snapshot_ref.is_empty());
-            assert!(goal.score > 0.0);
-            saw_goal_edge = true;
-            break;
+    // Bounded wait (review finding: the old loop could drain hundreds of
+    // real-clock heartbeats before failing): one overall wall deadline for
+    // the goal edge, generous enough for the search but finite.
+    let goal_edge = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            let Some(event) = stream.message().await.expect("stream item") else {
+                panic!("stream ended before the GoalReached edge");
+            };
+            assert!(event.status.is_some());
+            if let Some(wire::progress_event::Edge::Goal(goal)) = event.edge {
+                return goal;
+            }
         }
-    }
-    assert!(saw_goal_edge, "GoalReached edge must arrive on the stream");
+    })
+    .await
+    .expect("GoalReached edge must arrive on the stream within its deadline");
+    assert!(goal_edge.node_id > 0);
+    assert!(!goal_edge.snapshot_ref.is_empty());
+    assert!(goal_edge.score > 0.0);
 
     // Stop: terminal state + final stats.
     let stopped = client
@@ -187,10 +191,10 @@ async fn all_six_rpcs_work_end_to_end() {
     let final_stats = stopped.final_stats.expect("final stats");
     assert!(final_stats.expansions > 0);
     assert!(final_stats.nodes_committed > 1);
-    assert!(
-        stopped.state == wire::ExperimentState::Stopped as i32
-            || stopped.state == wire::ExperimentState::GoalReached as i32
-    );
+    // on_goal = CONTINUE means the goal never terminates the run, so the
+    // one legal terminal state after our Stop is Stopped (review finding:
+    // pin it instead of accepting two).
+    assert_eq!(stopped.state, wire::ExperimentState::Stopped as i32);
 
     // Unknown experiment surfaces NOT_FOUND.
     let missing = client

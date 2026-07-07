@@ -182,7 +182,11 @@ impl<T: Send + 'static> SyncAdapter<T> {
 }
 
 fn identity_bytes<R: Serialize>(request: &R) -> Vec<u8> {
-    postcard::to_allocvec(request).unwrap_or_default()
+    // A serialization failure must be loud: silently mapping every failed
+    // request to the same empty identity would merge their fault streams
+    // (review finding, both reviewers). DTOs are plain-old-data; this
+    // cannot fail short of a serde bug.
+    postcard::to_allocvec(request).expect("client DTOs are postcard-serializable")
 }
 
 macro_rules! async_port {

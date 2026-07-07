@@ -16,16 +16,17 @@ use crate::{
     bringup::{ExperimentSources, SynthBringupPort},
     config::{config_hash, effective_config},
     experiment::{
-        Control, ExperimentRunner, RunOutcome, RunnerConfig, RunnerHandle, StartMode,
-        StatusSnapshot,
+        Control, ExperimentRunner, RunnerConfig, RunnerHandle, StartMode, StatusSnapshot,
     },
     SyncStoreAccess,
 };
 
 struct ExperimentEntry {
     handle: RunnerHandle,
-    outcome: Arc<Mutex<Option<RunOutcome>>>,
     task: tokio::task::JoinHandle<()>,
+    /// Stall-edge derivation for StreamProgress (window from the effective
+    /// config at start).
+    window_n: u32,
 }
 
 /// Resolves the artifact sources for one experiment (the fake worlds
@@ -45,6 +46,9 @@ where
     sources: SourcesFactory,
     producer_id: String,
     experiments: Mutex<HashMap<String, ExperimentEntry>>,
+    /// Ids currently in bring-up (registry lock is not held across
+    /// ExperimentRunner::start, which can take a while).
+    starting: Mutex<std::collections::HashSet<String>>,
 }
 
 impl<H, S, St, Sy, E> OrchestratorService<H, S, St, Sy, E>
@@ -73,6 +77,38 @@ where
             sources,
             producer_id: producer_id.into(),
             experiments: Mutex::new(HashMap::new()),
+            starting: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Drains every running experiment: sends Stop and awaits a terminal
+    /// state, so each runner writes its final checkpoint (SIGTERM path).
+    pub async fn shutdown(&self) {
+        let handles: Vec<(String, RunnerHandle)> = {
+            let experiments = self.experiments.lock().await;
+            experiments
+                .iter()
+                .filter(|(_, entry)| !entry.task.is_finished())
+                .map(|(id, entry)| (id.clone(), entry.handle.clone()))
+                .collect()
+        };
+        for (_, handle) in &handles {
+            let _ = handle.send(Control::Stop);
+        }
+        for (_, handle) in handles {
+            let mut watch = handle.watch();
+            loop {
+                let state = watch.borrow_and_update().state;
+                if !matches!(
+                    state,
+                    ExperimentState::Running | ExperimentState::Pending | ExperimentState::Paused
+                ) {
+                    break;
+                }
+                if watch.changed().await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -165,22 +201,44 @@ where
             )));
         }
 
-        let mut experiments = self.experiments.lock().await;
-        if let Some(entry) = experiments.get(&request.experiment_id) {
-            let running = !entry.task.is_finished();
-            if running && !request.resume_if_exists {
+        {
+            let experiments = self.experiments.lock().await;
+            if let Some(entry) = experiments.get(&request.experiment_id) {
+                let running = !entry.task.is_finished();
+                if running && !request.resume_if_exists {
+                    return Err(Status::already_exists(format!(
+                        "experiment {} is already running",
+                        request.experiment_id
+                    )));
+                }
+                let snapshot = entry.handle.status();
+                if running {
+                    return Ok(Response::new(wire::StartExperimentResponse {
+                        experiment_id: request.experiment_id,
+                        state: state_to_wire(snapshot.state) as i32,
+                        resumed_at_batch_seq: snapshot.checkpointed_batch_seq,
+                    }));
+                }
+                // Finished id: experiment_id is the idempotency key, so a
+                // resubmit returns the terminal status instead of silently
+                // re-running and overwriting the record (review finding).
+                // resume_if_exists explicitly opts back in.
+                if !request.resume_if_exists {
+                    return Ok(Response::new(wire::StartExperimentResponse {
+                        experiment_id: request.experiment_id,
+                        state: state_to_wire(snapshot.state) as i32,
+                        resumed_at_batch_seq: snapshot.checkpointed_batch_seq,
+                    }));
+                }
+            }
+            // Reserve the id so bring-up can run without holding the
+            // registry lock (bring-up is slow; the lock serialises RPCs).
+            let mut starting = self.starting.lock().await;
+            if !starting.insert(request.experiment_id.clone()) {
                 return Err(Status::already_exists(format!(
-                    "experiment {} is already running",
+                    "experiment {} is already starting",
                     request.experiment_id
                 )));
-            }
-            if running {
-                let snapshot = entry.handle.status();
-                return Ok(Response::new(wire::StartExperimentResponse {
-                    experiment_id: request.experiment_id,
-                    state: state_to_wire(snapshot.state) as i32,
-                    resumed_at_batch_seq: snapshot.checkpointed_batch_seq,
-                }));
             }
         }
 
@@ -189,6 +247,7 @@ where
         } else {
             request.run_id.clone()
         };
+        let window_n = effective.plateau.window_n;
         let runner_config = RunnerConfig {
             experiment_id: request.experiment_id.clone(),
             run_id,
@@ -210,13 +269,18 @@ where
         .await;
         let (runner, handle, mode) = match started {
             Ok(parts) => parts,
-            Err(error) if error.kind() == ClientErrorKind::FailedPrecondition => {
-                return Err(Status::failed_precondition(error.message().to_owned()));
+            Err(error) => {
+                self.starting.lock().await.remove(&request.experiment_id);
+                return Err(match error.kind() {
+                    ClientErrorKind::FailedPrecondition => {
+                        Status::failed_precondition(error.message().to_owned())
+                    }
+                    ClientErrorKind::InvalidRequest => {
+                        Status::invalid_argument(error.message().to_owned())
+                    }
+                    _ => Status::internal(error.message().to_owned()),
+                });
             }
-            Err(error) if error.kind() == ClientErrorKind::InvalidRequest => {
-                return Err(Status::invalid_argument(error.message().to_owned()));
-            }
-            Err(error) => return Err(Status::internal(error.message().to_owned())),
         };
 
         let resumed_at = match mode {
@@ -225,22 +289,21 @@ where
                 checkpoint_batch_seq,
             } => checkpoint_batch_seq,
         };
-        let outcome_slot = Arc::new(Mutex::new(None));
-        let task_slot = Arc::clone(&outcome_slot);
         let task = tokio::spawn(async move {
-            let outcome = runner.run().await;
-            if let Ok(outcome) = outcome {
-                *task_slot.lock().await = Some(outcome);
-            }
+            let _ = runner.run().await;
         });
-        experiments.insert(
-            request.experiment_id.clone(),
-            ExperimentEntry {
-                handle,
-                outcome: outcome_slot,
-                task,
-            },
-        );
+        {
+            let mut experiments = self.experiments.lock().await;
+            experiments.insert(
+                request.experiment_id.clone(),
+                ExperimentEntry {
+                    handle,
+                    task,
+                    window_n,
+                },
+            );
+            self.starting.lock().await.remove(&request.experiment_id);
+        }
 
         Ok(Response::new(wire::StartExperimentResponse {
             experiment_id: request.experiment_id,
@@ -315,12 +378,12 @@ where
         request: Request<wire::StopExperimentRequest>,
     ) -> Result<Response<wire::StopExperimentResponse>, Status> {
         let request = request.into_inner();
-        let (handle, outcome) = {
+        let handle = {
             let experiments = self.experiments.lock().await;
             let entry = experiments.get(&request.experiment_id).ok_or_else(|| {
                 Status::not_found(format!("unknown experiment {}", request.experiment_id))
             })?;
-            (entry.handle.clone(), Arc::clone(&entry.outcome))
+            entry.handle.clone()
         };
         // abandon_inflight: on fakes the drain is bounded, so both stop
         // flavors drain (disclosed; the real cancel path is M6 work).
@@ -334,7 +397,6 @@ where
                 ExperimentState::Running | ExperimentState::Pending | ExperimentState::Paused
             ) {
                 let stats = stats_to_wire(&snapshot);
-                let _ = outcome; // final stats come from the last snapshot
                 return Ok(Response::new(wire::StopExperimentResponse {
                     state: state_to_wire(snapshot.state) as i32,
                     final_stats: Some(stats),
@@ -371,12 +433,12 @@ where
         request: Request<wire::StreamProgressRequest>,
     ) -> Result<Response<Self::StreamProgressStream>, Status> {
         let request = request.into_inner();
-        let (handle, store) = {
+        let (handle, store, window_n) = {
             let experiments = self.experiments.lock().await;
             let entry = experiments.get(&request.experiment_id).ok_or_else(|| {
                 Status::not_found(format!("unknown experiment {}", request.experiment_id))
             })?;
-            (entry.handle.clone(), self.store.clone())
+            (entry.handle.clone(), self.store.clone(), entry.window_n)
         };
         let experiment_id = request.experiment_id.clone();
         let min_interval =
@@ -390,17 +452,19 @@ where
         tokio::spawn(async move {
             let mut watch = handle.watch();
             let mut previous = watch.borrow_and_update().clone();
-            let mut goal_emitted = !previous.goal_nodes.is_empty();
-            // Initial heartbeat (goal re-emitted on reconnect).
+            // Every goal gets its own edge (on_goal = CONTINUE keeps
+            // committing goals after the first); the latch is a count, not
+            // a bool (review finding, both reviewers).
+            let mut goals_emitted = previous.goal_nodes.len();
+            // Initial heartbeat (latest goal re-emitted on reconnect,
+            // API.md §1).
             let mut initial = wire::ProgressEvent {
                 at: Some(now_timestamp()),
                 status: Some(status_to_wire(&experiment_id, &previous)),
                 edge: None,
             };
-            // Goal re-emitted on reconnect (API.md §1).
-            if !previous.goal_nodes.is_empty() {
-                initial.edge = goal_edge(&experiment_id, &previous, &store).await;
-                goal_emitted = true;
+            if let Some(goal) = previous.goal_nodes.last().copied() {
+                initial.edge = goal_edge(&experiment_id, goal, &previous, &store).await;
             }
             if tx.send(Ok(initial)).await.is_err() {
                 return;
@@ -419,9 +483,10 @@ where
                         status: Some(status_to_wire(&experiment_id, &snapshot)),
                         edge: None,
                     };
-                    if !snapshot.goal_nodes.is_empty() && !goal_emitted {
-                        event.edge = goal_edge(&experiment_id, &snapshot, &store).await;
-                        goal_emitted = true;
+                    if snapshot.goal_nodes.len() > goals_emitted {
+                        let goal = snapshot.goal_nodes[goals_emitted];
+                        event.edge = goal_edge(&experiment_id, goal, &snapshot, &store).await;
+                        goals_emitted += 1;
                     } else if snapshot.state == ExperimentState::BudgetExhausted
                         && previous.state != ExperimentState::BudgetExhausted
                     {
@@ -440,6 +505,18 @@ where
                                 to_level: snapshot.escalation_level,
                             },
                         ));
+                    } else if window_n > 0
+                        && snapshot.expansions_since_improvement / u64::from(window_n)
+                            > previous.expansions_since_improvement / u64::from(window_n)
+                    {
+                        // A stall window completed without an escalation
+                        // change (review finding: the StallDetected edge was
+                        // never emitted).
+                        event.edge = Some(wire::progress_event::Edge::Stall(wire::StallDetected {
+                            level: snapshot.escalation_level,
+                            best_score: snapshot.best_score.unwrap_or_default(),
+                            window_n: u64::from(window_n),
+                        }));
                     }
                     if tx.send(Ok(event)).await.is_err() {
                         return;
@@ -462,13 +539,13 @@ where
 
 async fn goal_edge<St>(
     experiment_id: &str,
-    snapshot: &StatusSnapshot,
+    goal: NodeId,
+    _snapshot: &StatusSnapshot,
     store: &St,
 ) -> Option<wire::progress_event::Edge>
 where
     St: AsyncStore,
 {
-    let goal = *snapshot.goal_nodes.first()?;
     let meta = store
         .get_node(GetNodeRequest {
             experiment_id: experiment_id.to_owned(),

@@ -340,7 +340,7 @@ impl GridWorld {
         let room = state.room.id() as usize;
         self.room_base_score[room]
             + f64::from(state.x) * self.room_x_weight[room]
-            + f64::from(GRID_HEIGHT - 1 - state.y) * self.room_y_weight[room]
+            + f64::from((GRID_HEIGHT - 1).saturating_sub(state.y)) * self.room_y_weight[room]
             + if state.has_key() { 25.0 } else { 0.0 }
             + f64::from(self.boss_hp_max().saturating_sub(state.boss_hp)) * 40.0
             + if self.goal_reached(state) {
@@ -572,43 +572,70 @@ mod tests {
     }
 
     #[test]
-    fn world_default_fixture_reproduces_the_original_semantics() {
+    fn world_default_fixture_matches_golden_literals() {
+        // GridState::step delegates to GridWorld::three_room(), so comparing
+        // the two is tautological (review finding). Pin the default world's
+        // observable behavior to golden literals instead: a scripted
+        // full solve, its endpoint identity values, and the score curve.
         let world = GridWorld::three_room();
         assert_eq!(world.initial_state(), GridState::new());
 
-        // Sweep every reachable-ish state cell x action in both engines.
-        for room in [Room::Start, Room::KeyVault, Room::Boss] {
-            for x in 0..GRID_WIDTH {
-                for y in 0..GRID_HEIGHT {
-                    for keys in [0, KEY_BOSS_DOOR] {
-                        for boss_hp in 0..=BOSS_MAX_HP {
-                            let state = GridState {
-                                x,
-                                y,
-                                room,
-                                keys,
-                                boss_hp,
-                            };
-                            for action in [
-                                GridAction::Wait,
-                                GridAction::Up,
-                                GridAction::Down,
-                                GridAction::Left,
-                                GridAction::Right,
-                                GridAction::Attack,
-                            ] {
-                                assert_eq!(
-                                    world.step(state, action),
-                                    state.step(action),
-                                    "state {state:?} action {action:?}"
-                                );
-                            }
-                            assert_eq!(world.goal_reached(state), state.goal_reached());
-                        }
-                    }
-                }
-            }
-        }
+        let solve = [
+            // Start corridor -> key vault
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Right, // door -> KeyVault(0,2)
+            GridAction::Right,
+            GridAction::Right, // (2,2) key
+            GridAction::Left,
+            GridAction::Left,
+            GridAction::Left, // door -> Start(4,2)
+            GridAction::Left,
+            GridAction::Left,
+            GridAction::Up,
+            GridAction::Up, // (2,0) boss door
+            GridAction::Up, // -> Boss(2,4)
+            GridAction::Up,
+            GridAction::Up, // (2,2) boss cell
+            GridAction::Attack,
+            GridAction::Attack,
+            GridAction::Attack, // boss down
+            GridAction::Right,
+            GridAction::Right,
+            GridAction::Up,
+            GridAction::Up, // (4,0) credits
+        ];
+        let solved = world.apply_actions(GridState::new(), &solve);
+        assert!(world.goal_reached(solved));
+        assert_eq!(
+            (solved.room, solved.x, solved.y, solved.keys, solved.boss_hp),
+            (Room::Boss, 4, 0, KEY_BOSS_DOOR, 0)
+        );
+
+        // Golden identity values (stable across refactors; a change here is
+        // a wire-visible break, not a cleanup).
+        assert_eq!(
+            hex(GridState::new().state_hash().as_bytes()),
+            GOLDEN_ROOT_HASH
+        );
+        assert_eq!(hex(solved.state_hash().as_bytes()), GOLDEN_GOAL_HASH);
+        assert_eq!(GridState::new().cell_key().get(), GOLDEN_ROOT_CELL);
+        assert_eq!(solved.cell_key().get(), GOLDEN_GOAL_CELL);
+        assert_eq!(world.progress_score_value(GridState::new()), 2.0);
+        assert_eq!(world.progress_score_value(solved), 1389.0);
+    }
+
+    const GOLDEN_ROOT_HASH: &str =
+        "a58ed52e5e471cabc5fc2bf4c8296911b751673728415242820e881aa23f87a4";
+    const GOLDEN_GOAL_HASH: &str =
+        "39c81415f549e99a4d46781ab7cf807bea304cec7cafa8ad420fbfcab9c2d97f";
+    const GOLDEN_ROOT_CELL: u64 = 844_424_930_131_970;
+    const GOLDEN_GOAL_CELL: u64 = 1_108_101_824_512;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     #[test]

@@ -12,7 +12,11 @@
 //! Synth/store/scorer RPCs use the same backoff via [`retry_rpc`];
 //! `ScoreBatch`'s license is `client_batch_id` dedup replay, `CreateNode`
 //! blind retry is safe (idempotent), and `ProposeBursts` retries go through
-//! the existing fingerprint guard.
+//! the existing fingerprint guard. `PutMetadata` with a generation CAS is
+//! blind-retried as-is: on the fakes a retried attempt re-runs the same
+//! compare; against a real store a lost-ack success would surface as a
+//! spurious generation conflict — the M6 adapter must re-read the
+//! generation between attempts (review finding, disclosed).
 
 use std::{future::Future, time::Duration};
 
@@ -105,8 +109,9 @@ where
 
 /// Same exponential backoff for non-job RPCs (synth/store/scorer). The
 /// closure re-issues the identical request each attempt; idempotency comes
-/// from the callee's contract (batch-id dedup, idempotent CreateNode,
-/// generation re-read for PutMetadata).
+/// from the callee's contract (batch-id dedup, idempotent CreateNode).
+/// CAS'd PutMetadata is NOT generation-re-read between attempts — safe on
+/// the fakes, an M6 adapter concern against a real store.
 pub async fn retry_rpc<T, F, Fut>(policy: &RetryPolicy, mut call: F) -> ClientResult<T>
 where
     F: FnMut() -> Fut,

@@ -41,6 +41,10 @@ impl Gauges {
     }
 
     pub(crate) fn dequeue(depth: &AtomicU64) {
-        depth.fetch_sub(1, Ordering::SeqCst);
+        // Saturating: a decrement racing a failed enqueue must not wrap to
+        // u64::MAX (review finding).
+        let _ = depth.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            Some(value.saturating_sub(1))
+        });
     }
 }

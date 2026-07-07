@@ -55,7 +55,7 @@ impl InMemorySnapshotStore {
     }
 
     #[must_use]
-    pub fn preview_fault(
+    pub fn draw_fault(
         &self,
         operation: &'static str,
         request_identity: &[u8],
@@ -80,7 +80,7 @@ impl InMemorySnapshotStore {
         request_identity: Vec<u8>,
         response_items: u32,
     ) -> ClientResult<FaultDecision> {
-        let decision = self.preview_fault(operation, &request_identity, response_items);
+        let decision = self.draw_fault(operation, &request_identity, response_items);
         self.last_fault.set(Some(decision));
         if let Some(error) = decision.client_error() {
             return Err(error);
@@ -1049,12 +1049,12 @@ mod tests {
                 crate::fault::FaultRate::always(),
                 0,
             ));
-        let same_a = InMemorySnapshotStore::with_fault_plan(plan.clone()).preview_fault(
+        let same_a = InMemorySnapshotStore::with_fault_plan(plan.clone()).draw_fault(
             "query_nodes",
             b"same-request",
             8,
         );
-        let same_b = InMemorySnapshotStore::with_fault_plan(plan.clone()).preview_fault(
+        let same_b = InMemorySnapshotStore::with_fault_plan(plan.clone()).draw_fault(
             "query_nodes",
             b"same-request",
             8,
@@ -1067,7 +1067,7 @@ mod tests {
                     0,
                 )),
         )
-        .preview_fault("query_nodes", b"same-request", 8);
+        .draw_fault("query_nodes", b"same-request", 8);
 
         let baseline = baseline_transcript(InMemorySnapshotStore::new());
         let disabled = baseline_transcript(InMemorySnapshotStore::with_fault_plan(

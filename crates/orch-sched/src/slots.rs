@@ -57,7 +57,7 @@ struct ViewState {
     capacity: u32,
     reserved: u32,
     known: BTreeMap<SlotId, SlotState>,
-    waiters: VecDeque<oneshot::Sender<()>>,
+    waiters: VecDeque<oneshot::Sender<SlotPermit>>,
     worker_class: DeterminismClass,
     busy_integral: Duration,
     capacity_integral: Duration,
@@ -95,18 +95,36 @@ impl ViewState {
             self.last_advance = now;
         }
     }
+}
 
-    fn wake_free_waiters(&mut self) {
-        let mut budget = self.free();
-        while budget > 0 {
-            let Some(waiter) = self.waiters.pop_front() else {
-                break;
-            };
-            // A dropped receiver just consumes the wake; the next release
-            // or drain wakes the following waiter.
-            if waiter.send(()).is_ok() {
-                budget -= 1;
+/// Hands reservations to waiters FIFO: each successfully woken waiter
+/// receives an already-reserved permit, so no later acquirer can steal the
+/// slot between wake and wake-up (review finding, both reviewers). A permit
+/// whose receiver was dropped releases itself via Drop.
+fn wake_free_waiters(state: &Arc<Mutex<ViewState>>) {
+    loop {
+        let permit = {
+            let mut view = state.lock().expect("slot view state poisoned");
+            if view.free() == 0 || view.waiters.is_empty() {
+                return;
             }
+            view.advance_integrals(Instant::now());
+            view.reserved += 1;
+            SlotPermit {
+                state: Arc::clone(state),
+            }
+        };
+        let waiter = {
+            let mut view = state.lock().expect("slot view state poisoned");
+            view.waiters.pop_front()
+        };
+        match waiter {
+            // Send failure (cancelled acquire) drops the permit, which
+            // releases the reservation via Drop and we keep going.
+            Some(sender) => {
+                let _ = sender.send(permit);
+            }
+            None => return,
         }
     }
 }
@@ -209,7 +227,8 @@ impl SlotView {
                 if let Some(capacity) = capacity {
                     view_state.capacity = capacity;
                 }
-                view_state.wake_free_waiters();
+                drop(view_state);
+                wake_free_waiters(&task_state);
             }
         });
 
@@ -219,6 +238,11 @@ impl SlotView {
     /// Suspends until a class-compatible slot is likely free, then reserves
     /// it. Refuses immediately (fixed grep-able reason) on a determinism
     /// class mismatch unless `allow_class_mismatch` was configured.
+    ///
+    /// M6 note: the wait is unbounded — on fakes every slot is always
+    /// eventually released, but a real worker that leaks a slot would park
+    /// acquirers forever. The real transport needs an acquire deadline or a
+    /// starvation watchdog here.
     pub async fn acquire(
         &self,
         required_class: Option<&DeterminismClass>,
@@ -241,8 +265,11 @@ impl SlotView {
                 state.waiters.push_back(sender);
                 receiver
             };
-            // A closed sender (view dropped mid-shutdown) just re-loops.
-            let _ = receiver.await;
+            // FIFO: the waker hands us an already-reserved permit. A closed
+            // sender (view shutting down) re-loops onto the fast path.
+            if let Ok(permit) = receiver.await {
+                return Ok(permit);
+            }
         }
     }
 
@@ -328,10 +355,12 @@ impl std::fmt::Debug for SlotPermit {
 
 impl Drop for SlotPermit {
     fn drop(&mut self) {
-        let mut state = self.state.lock().expect("slot view state poisoned");
-        state.advance_integrals(Instant::now());
-        state.reserved = state.reserved.saturating_sub(1);
-        state.wake_free_waiters();
+        {
+            let mut state = self.state.lock().expect("slot view state poisoned");
+            state.advance_integrals(Instant::now());
+            state.reserved = state.reserved.saturating_sub(1);
+        }
+        wake_free_waiters(&self.state);
     }
 }
 

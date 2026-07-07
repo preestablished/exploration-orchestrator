@@ -76,43 +76,50 @@ async fn queues_cap_at_configured_bounds_under_a_slow_scorer() {
     pipeline.close();
 
     // Slow C stage: every completed batch goes through the slow scorer
-    // before the next result is taken.
+    // before the next result is taken. The whole drain is bounded in
+    // virtual time so a hang-class deadlock fails loudly instead of
+    // hanging the suite (review suggestion; cf. shrink_grow.rs).
     let mut completed = 0u64;
-    while let Some(result) = pipeline.next_completed().await.expect("batch") {
-        let states: Vec<StateInput> = result
-            .jobs
-            .iter()
-            .map(|job| match job {
-                JobOutcome::Completed(job) => StateInput {
-                    node_ref: format!("b{}-j{}", result.seq, job.job_idx),
-                    feature_bytes: job
-                        .capture
-                        .as_ref()
-                        .expect("capture")
-                        .feature_bytes
-                        .clone()
-                        .expect("features"),
-                    framebuffer: None,
-                    fb_meta: None,
-                },
-                JobOutcome::Abandoned { job_idx, reason } => {
-                    panic!("job {job_idx} abandoned: {reason}")
-                }
-            })
-            .collect();
-        harness
-            .scorer
-            .score_batch(ScoreBatchRequest {
-                experiment_id: EXPERIMENT_ID.to_owned(),
-                states,
-                archive_update: ArchiveUpdateMode::ScoreOnly,
-                client_batch_id: format!("b{}", result.seq),
-                return_decoded: false,
-            })
-            .await
-            .expect("score");
-        completed += 1;
-    }
+    let drain = async {
+        while let Some(result) = pipeline.next_completed().await.expect("batch") {
+            let states: Vec<StateInput> = result
+                .jobs
+                .iter()
+                .map(|job| match job {
+                    JobOutcome::Completed(job) => StateInput {
+                        node_ref: format!("b{}-j{}", result.seq, job.job_idx),
+                        feature_bytes: job
+                            .capture
+                            .as_ref()
+                            .expect("capture")
+                            .feature_bytes
+                            .clone()
+                            .expect("features"),
+                        framebuffer: None,
+                        fb_meta: None,
+                    },
+                    JobOutcome::Abandoned { job_idx, reason } => {
+                        panic!("job {job_idx} abandoned: {reason}")
+                    }
+                })
+                .collect();
+            harness
+                .scorer
+                .score_batch(ScoreBatchRequest {
+                    experiment_id: EXPERIMENT_ID.to_owned(),
+                    states,
+                    archive_update: ArchiveUpdateMode::ScoreOnly,
+                    client_batch_id: format!("b{}", result.seq),
+                    return_decoded: false,
+                })
+                .await
+                .expect("score");
+            completed += 1;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(600), drain)
+        .await
+        .expect("backpressure drain must not deadlock");
     assert_eq!(completed, BATCHES);
     producer.await.expect("producer");
 

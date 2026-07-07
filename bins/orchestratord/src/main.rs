@@ -177,7 +177,7 @@ async fn serve_simulate(args: &Args) -> Result<(), String> {
         .unwrap_or_else(|| "127.0.0.1:7131".parse().expect("static addr"));
 
     let world = simulate::SimulatedWorld::new();
-    let service = OrchestratorService::new(
+    let service = std::sync::Arc::new(OrchestratorService::new(
         world.hypervisor.clone(),
         world.scorer.clone(),
         world.store.clone(),
@@ -185,25 +185,32 @@ async fn serve_simulate(args: &Args) -> Result<(), String> {
         SharedSink::new(world.observatory()),
         std::sync::Arc::new(|experiment_id: &str| simulate::sources(experiment_id)),
         producer_id(),
-    );
+    ));
 
     tokio::spawn(serve_http(http));
 
     info!(%listen, %http, "orchestratord --simulate serving");
-    let shutdown = async {
+    // SIGTERM/SIGINT drain: stop every running experiment and wait for its
+    // final checkpoint before the listener shuts down (review finding: the
+    // signal used to only stop the listener, aborting runner tasks with no
+    // final checkpoint).
+    let drain_service = std::sync::Arc::clone(&service);
+    let shutdown = async move {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("sigterm handler");
         tokio::select! {
-            _ = sigterm.recv() => info!("SIGTERM: draining"),
+            _ = sigterm.recv() => info!("SIGTERM: draining experiments"),
             result = tokio::signal::ctrl_c() => {
                 let _ = result;
-                info!("SIGINT: draining");
+                info!("SIGINT: draining experiments");
             }
         }
+        drain_service.shutdown().await;
+        info!("all experiments checkpointed; shutting down");
     };
     Server::builder()
         .add_service(
-            wire::exploration_orchestrator_server::ExplorationOrchestratorServer::new(service),
+            wire::exploration_orchestrator_server::ExplorationOrchestratorServer::from_arc(service),
         )
         .serve_with_shutdown(listen, shutdown)
         .await
@@ -222,11 +229,24 @@ async fn serve_http(addr: SocketAddr) {
         };
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buffer = [0u8; 1024];
-            let Ok(read) = stream.read(&mut buffer).await else {
-                return;
-            };
-            let request = String::from_utf8_lossy(&buffer[..read]);
+            // Read until the end of the request headers (bounded at 8 KiB)
+            // so split TCP reads are not mis-parsed (review finding).
+            let mut buffer = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.windows(4).any(|window| window == b"\r\n\r\n") || buffer.len() >= 8 * 1024
+                {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&buffer);
             let (status, body) = if request.starts_with("GET /healthz") {
                 ("200 OK", "ok\n".to_owned())
             } else if request.starts_with("GET /metrics") {

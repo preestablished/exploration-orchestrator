@@ -398,6 +398,14 @@ impl FaultPlan {
 /// run replayed against a fresh injector stays seed-deterministic. Ops whose
 /// request identity is attempt-invariant (same `client_batch_id`, unit-struct
 /// requests) would otherwise re-draw the identical terminal fault forever.
+///
+/// The counter is deliberately NOT keyed by `request_identity`: interleaved
+/// requests to the same operation therefore shift each other's draws, which
+/// is still deterministic for a fixed call order but means a `LatencyProbe`
+/// holding a mirror injector stays exact only while its call sequence
+/// matches the fake's. Probes tolerate drift (latency is theirs to model);
+/// anything needing exact per-request mirroring should key its own injector
+/// by identity (review note).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FaultInjector {
     plan: FaultPlan,

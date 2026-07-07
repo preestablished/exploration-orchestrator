@@ -169,9 +169,10 @@ impl FakeHypervisor {
                         live_children: 0,
                     },
                 });
-                if let Some(parent_id) = slot.parent {
-                    self.maybe_unfreeze_parent(parent_id);
-                }
+                // No unfreeze here: the parent is itself scheduled for
+                // reclamation on a later pass, and a Frozen -> Paused
+                // transition one step before its Empty event would be a
+                // spurious observation (review finding).
             }
         }
     }
@@ -268,7 +269,7 @@ impl FakeHypervisor {
         }
     }
 
-    fn preview_fault(
+    fn draw_fault(
         &self,
         operation: &'static str,
         request_identity: &[u8],
@@ -286,7 +287,7 @@ impl FakeHypervisor {
         request_identity: Vec<u8>,
         response_items: u32,
     ) -> ClientResult<FaultDecision> {
-        let decision = self.preview_fault(operation, &request_identity, response_items);
+        let decision = self.draw_fault(operation, &request_identity, response_items);
         self.last_fault.set(Some(decision));
         if let Some(error) = decision.client_error() {
             return Err(error);

@@ -89,6 +89,10 @@ impl Pipeline {
     where
         H: AsyncHypervisor + Clone + 'static,
     {
+        debug_assert!(
+            config.mode != SchedMode::Deterministic || config.max_inflight_batches <= 1,
+            "config validation coerces max_inflight_batches to 1 in deterministic mode"
+        );
         let max_inflight = config.max_inflight_batches.max(1) as usize;
         // Submit queue cap: max_inflight_batches - 1 (a queued batch beyond
         // the ones executing), floor 1 so submit->recv still flows.
@@ -162,6 +166,10 @@ impl Pipeline {
 
     /// Feeds one batch into the execute stage; suspends while the bounded
     /// submit queue is full (backpressure into the S stage).
+    ///
+    /// The gauge increments before the (possibly blocking) send on purpose:
+    /// the submit depth counts the blocked producer, which is what the
+    /// backpressure bar's configuration-derived bounds assert against.
     pub async fn submit(&self, batch: Batch) -> ClientResult<()> {
         Gauges::enqueue(
             &self.gauges.queue_depth_submit,
@@ -176,6 +184,10 @@ impl Pipeline {
     /// Next completed batch: completion order in FAST mode, strict `seq`
     /// order in DETERMINISTIC mode. `Ok(None)` means the pipeline drained
     /// (submit side closed and all batches handed back).
+    ///
+    /// DETERMINISTIC contract: submitted seqs must be gap-free from
+    /// `first_seq` — a skipped seq would park the reorder buffer forever
+    /// waiting for a batch that never comes.
     pub async fn next_completed(&mut self) -> ClientResult<Option<BatchResult>> {
         loop {
             if self.mode == SchedMode::Deterministic {
