@@ -22,7 +22,9 @@ use orch_core::{
     types::{FiniteF64, FrameCount, Score},
 };
 
-use crate::fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget};
+use crate::fault::{
+    FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultStats, FaultTarget,
+};
 
 pub const FAKE_SYNTH_VERSION: &str = "fake-synth/0.1";
 pub const MAX_PROPOSE_BURSTS: u32 = 256;
@@ -74,6 +76,11 @@ impl FakeSynth {
     #[must_use]
     pub fn last_fault(&self) -> Option<FaultDecision> {
         self.last_fault.get()
+    }
+
+    #[must_use]
+    pub fn fault_stats(&self) -> FaultStats {
+        self.fault_injector.stats()
     }
 
     #[must_use]

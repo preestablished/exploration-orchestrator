@@ -21,7 +21,7 @@ use orch_clients::{
 use orch_core::types::{FrameCount, GuestInstructions, SnapshotRef};
 
 use crate::{
-    fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget},
+    fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultStats, FaultTarget},
     grid::{GridAction, GridState, GridWorld},
     scorer::encode_grid_features,
 };
@@ -117,6 +117,11 @@ impl FakeHypervisor {
     }
 
     #[must_use]
+    pub fn fault_stats(&self) -> FaultStats {
+        self.fault_injector.stats()
+    }
+
+    #[must_use]
     pub fn deterministic_class(&self) -> &DeterminismClass {
         &self.class
     }
@@ -142,6 +147,18 @@ impl FakeHypervisor {
             .into_iter()
             .filter(|snapshot| !committed_refs.contains(snapshot))
             .collect()
+    }
+
+    /// Drops slot-watch events that have already been consumed by
+    /// `WatchSlots`. Long fake soaks compact this inspection buffer so it
+    /// does not dominate RSS.
+    pub fn compact_consumed_watch_events(&mut self) -> usize {
+        let consumed = self.watch_cursor.get().min(self.watch_events.len());
+        if consumed > 0 {
+            self.watch_events.drain(..consumed);
+            self.watch_cursor.set(0);
+        }
+        consumed
     }
 
     /// Changes the advertised slot pool size mid-run (shrink/grow drills).

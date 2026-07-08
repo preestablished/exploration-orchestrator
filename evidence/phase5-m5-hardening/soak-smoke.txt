@@ -1,17 +1,27 @@
 # M5 Soak smoke Evidence
 
-captured_at_utc: 2026-07-08T18:15:40Z
-commit: de48ff3ca244184db54182472c361960d6be0a3d
+start_utc: 2026-07-08T18:49:41Z
+commit: 8d4536100761d5172b2311ebefaa06486d6da06c
+host: infra-control
 rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
 duration_seconds: 2
 seed: 24069
 fault_seed: 1024369
 k: 64
-fault_plan: hypervisor deterministic latency base=1 jitter=3
+gc_every_commits: 64
+scrape_interval_seconds: 1
+rss_tolerance_percent: 50
+rss_warmup_samples: 2
+fault_plan: deterministic latency base=1 jitter=3 plus one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit
 tier2: not used in this lane
 
 ## command
-$ M5_SOAK_DURATION_SECONDS=2 M5_SOAK_SEED=24069 M5_SOAK_FAULT_SEED=1024369 M5_SOAK_K=64 cargo test -p orch-server --test m5_soak -- --nocapture
-M5_SOAK_SUMMARY duration_seconds=2 k=64 seed=24069 fault_seed=1024369 expansions=29 nodes=33 committed_refs=33 pre_gc_orphans=1182 post_gc_live=33 failed_reason=none
+$ M5_SOAK_DURATION_SECONDS=2 M5_SOAK_SEED=24069 M5_SOAK_FAULT_SEED=1024369 M5_SOAK_K=64 M5_SOAK_GC_EVERY_COMMITS=64 cargo test -p orch-server --test m5_soak -- --nocapture
+end_utc: 2026-07-08T18:49:43Z
+elapsed_wall_seconds: 2
+M5_SOAK_SUMMARY duration_seconds=2 k=64 seed=24069 fault_seed=1024369 config_hash=d763e3f2852681944519911777cc28ef22845fe0565e78f9f28f14c08c109581 expansions=20 nodes=19 committed_refs=19 pre_gc_orphans=817 post_gc_live=19 periodic_gc_runs=0 periodic_gc_orphans=0 periodic_gc_max_orphans=0 watch_events_compacted=0 observatory_events_compacted=0 failed_reason=none
+M5_SOAK_FAULT_COUNTS hypervisor_decisions=6984 hypervisor_latency=6984 hypervisor_terminal=1 scorer_decisions=41 scorer_latency=41 scorer_terminal=1 store_decisions=1428 store_latency=1428 store_terminal=1 synth_decisions=21 synth_latency=21 synth_terminal=1 observatory_decisions=1316 observatory_latency=1316 observatory_terminal=1
 test m5_fault_injected_fake_soak_smoke ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+RSS_SUMMARY samples=2 warmup_omitted=2 evaluated_samples=0 min_kib=0 max_kib=0 delta_percent=0.00
+

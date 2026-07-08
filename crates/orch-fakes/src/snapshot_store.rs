@@ -15,7 +15,9 @@ use orch_clients::{ClientError, ClientErrorKind, ClientResult};
 use orch_core::types::{NodeId, NodeStatus};
 use serde::Serialize;
 
-use crate::fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget};
+use crate::fault::{
+    FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultStats, FaultTarget,
+};
 
 #[derive(Clone, Debug)]
 pub struct InMemorySnapshotStore {
@@ -52,6 +54,11 @@ impl InMemorySnapshotStore {
     #[must_use]
     pub const fn last_fault(&self) -> Option<FaultDecision> {
         self.last_fault.get()
+    }
+
+    #[must_use]
+    pub fn fault_stats(&self) -> FaultStats {
+        self.fault_injector.stats()
     }
 
     #[must_use]

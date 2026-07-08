@@ -181,15 +181,31 @@ impl FakeWorld {
     }
 
     pub fn with_plans(world: GridWorld, hypervisor_plan: FaultPlan) -> Self {
+        Self::with_service_plans(
+            world,
+            hypervisor_plan,
+            FaultPlan::disabled(0),
+            FaultPlan::disabled(0),
+            FaultPlan::disabled(0),
+        )
+    }
+
+    pub fn with_service_plans(
+        world: GridWorld,
+        hypervisor_plan: FaultPlan,
+        scorer_plan: FaultPlan,
+        store_plan: FaultPlan,
+        synth_plan: FaultPlan,
+    ) -> Self {
         Self {
             hypervisor: SyncAdapter::new(FakeHypervisor::with_world_slots_and_fault_plan(
                 world.clone(),
                 8,
                 hypervisor_plan,
             )),
-            scorer: SyncAdapter::new(FakeScorer::with_world(world)),
-            store: SyncAdapter::new(InMemorySnapshotStore::new()),
-            synth: SyncAdapter::new(FakeSynth::new()),
+            scorer: SyncAdapter::new(FakeScorer::with_world_and_fault_plan(world, scorer_plan)),
+            store: SyncAdapter::new(InMemorySnapshotStore::with_fault_plan(store_plan)),
+            synth: SyncAdapter::new(FakeSynth::with_fault_plan(synth_plan)),
         }
     }
 

@@ -8,7 +8,9 @@ use orch_clients::{
     ClientResult,
 };
 
-use crate::fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget};
+use crate::fault::{
+    FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultStats, FaultTarget,
+};
 
 /// In-memory observatory sink. Emits append to an ordered log; the ack
 /// counter tracks the highest contiguous sequence accepted.
@@ -47,6 +49,11 @@ impl FakeObservatory {
         self.last_fault.get()
     }
 
+    #[must_use]
+    pub fn fault_stats(&self) -> FaultStats {
+        self.fault_injector.stats()
+    }
+
     /// Ordered log of every accepted envelope.
     #[must_use]
     pub fn events(&self) -> &[EventEnvelope] {
@@ -60,6 +67,15 @@ impl FakeObservatory {
             .iter()
             .filter(|event| event.event_type == event_type)
             .collect()
+    }
+
+    /// Clears the accepted-envelope inspection log while preserving the ack
+    /// counter. Long fake soaks use this to avoid retaining telemetry that
+    /// has already been acknowledged.
+    pub fn clear_events(&mut self) -> usize {
+        let count = self.events.len();
+        self.events.clear();
+        count
     }
 }
 

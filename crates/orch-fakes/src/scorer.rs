@@ -23,7 +23,7 @@ use orch_core::types::{CellKey, FiniteF64, Novelty, Score, Stage, StateHash};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultTarget},
+    fault::{FaultDecision, FaultInjector, FaultPlan, FaultRequest, FaultStats, FaultTarget},
     grid::{GridState, GridWorld, Room, BOSS_MAX_HP, GRID_HEIGHT, GRID_WIDTH},
 };
 
@@ -87,6 +87,11 @@ impl FakeScorer {
     #[must_use]
     pub fn last_fault(&self) -> Option<FaultDecision> {
         self.last_fault.get()
+    }
+
+    #[must_use]
+    pub fn fault_stats(&self) -> FaultStats {
+        self.fault_injector.stats()
     }
 
     #[must_use]

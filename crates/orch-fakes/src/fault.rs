@@ -293,6 +293,15 @@ impl FaultDecision {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FaultStats {
+    pub decisions_total: u64,
+    pub latency_faults_total: u64,
+    pub terminal_faults_total: u64,
+    pub partial_response_faults_total: u64,
+    pub synth_fingerprint_flip_faults_total: u64,
+}
+
 /// Seed-pure fault plan shared by fake service implementations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FaultPlan {
@@ -303,6 +312,7 @@ pub struct FaultPlan {
     timeout_rate: FaultRate,
     partial_response: PartialResponseFault,
     synth_fingerprint_flip_rate: FaultRate,
+    one_shot_errors: BTreeMap<String, ClientErrorKind>,
 }
 
 impl FaultPlan {
@@ -316,6 +326,7 @@ impl FaultPlan {
             timeout_rate: FaultRate::never(),
             partial_response: PartialResponseFault::disabled(),
             synth_fingerprint_flip_rate: FaultRate::never(),
+            one_shot_errors: BTreeMap::new(),
         }
     }
 
@@ -389,6 +400,16 @@ impl FaultPlan {
         self.synth_fingerprint_flip_rate = rate;
         self
     }
+
+    #[must_use]
+    pub fn with_one_shot_error(
+        mut self,
+        operation: impl Into<String>,
+        kind: ClientErrorKind,
+    ) -> Self {
+        self.one_shot_errors.insert(operation.into(), kind);
+        self
+    }
 }
 
 /// Deterministic fault injector used by fakes at request boundaries.
@@ -410,6 +431,7 @@ impl FaultPlan {
 pub struct FaultInjector {
     plan: FaultPlan,
     attempts: RefCell<BTreeMap<(FaultTarget, String), u64>>,
+    stats: RefCell<FaultStats>,
 }
 
 impl FaultInjector {
@@ -418,12 +440,24 @@ impl FaultInjector {
         Self {
             plan,
             attempts: RefCell::new(BTreeMap::new()),
+            stats: RefCell::new(FaultStats {
+                decisions_total: 0,
+                latency_faults_total: 0,
+                terminal_faults_total: 0,
+                partial_response_faults_total: 0,
+                synth_fingerprint_flip_faults_total: 0,
+            }),
         }
     }
 
     #[must_use]
     pub const fn plan(&self) -> &FaultPlan {
         &self.plan
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> FaultStats {
+        *self.stats.borrow()
     }
 
     /// Decides the fault outcome for one request attempt and consumes the
@@ -439,7 +473,9 @@ impl FaultInjector {
             *counter += 1;
             attempt
         };
-        self.decide_with_attempt(request, response_items, attempt)
+        let decision = self.decide_with_attempt(request, response_items, attempt);
+        self.record_stats(decision);
+        decision
     }
 
     /// Computes the decision the next [`Self::decide`] call for this
@@ -470,12 +506,21 @@ impl FaultInjector {
             FaultChannel::Latency,
         ));
 
-        let terminal = decide_terminal(
-            self.plan.timeout_rate,
-            self.plan.error_rate,
-            self.plan.error_kind,
-            draw_u64(self.plan.seed, request, attempt, FaultChannel::Terminal),
-        );
+        let terminal = if attempt == 1 {
+            self.plan
+                .one_shot_errors
+                .get(request.operation)
+                .copied()
+                .map(FaultTerminal::Error)
+                .unwrap_or(FaultTerminal::None)
+        } else {
+            decide_terminal(
+                self.plan.timeout_rate,
+                self.plan.error_rate,
+                self.plan.error_kind,
+                draw_u64(self.plan.seed, request, attempt, FaultChannel::Terminal),
+            )
+        };
 
         let has_response = matches!(terminal, FaultTerminal::None);
         let partial = has_response
@@ -525,6 +570,25 @@ impl FaultInjector {
             terminal,
             partial,
             synth_fingerprint_flip,
+        }
+    }
+
+    fn record_stats(&self, decision: FaultDecision) {
+        let mut stats = self.stats.borrow_mut();
+        stats.decisions_total = stats.decisions_total.saturating_add(1);
+        if decision.latency_ticks > 0 {
+            stats.latency_faults_total = stats.latency_faults_total.saturating_add(1);
+        }
+        if !matches!(decision.terminal, FaultTerminal::None) {
+            stats.terminal_faults_total = stats.terminal_faults_total.saturating_add(1);
+        }
+        if decision.partial.is_some() {
+            stats.partial_response_faults_total =
+                stats.partial_response_faults_total.saturating_add(1);
+        }
+        if decision.synth_fingerprint_flip.is_some() {
+            stats.synth_fingerprint_flip_faults_total =
+                stats.synth_fingerprint_flip_faults_total.saturating_add(1);
         }
     }
 }
