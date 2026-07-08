@@ -53,11 +53,14 @@ fn bin() -> &'static str {
 /// evidence lane (both set `TIER2_ENABLE=1`), not in every workspace test
 /// sweep.
 fn enabled() -> bool {
-    if std::env::var("TIER2_ENABLE").is_ok() {
-        return true;
+    let on = matches!(
+        std::env::var("TIER2_ENABLE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+    if !on {
+        eprintln!("tier2_chaos: skipped (set TIER2_ENABLE=1 to run)");
     }
-    eprintln!("tier2_chaos: skipped (set TIER2_ENABLE=1 to run)");
-    false
+    on
 }
 
 fn config_yaml(seed: u64) -> String {
@@ -150,6 +153,18 @@ struct Launched {
     child: Child,
     lines: Arc<Mutex<Vec<String>>>,
     receiver: mpsc::Receiver<String>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Launched {
+    /// Wait for the stdout reader thread to drain the pipe to EOF, so a
+    /// subsequent snapshot of `lines` is complete (the child must have
+    /// exited or been killed first, closing the pipe). Idempotent.
+    fn join_reader(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 /// Launch one `orchestratord --experiment` incarnation with the given
@@ -176,7 +191,7 @@ fn launch(yaml: &Path, dir: &Path, envs: &[(&str, String)]) -> Launched {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let (sender, receiver) = mpsc::channel();
     let sink = Arc::clone(&lines);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         for line in std::io::BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             sink.lock().expect("lines mutex").push(line.clone());
@@ -187,6 +202,7 @@ fn launch(yaml: &Path, dir: &Path, envs: &[(&str, String)]) -> Launched {
         child,
         lines,
         receiver,
+        reader: Some(reader),
     }
 }
 
@@ -259,6 +275,10 @@ fn run_to_completion(yaml: &Path, dir: &Path) -> Vec<String> {
                 .collect::<Vec<_>>()
         ),
     }
+    // The child has exited (CleanExit), so the pipe is closed; joining the
+    // reader guarantees every line is in `lines` before we snapshot it (the
+    // torn-write assertion greps this snapshot).
+    launched.join_reader();
     let lines = launched.lines.lock().expect("lines mutex").clone();
     lines
 }
@@ -288,8 +308,10 @@ fn fingerprints_with(
     break_mode: Option<orch_simstate::world::BreakMode>,
 ) -> Fingerprints {
     let (services, _stats) = match break_mode {
-        None => PersistentServices::reload(dir).expect("offline reload"),
-        Some(mode) => PersistentServices::reload_broken(dir, mode).expect("offline broken reload"),
+        None => PersistentServices::reload_readonly(dir).expect("offline reload"),
+        Some(mode) => {
+            PersistentServices::reload_broken_readonly(dir, mode).expect("offline broken reload")
+        }
     };
     let store = services.store.inner();
     assert_no_stranded_frontier(store, EXPERIMENT_ID);
@@ -735,11 +757,25 @@ fn grpc_served_resume_survives_sigkill() {
 
         let killed = runtime.block_on(async {
             let endpoint = format!("http://{listen}");
-            // Wait for the listener.
-            let mut client = loop {
-                match ExplorationOrchestratorClient::connect(endpoint.clone()).await {
-                    Ok(client) => break client,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            // Wait for the listener, but bounded and liveness-checked: a
+            // silent startup failure or a port race must fail fast, not hang
+            // the CI job forever (server stderr is /dev/null).
+            let mut client = {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    if let Ok(client) =
+                        ExplorationOrchestratorClient::connect(endpoint.clone()).await
+                    {
+                        break client;
+                    }
+                    if let Some(status) = server.try_wait().expect("try_wait serve") {
+                        panic!("served process exited before listening: {status:?}");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "served process never became reachable within 30s"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             };
             let response = client
@@ -796,8 +832,10 @@ fn grpc_served_resume_survives_sigkill() {
         // legitimately. Retry on a fresh dir if the poll raced the first
         // real checkpoint write.
         {
+            // Read-only: this guard runs before the relaunch reopens the
+            // same dir, so it must not journal a reclaim into it.
             let (services, _stats) =
-                PersistentServices::reload(&state_dir).expect("offline reload");
+                PersistentServices::reload_readonly(&state_dir).expect("offline reload");
             let checkpoint = services.store.inner().get_metadata(GetMetadataRequest {
                 key: MetadataKey::checkpoint(EXPERIMENT_ID),
             });
@@ -840,10 +878,22 @@ fn grpc_served_resume_survives_sigkill() {
 
         runtime.block_on(async {
             let endpoint = format!("http://{listen2}");
-            let mut client = loop {
-                match ExplorationOrchestratorClient::connect(endpoint.clone()).await {
-                    Ok(client) => break client,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            let mut client = {
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                loop {
+                    if let Ok(client) =
+                        ExplorationOrchestratorClient::connect(endpoint.clone()).await
+                    {
+                        break client;
+                    }
+                    if let Some(status) = server2.try_wait().expect("try_wait relaunch") {
+                        panic!("relaunched process exited before listening: {status:?}");
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "relaunched process never became reachable within 30s"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             };
             let resumed = client

@@ -84,19 +84,23 @@ pub fn assert_no_stranded_frontier(store: &InMemorySnapshotStore, experiment_id:
 }
 
 /// Blake3 over the scorer's committed archive state for one experiment:
-/// archive_seq, feature-map/program hashes, and the sorted cell counts.
-/// Batch caches and fault state are deliberately excluded (idempotency
-/// caches, not committed search state). An absent archive hashes a fixed
-/// empty marker.
+/// archive_seq, feature-map/program hashes, the sorted cell counts, and the
+/// sorted dedup set of committed state-hashes (`seen_hashes`). The set is
+/// hashed in addition to the counts because distinct state-hashes can map
+/// to the same coarse `cell_key`: a resume that commits a different hash
+/// into an equal-count cell leaves `cell_counts` and `archive_seq`
+/// identical while the committed archive genuinely diverges. Batch caches
+/// and fault state are deliberately excluded (idempotency caches, not
+/// committed search state). An absent archive hashes a fixed empty marker.
 #[must_use]
 pub fn scorer_archive_fingerprint(scorer: &FakeScorer, experiment_id: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"orch-simstate/scorer-archive-fingerprint/v1");
+    hasher.update(b"orch-simstate/scorer-archive-fingerprint/v2");
     match scorer.archive_parts(experiment_id) {
         None => {
             hasher.update(b"absent");
         }
-        Some((archive_seq, cell_counts, feature_map_hash, program_hash)) => {
+        Some((archive_seq, cell_counts, seen_hashes, feature_map_hash, program_hash)) => {
             hasher.update(&archive_seq.to_le_bytes());
             match feature_map_hash {
                 Some(digest) => hasher.update(digest.as_bytes()),
@@ -106,9 +110,14 @@ pub fn scorer_archive_fingerprint(scorer: &FakeScorer, experiment_id: &str) -> [
                 Some(digest) => hasher.update(digest.as_bytes()),
                 None => hasher.update(b"no-program"),
             };
+            hasher.update(&(cell_counts.len() as u64).to_le_bytes());
             for (cell_key, count) in cell_counts {
                 hasher.update(&cell_key.get().to_le_bytes());
                 hasher.update(&count.to_le_bytes());
+            }
+            hasher.update(&(seen_hashes.len() as u64).to_le_bytes());
+            for state_hash in seen_hashes {
+                hasher.update(state_hash.as_bytes());
             }
         }
     }

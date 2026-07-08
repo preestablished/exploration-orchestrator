@@ -23,6 +23,14 @@ use crate::records::JournalRecord;
 pub const JOURNAL_FILE: &str = "journal.v1";
 pub const JOURNAL_VERSION: u32 = 1;
 const FRAME_HEADER_LEN: usize = 4 + 8;
+/// Ceiling on a frame's declared payload length. No real journal record
+/// approaches this (grid-world requests are sub-megabyte); a header whose
+/// length field exceeds it cannot be a genuine torn tail (a torn write
+/// keeps the true, small length — only the payload is truncated), so it is
+/// treated as corruption rather than silently swallowing every frame after
+/// it as "torn". Guards the one case the payload checksum can't: a length
+/// field flipped large enough to overrun EOF.
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 /// Truncated blake3: first 8 bytes, little-endian.
 #[must_use]
@@ -106,7 +114,9 @@ impl Journal {
             },
             true,
         )?;
-        File::open(dir)?.sync_data()?;
+        // Parent-directory fsync so the new file's directory entry is
+        // durable (sync_all, not sync_data — the entry is metadata).
+        File::open(dir)?.sync_all()?;
         Ok(journal)
     }
 
@@ -213,6 +223,10 @@ impl Journal {
                     torn_at = Some(offset);
                     break;
                 }
+                FrameParse::CorruptLen { len } => panic!(
+                    "journal {path:?}: implausible frame length {len} at byte {offset} \
+                     (> {MAX_FRAME_LEN}) — corruption, not a torn tail"
+                ),
                 FrameParse::Corrupt { next } => {
                     // Torn tail or mid-file corruption? Decide by attempting
                     // to parse past the bad frame: any valid frame after it
@@ -223,6 +237,10 @@ impl Journal {
                             FrameParse::Ok { .. } => panic!(
                                 "journal {path:?}: corrupt frame at byte {offset} followed by \
                                  valid frames — mid-file corruption, not a torn tail"
+                            ),
+                            FrameParse::CorruptLen { len } => panic!(
+                                "journal {path:?}: implausible frame length {len} at byte {probe} \
+                                 (> {MAX_FRAME_LEN}) — corruption, not a torn tail"
                             ),
                             FrameParse::Corrupt { next } => probe = next,
                             FrameParse::Torn => break,
@@ -266,6 +284,10 @@ enum FrameParse {
     },
     /// Frame runs past EOF — can only be the (expected, torn) tail.
     Torn,
+    /// Length field exceeds `MAX_FRAME_LEN`: unambiguous corruption (a torn
+    /// tail keeps its true small length), so no following frame can be
+    /// recovered — load panics rather than truncating.
+    CorruptLen { len: usize },
     /// Complete-length frame whose checksum or decode fails.
     Corrupt { next: usize },
 }
@@ -277,6 +299,9 @@ fn parse_frame(bytes: &[u8], offset: usize) -> FrameParse {
     }
     let len = u32::from_le_bytes(remaining[..4].try_into().expect("4 bytes")) as usize;
     let checksum = u64::from_le_bytes(remaining[4..12].try_into().expect("8 bytes"));
+    if len > MAX_FRAME_LEN {
+        return FrameParse::CorruptLen { len };
+    }
     if remaining.len() < FRAME_HEADER_LEN + len {
         return FrameParse::Torn;
     }

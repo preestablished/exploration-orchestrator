@@ -48,6 +48,9 @@ jobs:
   # and its failure names itself.
   tier2-chaos-smoke:
     name: tier2-chaos-smoke (${{ matrix.arch }})
+    # Bounded so a hung child (e.g. an unreachable served process) fails
+    # fast instead of burning the 6 h default. The reduced smoke is minutes.
+    timeout-minutes: 30
     strategy:
       matrix:
         include:

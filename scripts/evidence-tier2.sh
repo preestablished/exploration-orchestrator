@@ -5,6 +5,10 @@
 # every kill a real SIGKILL on the orchestratord process; asserts the
 # total kill count >= TIER2_MIN_KILLS. CHAOS_SEED overrides to a single
 # seed (the phases track's fresh-seed spot-check).
+#
+# Exit status reflects the tests: any non-zero `cargo test` (including the
+# in-test kill-quota gate) makes this script exit non-zero, so automation
+# keying on the exit code is not misled by a green-looking manifest.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out=evidence/phase5-tier2-chaos
@@ -26,10 +30,22 @@ min_kills="${TIER2_MIN_KILLS:-50}"
   echo "kill quota asserted: >= $min_kills"
 } > "$out/run-manifest.md"
 
+status_file="$(mktemp)"
+trap 'rm -f "$status_file"' EXIT
+
+# run <display-name> <cmd...> — prints trimmed output, records the *cargo*
+# exit code (not grep's no-match, and never masked by `|| true`).
 run() {
   local name="$1"; shift
   echo "== $name =="
-  "$@" 2>&1 | grep -E "^test |test result|TIER2_" || true
+  set +e
+  "$@" 2>&1 | grep -E "^test |test result|TIER2_"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "== $name FAILED (cargo exit $rc) =="
+  fi
+  echo "$rc" >> "$status_file"
 }
 
 {
@@ -46,5 +62,10 @@ run() {
     cargo test -p orchestratord --test tier2_chaos -- --nocapture \
       negative_control_detects_divergence
 } | tee "$out/negative-control.txt"
+
+if grep -qvE '^0$' "$status_file"; then
+  echo "evidence run FAILED — a test invocation exited non-zero (see $out/*.txt)" >&2
+  exit 1
+fi
 
 echo "evidence written to $out/"

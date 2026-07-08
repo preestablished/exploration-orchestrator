@@ -435,21 +435,45 @@ impl PersistentServices {
     /// fresh fakes, digest-checking each against its `Applied` frame (the
     /// tripwire for hidden nondeterminism in the fakes), then reclaims the
     /// dead incarnation's sessions (D-T4) and reopens the journal for
-    /// appending.
+    /// appending. This is the **live resume** path — the returned world is
+    /// journal-backed and drivable, and the reclaim is journaled so the next
+    /// incarnation reproduces it.
     pub fn reload(dir: &Path) -> std::io::Result<(Self, LoadStats)> {
-        Self::reload_inner(dir, None)
+        Self::reload_inner(dir, None, false)
     }
 
     /// [`Self::reload`] with a deliberate divergence for the negative
     /// control (W2.5). Digest checks are skipped: the mutation exists to
     /// diverge, and the end-state comparator is what must catch it.
     pub fn reload_broken(dir: &Path, mode: BreakMode) -> std::io::Result<(Self, LoadStats)> {
-        Self::reload_inner(dir, Some(mode))
+        Self::reload_inner(dir, Some(mode), false)
+    }
+
+    /// Read-only reconstruction for end-state inspection (comparators). Unlike
+    /// [`Self::reload`] it has **no on-disk side effect**: it neither reclaims
+    /// sessions nor journals anything, so computing a fingerprint is
+    /// idempotent and never grows a never-crashed control run's journal. The
+    /// returned world is journal-less (do not drive it further).
+    pub fn reload_readonly(dir: &Path) -> std::io::Result<(Self, LoadStats)> {
+        Self::reload_inner(dir, None, true)
+    }
+
+    /// [`Self::reload_readonly`] re-applying a break mode — reads back a
+    /// deliberately-broken state-dir for the negative control without
+    /// mutating it (the broken run journaled its post-resume ops against
+    /// perturbed state, so a plain read-only replay would trip the digest
+    /// tripwire; re-applying the mutation reconstructs the divergent state).
+    pub fn reload_broken_readonly(
+        dir: &Path,
+        mode: BreakMode,
+    ) -> std::io::Result<(Self, LoadStats)> {
+        Self::reload_inner(dir, Some(mode), true)
     }
 
     fn reload_inner(
         dir: &Path,
         break_mode: Option<BreakMode>,
+        readonly: bool,
     ) -> std::io::Result<(Self, LoadStats)> {
         let (records, stats) = Journal::load(dir)?;
         let (mut hypervisor, mut scorer, mut store, mut synth) = fresh_fakes();
@@ -607,6 +631,25 @@ impl PersistentServices {
                     check(*op_id, digest_response(&synth.mine_macros(request.clone())));
                 }
             }
+        }
+
+        // Read-only inspection stops here: no reclaim, no journal append, no
+        // reopen — a fingerprint read must not mutate the state-dir (C3).
+        // The returned world is journal-less and must not be driven further.
+        if readonly {
+            println!(
+                "TIER2_SIM_RELOAD readonly frames={} truncated_bytes={}",
+                stats.frames, stats.truncated_bytes
+            );
+            return Ok((
+                Self {
+                    hypervisor: Persistent::new(hypervisor, None),
+                    scorer: Persistent::new(scorer, None),
+                    store: Persistent::new(store, None),
+                    synth: Persistent::new(synth, None),
+                },
+                stats,
+            ));
         }
 
         // The worker observing the dead incarnation's connection drop —

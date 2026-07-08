@@ -110,9 +110,12 @@ impl FakeScorer {
     }
 
     /// Comparator accessor (Tier-2): the archive fields that define committed
-    /// scorer state — `(archive_seq, cell_counts, feature_map_hash,
-    /// program_hash)`. `orch-simstate`'s `scorer_archive_fingerprint` hashes
-    /// these; batch caches and fault state are deliberately excluded.
+    /// scorer state — `(archive_seq, cell_counts, seen_hashes,
+    /// feature_map_hash, program_hash)`. `orch-simstate`'s
+    /// `scorer_archive_fingerprint` hashes these; batch caches and fault
+    /// state are deliberately excluded. `seen_hashes` is the dedup set of
+    /// committed state-hashes — distinct hashes can share a `cell_key`, so
+    /// `cell_counts` alone does not pin the committed archive.
     #[must_use]
     #[allow(clippy::type_complexity)]
     pub fn archive_parts(
@@ -121,6 +124,7 @@ impl FakeScorer {
     ) -> Option<(
         u64,
         &BTreeMap<CellKey, u32>,
+        &BTreeSet<StateHash>,
         Option<Digest32>,
         Option<Digest32>,
     )> {
@@ -128,6 +132,7 @@ impl FakeScorer {
             (
                 archive.archive_seq,
                 &archive.cell_counts,
+                &archive.seen_hashes,
                 archive.feature_map_hash,
                 archive.program_hash,
             )

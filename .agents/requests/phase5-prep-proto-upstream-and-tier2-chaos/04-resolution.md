@@ -173,6 +173,52 @@ their `origin/main` (their resolution:
     upstream-before-tag — held. The breaking-gate demonstration ran on
     their side (scratch branch `scratch/proto-breaking-scorer-return-decoded`).
 
+## Post-landing review pass (two independent reviewers)
+
+After landing, two independent code reviews ran — one on
+crash-consistency/correctness soundness, one on test-design/adversarial
+robustness. Both confirmed the core anti-vacuity guards are sound (torn
+truncation cannot silently pass; the negative control is a genuine
+two-sided demonstration; the kill quota tracks real SIGKILLs at the
+claimed sites; journaling completeness and op-id/replay linearization
+are correct). The accepted findings were applied:
+
+- **Comparator hole (correctness, HIGH):** `scorer_archive_fingerprint`
+  omitted `seen_hashes` — distinct state-hashes can share a coarse
+  `cell_key`, so `cell_counts`+`archive_seq` could match while the
+  committed dedup set diverged. Now folded in (fingerprint bumped to
+  `…/v2`); `FakeScorer::archive_parts` exposes the set.
+- **gRPC connect hang (test-design, HIGH):** the served-resume smoke's
+  two connect loops were unbounded and unchecked — a silent startup
+  failure or a port race would hang CI, not fail fast. Now both loops
+  carry a 30 s deadline and a `Child::try_wait` liveness check; the CI
+  job gains `timeout-minutes: 30`.
+- **Evidence script masked failures (test-design):** `evidence-tier2.sh`
+  `| grep … || true` swallowed a non-zero `cargo test` (including the
+  in-test kill-quota gate). It now captures the cargo exit via
+  `PIPESTATUS` and exits non-zero if any invocation failed.
+- **Journal length-field blindness (correctness, MED):** a corrupt
+  length field could misclassify corruption as a torn tail and silently
+  truncate committed frames. Added a `MAX_FRAME_LEN` sanity cap that
+  panics (corruption) rather than truncating; the in-bounds case was
+  already caught by the payload checksum, and the past-EOF ambiguity is
+  inherent to any append-log torn-tail model (out of the SIGKILL threat
+  model — committed frames are fsynced and intact).
+- **Read-only reload (correctness, MED/LOW):** computing a fingerprint
+  via `reload` journaled a `ReclaimSession` into the state-dir, a
+  durable side effect on a read. Added `reload_readonly` /
+  `reload_broken_readonly` (no reclaim, no journal append); the
+  comparator and the gRPC offline guard use them.
+- **Minor (test-design/correctness):** directory durability uses
+  `sync_all` not `sync_data`; `run_to_completion` joins the stdout
+  reader thread before snapshotting; `enabled()` is a truthy check
+  (`TIER2_ENABLE=0` no longer counts as enabled).
+
+Deliberately not changed: `store_tree_hash`'s field set — it is the
+Tier-1 comparator extracted verbatim (W2.1 "assertions identical");
+narrowing/widening it would alter Tier-1's bar. The full evidence lane
+was re-run after these fixes; the numbers below are from that re-run.
+
 ## Phases-track handoff
 
 Per `03-verification-offer.md`: respond with `05-verification.md` after
