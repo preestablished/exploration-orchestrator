@@ -167,6 +167,44 @@ impl Launched {
     }
 }
 
+impl Drop for Launched {
+    /// Backstop reap: if a round panics (e.g. `wait_marker_or_exit` hitting
+    /// its timeout while the child is parked at a hang hook), unwinding must
+    /// not leak the child process. Kill+wait are idempotent on an
+    /// already-reaped child, so this is harmless on the normal paths.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Kill-on-drop wrapper for the served-gRPC processes (plain `Child`, not
+/// `Launched`). A panic in the smoke — an assertion between spawn and the
+/// explicit stop — would otherwise leak a listening daemon (this exact leak
+/// stranded an `orchestratord --simulate` for hours after an early failed
+/// run). Deref exposes the `Child` for `try_wait`/`kill`.
+struct ChildGuard(Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Launch one `orchestratord --experiment` incarnation with the given
 /// extra env hooks, stdout piped through a reader thread.
 fn launch(yaml: &Path, dir: &Path, envs: &[(&str, String)]) -> Launched {
@@ -753,7 +791,7 @@ fn grpc_served_resume_survives_sigkill() {
             .env_remove("ORCH_SIM_BREAK")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut server = serve.spawn().expect("spawn serve");
+        let mut server = ChildGuard(serve.spawn().expect("spawn serve"));
 
         let killed = runtime.block_on(async {
             let endpoint = format!("http://{listen}");
@@ -874,7 +912,7 @@ fn grpc_served_resume_survives_sigkill() {
             .env_remove("ORCH_SIM_BREAK")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut server2 = serve2.spawn().expect("spawn relaunch");
+        let mut server2 = ChildGuard(serve2.spawn().expect("spawn relaunch"));
 
         runtime.block_on(async {
             let endpoint = format!("http://{listen2}");

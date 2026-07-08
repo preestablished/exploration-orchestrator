@@ -213,6 +213,14 @@ are correct). The accepted findings were applied:
   `sync_all` not `sync_data`; `run_to_completion` joins the stdout
   reader thread before snapshotting; `enabled()` is a truthy check
   (`TIER2_ENABLE=0` no longer counts as enabled).
+- **Process-leak guard (test-design, follow-up):** the served-gRPC test
+  spawns a daemon and only kills it on the happy path, so a panic
+  between spawn and stop leaked a listening `orchestratord` (observed —
+  an early failed run stranded one for hours). Added kill-on-drop
+  guards: `ChildGuard` for the gRPC servers and a `Drop` on `Launched`
+  for the `--experiment` children, so unwinding always reaps the
+  process. Validated: negative-control + gRPC pass with the guards and
+  leave zero stray processes.
 
 Deliberately not changed: `store_tree_hash`'s field set — it is the
 Tier-1 comparator extracted verbatim (W2.1 "assertions identical");
