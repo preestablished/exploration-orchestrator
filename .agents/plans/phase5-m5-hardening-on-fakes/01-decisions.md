@@ -10,8 +10,8 @@ staying inside the current fakes-first architecture.
 - Config rejection strings: field-scoped validation messages used by gRPC
   `StartExperiment` (`INVALID_ARGUMENT`) and standalone YAML (`orchestratord
   --experiment` failure). These are not runtime failure reasons.
-- Runtime `FAILED` reason strings: stable prefixes used when an experiment
-  transitions to `ExperimentState::Failed`.
+- Runtime terminal reason strings: stable prefixes used when an experiment
+  reaches a terminal state, with a clearly identified `FAILED` subset.
 
 The config string constants should live next to the owning validator
 (`orch-core::types` may keep `ConfigError`, but expose a stable catalog). The
@@ -22,7 +22,7 @@ least-churn option because both crates already depend on `orch-core`.
 Committed docs should be generated or asserted from the constant lists:
 
 - `docs/config-validation-rejections.md`
-- `docs/runtime-failed-reasons.md`
+- `docs/runtime-terminal-reasons.md`
 
 Tests compare the docs' string lists to the code constants. Drift fails CI.
 
@@ -83,22 +83,27 @@ The current `serve_http` function returns only `orchestratord_up 1`; M5 replaces
 that placeholder. Keep the responder plain HTTP for now. Pulling in a web
 framework for two endpoints is unnecessary.
 
-## D5.5 - CAS ownership loss is detected before tree writes and at checkpoint CAS
+## D5.5 - CAS ownership loss is detected before local commit mutation and at checkpoint CAS
 
-**Decision:** add an ownership guard before node-store writes in the commit path,
-and keep the existing CAS check on checkpoint `PutMetadata`.
+**Decision:** add an ownership guard before local C-stage commit mutation, and
+keep the existing CAS check on checkpoint `PutMetadata`.
 
 Mechanically: once the runner has a checkpoint generation, `ensure_checkpoint_owner`
 can `GetMetadata(orch/ckpt/<exp>)` and compare the generation to
 `self.ckpt_generation`. If it differs or the key is absent, fail with
-`checkpoint-cas-ownership-lost`. Call this guard immediately before the C-stage
-starts creating/updating tree nodes. The checkpoint path still detects the race
-where a competing writer wins after the guard but before `PutMetadata`.
+`checkpoint-cas-ownership-lost`. Call this guard immediately before
+`commit_batch(...)` or any replay-commit path mutates in-memory tree/frontier
+state, not merely before `CreateNode`. The checkpoint path still detects the
+race where a competing writer wins after the guard but before `PutMetadata`.
+Once ownership loss is classified, the runner must not attempt the normal final
+checkpoint/archive path; that would be another stale-writer write after losing
+the single-writer CAS.
 
 This satisfies both requested windows:
 
-- Node-commit window: takeover before C-stage writes, loser fails before
-  `CreateNode`.
+- Node-commit window: takeover before C-stage commit, loser fails before local
+  tree mutation, `CreateNode`, `UpdateNodes`, `ReplayCommits`, or final
+  checkpoint/archive writes.
 - Checkpoint-write window: takeover right before checkpoint CAS, loser fails on
   `PutMetadata`.
 
@@ -133,11 +138,14 @@ inspect the fake world after Stop:
 
 - committed node snapshot refs from `InMemorySnapshotStore::query_nodes`
 - all known fake hypervisor snapshots from a new inspection method
-- optional fake GC/retention helper that removes unreferenced snapshots
+- mandatory fake GC/retention helper such as
+  `retain_live_snapshots(committed_refs)` that removes unreferenced snapshots
 
 The invariant is: after Stop and fake GC, live snapshots equal exactly the set of
 committed node refs; discarded children are absent from that live set and are
-listed as unreferenced orphans before GC.
+listed as unreferenced orphans before GC. Because the soak acceptance depends on
+the post-GC equality assertion, the inspection and retention APIs are required,
+not optional.
 
 **Rejected:** RSS-only leak assertions. The request explicitly says RSS-flat
 alone does not pass.

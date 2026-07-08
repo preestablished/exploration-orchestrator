@@ -53,7 +53,7 @@ W5.0 bead filing and doc correction
   -> W5.1 string modules and docs generated from constants
   -> W5.2 full wire/core/YAML config matrix
   -> W5.3 shared served/standalone validator
-  -> W5.4 feature-map decoded_features validation
+  -> W5.4 feature-map decoded_features validation/materialization
   -> W5.5 config evidence diff
 
 W5.6 metrics source/renderer
@@ -90,7 +90,7 @@ MET=$(bd create --title="M5 Prometheus metrics completeness" \
   --description="Implement W5.6-W5.8: ARCHITECTURE section 10 metric surface including observatory drops, renderer, /metrics wiring, and completeness test." \
   --type=task --priority=1 --silent)
 CAS=$(bd create --title="M5 CAS ownership-loss path" \
-  --description="Implement W5.9-W5.11: competing-writer fault scenarios for checkpoint-CAS and node-commit windows, stable FAILED reason, no post-loss writes." \
+  --description="Implement W5.9-W5.11: competing-writer fault scenarios for checkpoint-CAS and node-commit windows, stable FAILED reason, and no stale loser writes after ownership loss." \
   --type=task --priority=1 --silent)
 SOAK=$(bd create --title="M5 24h fault-injected fake soak and runbook" \
   --description="Implement W5.12-W5.16: K=64 soak harness, CI smoke using same binary, leak and snapshot-refcount/GC assertions, evidence, runbook, resolution." \

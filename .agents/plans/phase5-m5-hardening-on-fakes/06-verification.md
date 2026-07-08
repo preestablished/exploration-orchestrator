@@ -9,7 +9,7 @@
 | Metrics complete per ARCHITECTURE section 10 with before/after diff | W5.6-W5.8 | `metrics-diff.txt`, metrics tests |
 | CAS covers checkpoint-write and node-commit windows | W5.9-W5.11 | `cas-ownership.txt`, runtime reason runbook |
 | 24 h K=64 fault-injected soak with leak/GC assertions and CI smoke | W5.12-W5.16 | `soak-24h.txt`, `soak-smoke.txt`, `run-manifest.md` |
-| Soak runbook lists every FAILED reason string | W5.15 | `docs/runtime-failed-reasons.md`, `failed-reason-census.txt` |
+| Soak runbook lists every FAILED reason string | W5.15 | `docs/runtime-terminal-reasons.md`, `failed-reason-census.txt` |
 
 ## CI changes
 
@@ -59,7 +59,8 @@ Make that easy:
 
 - Keep test names stable and documented in the resolution.
 - Add env vars for forcing each runtime FAILED reason where possible.
-- Make `docs/runtime-failed-reasons.md` grep-able by prefix.
+- Make `docs/runtime-terminal-reasons.md` grep-able by prefix, with a clear
+  `FAILED` subset section.
 
 ## Final handback shape
 

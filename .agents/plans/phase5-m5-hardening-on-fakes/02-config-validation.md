@@ -29,11 +29,14 @@ Acceptance:
 ## W5.2 - Build the API.md section 7 invalid-shape matrix
 
 Add table-driven tests that cover every field/oneof in the schema. Recommended
-test locations:
+test split:
 
-- `crates/orch-core/tests/config_matrix.rs` for core/effective validation.
-- `crates/orch-server/tests/config_validation_surface.rs` for gRPC/YAML surface
-  behavior.
+- `crates/orch-core/tests/config_matrix.rs` for materialized core
+  `ExperimentConfig` validation only.
+- `crates/orch-server/tests/config_validation_surface.rs` for wire/defaulting,
+  sparse enum validation, effective-config materialization, gRPC, and YAML
+  behavior. `effective_config` lives in `orch-server`, so do not put wire
+  semantics in `orch-core` tests.
 
 Minimum invalid cases:
 
@@ -47,7 +50,7 @@ Minimum invalid cases:
 | `synth_config_ref` | empty |
 | `macro_pack_refs` | malformed/empty entry if the implementation chooses to reject empty refs; otherwise document that repeated string entries are opaque refs and not locally validated |
 | `budgets.max_nodes` | no invalid local shape if `0 = unlimited`; assert explicit zero survives defaulting |
-| `budgets.max_wall_clock_s` | no invalid local shape if `0 = unlimited`; assert explicit zero survives defaulting |
+| `budgets.max_wall_clock_s` | API.md defines default `86_400` and does not define `0 = unlimited`; either reject explicit zero when the budgets submessage is present, or record an API.md correction before freezing current behavior |
 | `budgets.max_guest_instructions` | no invalid local shape if `0 = unlimited` |
 | `budgets.max_expansions` | no invalid local shape if `0 = unlimited` |
 | `selection.policy` | unknown enum number |
@@ -78,8 +81,8 @@ Minimum invalid cases:
 | `scheduling.mode` | unknown enum number |
 | `scheduling.max_inflight_batches` | `0` in FAST if expressible; verify DETERMINISTIC coerces to 1 |
 | `scheduling.job_timeout_s` | effective zero if expressible |
-| `scheduling.retry_max` | decide and document whether zero means no retries or invalid; test the chosen semantics |
-| `scheduling.retry_backoff_ms` | decide and document whether zero means immediate retry or invalid; test the chosen semantics |
+| `scheduling.retry_max` | not rejectable over proto3 v1 if zero keeps defaulting; assert the defaulting behavior or record an API correction before changing it |
+| `scheduling.retry_backoff_ms` | not rejectable over proto3 v1 if zero keeps defaulting; assert the defaulting behavior or record an API correction before changing it |
 | `scheduling.hypervisor_endpoints` | empty entry if local validation treats endpoints as non-empty strings; otherwise document they are resolved by service config |
 | `scheduling.allow_class_mismatch` | boolean, no invalid local shape |
 | `checkpoint.every_commits` | effective zero if expressible |
@@ -116,16 +119,31 @@ Acceptance:
 - One shared helper formats validation violations for both paths.
 - The surface test fails if gRPC and YAML diverge on details.
 
-## W5.4 - Validate `decoded_features` against the compiled feature map
+## W5.4 - Validate and materialize `decoded_features`
 
 API.md section 7 requires every configured decoded feature name to exist in the feature
-map. This is not pure `ExperimentConfig` validation because it needs the compiled
-map. Add a bring-up validation step after feature-map compilation and before the
-runner starts issuing work.
+map, and says an empty list defaults to a documented subset rather than "request
+no decoded features." This is not pure `ExperimentConfig` validation because it
+needs the compiled map. Add a bring-up validation/materialization step after
+feature-map compilation and before the runner starts issuing work.
+
+Required behavior:
+
+- If `decoded_features` is empty, materialize the API.md default subset: every
+  feature with declared semantics `position_x`, `position_y`, or `room_id`, plus
+  features named in grid discretize blocks. If that rule is no longer desired,
+  record an explicit API.md correction in the resolution before freezing current
+  "empty means none" behavior.
+- If `decoded_features` is non-empty, reject any name that does not exist in the
+  compiled feature map.
+- Once materialized, use the same selected set for `ScoreBatch.return_decoded`,
+  persisted node attrs, and node-added event payloads.
 
 Acceptance:
 
 - A config with `decoded_features: ["does_not_exist"]` fails before the loop.
+- Empty `decoded_features` produces the documented default subset, or the
+  resolution records the API correction and tests the chosen behavior.
 - The failure is `INVALID_ARGUMENT` over gRPC and a standalone config error over
   `--experiment`.
 - The exact field/message is in the config rejection doc.

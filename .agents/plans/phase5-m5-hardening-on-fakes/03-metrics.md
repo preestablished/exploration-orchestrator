@@ -26,23 +26,32 @@ Add a catalog in code for the required metric families:
 - `orch_batch_latency_seconds{stage="commit"}`
 - `orch_observatory_dropped_total`
 
-Implement a renderer in `orch-server` that emits Prometheus text. Keep the
-renderer dependency-light; a hand-written renderer is fine if tests parse the
-output. The renderer should accept a `MetricsSnapshot` that can be populated
-from:
+Add an explicit shared `MetricsRegistry` or equivalent snapshot path. It must be
+passed into `ExperimentRunner`, `Pipeline::spawn`/`PipelineConfig`,
+`EventEmitter`, `OrchestratorService`, and `serve_http`; current handles expose
+status only, pipeline gauges are local to `Pipeline::spawn`, and `/metrics`
+currently has no service/registry handle. Implement a renderer in `orch-server`
+that emits Prometheus text from that registry. Keep the renderer
+dependency-light; a hand-written renderer is fine if tests parse the output.
+The registry/snapshot should be populated from:
 
 - `StatusSnapshot` for expansions, nodes, frontier, best score, escalation,
   discarded children, and guest instruction stats.
-- Scheduler `Gauges` for queue depths, job failures, and execute latency.
+- Scheduler `Gauges` for queue depths, job failures, and execute latency, wired
+  from the same shared registry rather than lost inside the pipeline.
+- New select-stage and commit-stage latency observations around request build /
+  policy selection and C-stage commit work.
 - `SlotView::utilization()` or a runner-owned sample for slot utilization.
-- `EventEmitter::dropped_total()` / shared sink or an explicit atomic for
-  observatory drops.
+- `EventEmitter::dropped_total()` / shared sink or an explicit atomic in the
+  registry for observatory drops.
 - Scorer/archive state for `orch_archive_cells`, if available; otherwise add
   runner bookkeeping when `ScoreBatch`/`ReplayCommits` updates the archive.
 
 Acceptance:
 
 - The catalog is code-visible and reused by tests.
+- The metrics registry is reachable from the runner, pipeline, event emitter,
+  served service, and HTTP responder without global mutable state.
 - The renderer emits `# HELP`/`# TYPE` lines and numeric samples for every family.
 - Histograms include `_bucket`, `_sum`, and `_count` for all required stages.
 

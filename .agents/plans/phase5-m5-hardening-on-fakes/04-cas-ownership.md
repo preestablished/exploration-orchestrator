@@ -17,11 +17,16 @@ Behavior:
 - If it differs, is absent, or returns a CAS-style precondition conflict, fail
   with `checkpoint-cas-ownership-lost: ...`.
 - If the read has a retryable transient error, use the normal retry policy.
+- Mark ownership-loss errors as a special terminal class that skips the normal
+  final checkpoint/archive attempt in `run()`. A stale loser must not write one
+  more checkpoint after it has discovered that another writer owns the key.
 
 Call sites:
 
-- Immediately before C-stage tree writes (`CreateNode`, `UpdateNodes`,
-  `ReplayCommits`) for the node-commit window.
+- Immediately before local C-stage mutation (`commit_batch(...)`,
+  replay-commit adoption/insertion, or any tree/frontier/seen mutation) for the
+  node-commit window. Guarding only `CreateNode` is too late because the runner
+  mutates in-memory commit state before store writes.
 - Existing checkpoint `PutMetadata` remains the checkpoint-window guard.
 
 Add a test-only fault hook that can perform a competing metadata write at a named
@@ -33,6 +38,7 @@ Acceptance:
 - Ownership-loss errors use the central runtime reason constant.
 - The loser transitions to `ExperimentState::Failed` and publishes the reason.
 - No generic store error leaks to the user for the intended CAS path.
+- The final-checkpoint path is suppressed for ownership-loss failures.
 
 ## W5.10 - Checkpoint-write window scenario
 
@@ -54,9 +60,9 @@ Assertions:
 
 - Outcome state is `Failed`.
 - `failure_reason` starts with `checkpoint-cas-ownership-lost`.
-- The reason appears in `docs/runtime-failed-reasons.md`.
-- No writes occur after the failed CAS. Count store mutating operations before
-  and after if needed.
+- The reason appears in the `FAILED` subset of `docs/runtime-terminal-reasons.md`.
+- No loser writes occur after the failed CAS, including final checkpoint/archive
+  writes. Count store/scorer mutating operations before and after if needed.
 
 ## W5.11 - Node-commit window scenario
 
@@ -67,7 +73,8 @@ Recommended shape:
 
 - Inject takeover just before the C-stage tree-write block.
 - The new ownership guard must detect the generation mismatch before the loser
-  calls `CreateNode`.
+  calls `commit_batch(...)`, mutates local tree/frontier/seen state, or calls
+  `CreateNode`.
 - Instrument the fake store or persistent journal to count `create_node`,
   `update_nodes`, `put_metadata`, and `delete_metadata` operations by writer
   incarnation.
@@ -75,8 +82,9 @@ Recommended shape:
 Assertions:
 
 - The stale runner fails with `checkpoint-cas-ownership-lost`.
-- There are zero loser `CreateNode`/`UpdateNodes`/`ReplayCommits` calls after the
-  takeover injection point.
+- There are zero loser local commit mutations, `CreateNode`/`UpdateNodes`/
+  `ReplayCommits` calls, or final checkpoint/archive writes after the takeover
+  injection point.
 - The checkpoint key generation remains the competitor's generation.
 - A fresh runner can resume from the winner's checkpoint or, if the test uses a
   sentinel payload, the failure is explicitly limited to the loser path and does
