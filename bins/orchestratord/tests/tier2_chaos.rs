@@ -438,9 +438,12 @@ fn random_round(context: &SeedContext, index: u32, kills: &AtomicU32) {
     panic!("random round could not land a kill in 16 attempts");
 }
 
+/// A single unit of parallel work (borrows harness locals for its lifetime).
+type Job<'a> = Box<dyn FnOnce() + Send + 'a>;
+
 /// Runs closures across a small worker pool; propagates the first panic.
-fn run_parallel<'jobs>(jobs: Vec<Box<dyn FnOnce() + Send + 'jobs>>, workers: usize) {
-    let jobs: Vec<Mutex<Option<Box<dyn FnOnce() + Send + 'jobs>>>> =
+fn run_parallel(jobs: Vec<Job<'_>>, workers: usize) {
+    let jobs: Vec<Mutex<Option<Job<'_>>>> =
         jobs.into_iter().map(|job| Mutex::new(Some(job))).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -481,12 +484,12 @@ fn tier2_kill_matrix_resumes_bit_identically() {
     let contexts: Vec<SeedContext> = {
         let results: Vec<Mutex<Option<SeedContext>>> =
             seeds().iter().map(|_| Mutex::new(None)).collect();
-        let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = seeds()
+        let jobs: Vec<Job<'_>> = seeds()
             .into_iter()
             .zip(results.iter())
             .map(|(seed, slot)| {
                 let base = base.path().to_path_buf();
-                let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+                let job: Job<'_> = Box::new(move || {
                     *slot.lock().expect("slot") = Some(seed_context(&base, seed));
                 });
                 job
@@ -500,10 +503,10 @@ fn tier2_kill_matrix_resumes_bit_identically() {
     };
 
     // Phase 2: all kill rounds, in parallel across independent state-dirs.
-    let mut jobs: Vec<Box<dyn FnOnce() + Send + '_>> = Vec::new();
+    let mut jobs: Vec<Job<'_>> = Vec::new();
     for context in &contexts {
         for point in lattice_points() {
-            let context = &*context;
+            let context: &SeedContext = context;
             let kills = &lattice_kills;
             jobs.push(Box::new(move || {
                 let seed = context.seed as u32;
@@ -521,7 +524,7 @@ fn tier2_kill_matrix_resumes_bit_identically() {
             }));
         }
         for (kind, nth) in [("wal-append", 2u32), ("ckpt-put", 1u32)] {
-            let context = &*context;
+            let context: &SeedContext = context;
             let kills = &torn_kills;
             jobs.push(Box::new(move || {
                 let relaunch = forced_round(
@@ -547,7 +550,7 @@ fn tier2_kill_matrix_resumes_bit_identically() {
             }));
         }
         for index in 0..random_kills_per_seed() {
-            let context = &*context;
+            let context: &SeedContext = context;
             let kills = &random_kills;
             jobs.push(Box::new(move || random_round(context, index, kills)));
         }

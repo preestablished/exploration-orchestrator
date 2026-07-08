@@ -16,11 +16,12 @@ started). Both items landed 2026-07-08.
 | W2.4–W2.6 harness + CI | this repo | `cdc3d40` | `bins/orchestratord/tests/tier2_chaos.rs` (lattice/torn/random kill classes, gRPC resume smoke, negative control), `scripts/evidence-tier2.sh`, `tier2-chaos-smoke` CI job (both arches), M3/M4-resolution addendum |
 | W2.7 evidence + resolution | this repo | _see `git log`_ | `evidence/phase5-tier2-chaos/` + this file |
 
-W1.3 (buf lint exemptions): control-plane's item-1 buf gates had not
-landed at execution time (no `buf.yaml` in their tree; `buf` not
-installed locally — the plan says don't install tooling just for this).
-The exact `ignore_only` stanza ships in the W1.1 note (§2), explicitly
-marked "fold into your item-1 buf.yaml".
+W1.3 (buf lint exemptions): at our execution time control-plane's
+item-1 buf gates had not landed, so the exact `ignore_only` stanza
+shipped in the W1.1 note (§2), marked "fold into your item-1 buf.yaml".
+Control-plane subsequently did exactly that — the three exemptions are
+in their `buf.yaml` at `51d74ca` and their `buf lint` is green over our
+orchestrator file (see Cross-repo verification, below).
 
 ## Bead dispositions
 
@@ -40,41 +41,75 @@ marked "fold into your item-1 buf.yaml".
 
 - `evidence/phase5-tier2-chaos/run-manifest.md` — date, host, toolchain,
   commit, seed/kill parameters.
-- `evidence/phase5-tier2-chaos/tier2-chaos.txt` — full-matrix run
-  (`TIER2_SEEDS=5`, all 11 lattice points, both torn kinds, random
-  kills), containing the `TIER2_SUMMARY seeds=… kills=… lattice=…
-  torn=… random=…` line; kill quota ≥ 50 asserted by the harness itself
-  (`TIER2_MIN_KILLS=50`).
+- `evidence/phase5-tier2-chaos/tier2-chaos.txt` — full-matrix run,
+  recorded line: **`TIER2_SUMMARY seeds=5 kills=80 lattice=55 torn=10
+  random=15`** (80 ≥ 50; all 11 lattice points × 5 seeds = 55, both torn
+  kinds × 5 = 10, 3 random × 5 = 15), all bit-identical, plus
+  `TIER2_GRPC_SMOKE kills=1 resumed=1`. `test result: ok. 2 passed`
+  (`finished in 5933.31s` ≈ 99 min). Kill quota ≥ 50 asserted by the
+  harness (`TIER2_MIN_KILLS=50`).
 - `evidence/phase5-tier2-chaos/negative-control.txt` — the demonstrated
-  negative, naming the mutation (`perturb-node`) and the observed
-  divergence (`TIER2_NEGATIVE … hash_diverged=true`).
+  negative: `TIER2_NEGATIVE mutation=perturb-node hash_diverged=true
+  outcome_diverged=false` (the tree-hash arm of the comparator fired, so
+  the demonstration is non-vacuous), `test result: ok. 1 passed`
+  (`finished in 664.14s`).
+- Run manifest commit: `332cc76`, host `infra-control`, rustc 1.96.1.
+- Torn-write truncation proof: the `torn-{wal-append,ckpt-put}` rounds
+  assert the relaunch's reload logs a nonzero `truncated_bytes`
+  (surfaced on the *child's* stdout, captured and greped by the harness);
+  the passing `tier2_kill_matrix` result is that assertion holding. The
+  `TIER2_SIM_RELOAD … truncated_bytes=0` lines visible in the evidence
+  file are the harness's own offline comparator reloads of clean dirs,
+  not the torn relaunches.
 
-Reproduce: `scripts/evidence-tier2.sh` (env-overridable); phases-track
-spot-check: `CHAOS_SEED=<fresh> TIER2_ENABLE=1 cargo test -p
-orchestratord --test tier2_chaos -- --nocapture`.
+Reproduce: `scripts/evidence-tier2.sh` (env-overridable;
+`TIER2_PARALLEL` scales the worker pool — the full lane above ran at
+`TIER2_PARALLEL=6`); phases-track spot-check: `CHAOS_SEED=<fresh>
+TIER2_ENABLE=1 cargo test -p orchestratord --test tier2_chaos --
+--nocapture`.
 
-## Cross-repo verification state (item 1)
+## Cross-repo verification state (item 1) — COMPLETE both sides
 
-- Our CI consumes the canonical proto location on x86_64 + aarch64 via
-  the existing control-plane sibling checkout; both workspaces built and
-  tested green locally (`cargo build/test --workspace --all-features` in
-  both repos).
-- **Breaking-gate demonstration: pending their gates** — their item-1
-  `buf breaking` CI does not exist yet, so the scratch-branch
-  demonstration cannot run (plan W1.5 anticipated this: whichever repo
-  lands second runs it; their resolution carries the evidence). Not
-  silently skipped — see reinterpretation (g).
+The control-plane track has since reviewed and landed their half on
+their `origin/main` (their resolution:
+`../control-plane/.agents/requests/phase4-proto-freeze-tag-and-breaking-gate/04-resolution.md`):
+
+- My upstream commits `2f6f911` + `9cb1a0c` are merged intact beneath
+  their work; the real `determinism.orchestrator.v1` surface builds from
+  `control-plane/proto/` in both repos.
+- **Buf gates + lint exemptions landed** (`51d74ca`): their `buf.yaml`
+  carries all three exemptions I proposed
+  (`ENUM_ZERO_VALUE_SUFFIX`, `SERVICE_SUFFIX`,
+  `RPC_RESPONSE_STANDARD_NAME`) scoped to the orchestrator file — so the
+  gate is green over our surface.
+- **ExperimentSpec mirror + descriptor-equality check landed**
+  (`51d74ca`): they replaced the `controlplane/v1` stub with the
+  `ExperimentConfig` mirror (my proposed full-closure scope) and added
+  `crates/determinism-proto/tests/experiment_spec_mirror.rs`.
+- **Breaking-gate demonstration: done** — scratch branch
+  `scratch/proto-breaking-scorer-return-decoded`, evidence in their
+  resolution + `1a9fb94`. No longer pending (see reinterpretation (g)).
+- **`proto-v0.2.0` published** (`1a9fb94`); their CI green on both
+  arches; they record `../exploration-orchestrator: cargo test
+  --workspace --all-features` green against their tree.
+- Verified locally after their landing: `cargo fmt --check`, `cargo
+  clippy --workspace --all-targets --all-features -D warnings`, and
+  `cargo test --workspace --all-features` all green against
+  control-plane `origin/main` (Tier-1 `chaos_resume` on the shared
+  comparator + `seed_gate` included).
 
 ## Reinterpretations and named deltas (disclosed, numbered)
 
-(a) **Lint posture: exemptions, not renames** (D-P2). The upstream ships
-    with three `ignore_only` exemptions proposed in the coordination
-    note (`ENUM_ZERO_VALUE_SUFFIX`, `SERVICE_SUFFIX`,
-    `RPC_RESPONSE_STANDARD_NAME` — the third found by review against
-    the full DEFAULT category, beyond the request's named rules). None
-    is fixable wire-compatibly. The renumbering escape hatch (with its
-    persisted-`config_hash` cost) is documented in the note, exercised
-    only on control-plane's explicit ask — which has not come.
+(a) **Lint posture: exemptions, not renames** (D-P2) — RESOLVED. The
+    three `ignore_only` exemptions proposed in the coordination note
+    (`ENUM_ZERO_VALUE_SUFFIX`, `SERVICE_SUFFIX`,
+    `RPC_RESPONSE_STANDARD_NAME` — the third found by review against the
+    full DEFAULT category, beyond the request's named rules) were
+    **accepted and applied** in control-plane's `buf.yaml` (`51d74ca`),
+    scoped to the orchestrator file; their gate is green over our
+    surface. None was fixable wire-compatibly. The renumbering escape
+    hatch (with its persisted-`config_hash` cost) stayed unused —
+    control-plane never asked for it.
 (b) **CI-vs-manual lane** (D-T5): the full matrix is the manual evidence
     lane; CI runs the reduced smoke (1 seed, 3 lattice points, both torn
     kinds, 2 random kills, gRPC smoke, negative control) as the
@@ -95,11 +130,30 @@ orchestratord --test tier2_chaos -- --nocapture`.
     `orch-simstate` (no serde on `ClientError`), and replay in
     `reload_broken` skips digest checks entirely (the mutation exists to
     diverge; the end-state comparator is the assertion).
-(e) **Fake determinism audit findings**: none. No digest mismatch fired
-    across the smoke or evidence runs; no fake-side fix was needed. The
-    known-benign `watch_slots` cursor wart (`Cell` behind `&self`) is
-    documented in the plan and in code comments, invisible to digests
-    as predicted.
+(e) **Fake determinism audit findings**: none. No replay digest mismatch
+    fired from genuine fake nondeterminism in any bit-identical resume
+    round; no fake-side fix was needed. The known-benign `watch_slots`
+    cursor wart (`Cell` behind `&self`) is documented in the plan and in
+    code comments, invisible to digests as predicted. (The one digest
+    panic seen on the first full run was a *harness* bug — reading a
+    deliberately-broken dir with digest checks on — not fake
+    nondeterminism; see (h).)
+(h) **Two harness-logic bugs found and fixed on the first full run**
+    (commit `332cc76`); the load-bearing `tier2_kill_matrix` test passed
+    on that same run, so neither was a product defect:
+    1. The negative control read the perturbed run's end-state with a
+       plain `reload` (digest checks on). A perturbed run journals its
+       post-resume ops against perturbed state, so an unbroken replay
+       *correctly* trips the tripwire. Fixed by reading the broken dir
+       with `reload_broken` (skips digest checks, re-applies the same
+       mutation) — `fingerprints_with(dir, cfg_hash, break_mode)`.
+    2. The gRPC smoke asserted `resumed_at_batch_seq > 0` but could kill
+       after only the seq-0 bootstrap checkpoint (`bootstrap_fresh` writes
+       an initial checkpoint at `batch_seq` 0, and grid-world duplicates
+       make real commits accrue slower than `batch_seq`; the wire status
+       exposes only `batch_seq`, not `checkpointed_batch_seq`). Fixed by
+       polling to `batch_seq >= 96` and gating the round on an
+       offline-decoded checkpoint with `batch_seq > 0`.
 (f) **Negative-control mutation replaced** (W2.5): the request's "skip
     WAL replay" example is convergent by design (WAL entries are
     self-healing instructions; intents re-derive from `(seed,
@@ -109,14 +163,15 @@ orchestratord --test tier2_chaos -- --nocapture`.
     asserts the hash arm fires specifically, and that the unbroken
     reload of the same pre-relaunch journal converges — pinning the
     divergence on the mutation.
-(g) **Gates→upstream inversion** (W1.5): the upstream landed before
-    control-plane's buf gates exist (their item-1 timing is theirs; the
-    only hard constraint — upstream before the `proto-v0.2.0` tag — is
-    satisfied since no tag exists). Their item 3 ordering ("gates first,
-    then upstream as a lint-only concern") is therefore inverted; the
-    W1.1 note carries the exemption stanza so their gates land green
-    over our file, and the breaking-gate demo transfers to their
-    resolution.
+(g) **Gates→upstream inversion** (W1.5) — RESOLVED cleanly. The upstream
+    (`9cb1a0c`) landed before control-plane's buf gates (`51d74ca`), so
+    their item-3 ordering ("gates first, then upstream") was inverted in
+    time. It caused no red gate: they introduced the gates *together
+    with* the exemption stanza from the W1.1 note, so `buf lint` was
+    green over our file from its first run, and `proto-v0.2.0`
+    (`1a9fb94`) froze the correct tree. The hard constraint —
+    upstream-before-tag — held. The breaking-gate demonstration ran on
+    their side (scratch branch `scratch/proto-breaking-scorer-return-decoded`).
 
 ## Phases-track handoff
 
