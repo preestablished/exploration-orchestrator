@@ -6,6 +6,7 @@
 //! the chaos harnesses.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use orch_checkpoint::{
@@ -56,6 +57,7 @@ use orch_driver::{
 };
 use orch_sched::{
     driver::{BootstrapSpec, DriverConfig, JobResult, JobVerdict, WorkerDriver},
+    metrics::Gauges,
     pipeline::{Batch, BatchResult, JobOutcome, Pipeline, PipelineConfig},
     ports::{AsyncHypervisor, AsyncScorer, AsyncStore, AsyncSynth},
     retry::{is_retryable, retry_rpc, RetryPolicy},
@@ -64,17 +66,21 @@ use orch_sched::{
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    bringup::{bring_up, BringupOutcome, ExperimentSources, SynthBringupPort},
+    bringup::{
+        bring_up, materialize_decoded_features, BringupOutcome, ExperimentSources, SynthBringupPort,
+    },
+    config::config_validation_failed_detail,
     events::{self, EventEmitter, PruneReason},
+    metrics::{BatchLatencyStage, MetricsRegistry, MetricsStatus},
     SyncStoreAccess,
 };
 
-// ── fixed grep-able FAILED reasons ──────────────────────────────────────────
+// ── fixed grep-able terminal reasons ────────────────────────────────────────
 
-pub const REASON_CAS_OWNERSHIP_LOST: &str = "checkpoint-cas-ownership-lost";
-pub const REASON_ARCHIVE_SEQ_MISMATCH: &str = "scorer-archive-seq-mismatch";
-pub const REASON_FINGERPRINT_MISMATCH: &str = "synth-fingerprint-mismatch";
-pub const REASON_FRONTIER_EXHAUSTED: &str = "frontier-exhausted";
+pub use orch_core::runtime_reasons::{
+    REASON_ARCHIVE_SEQ_MISMATCH, REASON_CAS_OWNERSHIP_LOST, REASON_FINGERPRINT_MISMATCH,
+    REASON_FRONTIER_EXHAUSTED,
+};
 
 /// In-process crash lattice (plan D5 Tier 1): every point in the loop where
 /// state visibility changes. The chaos harness's policy returns `true` to
@@ -83,6 +89,7 @@ pub const REASON_FRONTIER_EXHAUSTED: &str = "frontier-exhausted";
 pub enum CrashPoint {
     AfterWalWrite,
     AfterDispatch,
+    BeforeCommitOwnerCheck,
     MidBatchCommit,
     AfterCreateNode,
     BeforeWalDelete,
@@ -95,9 +102,10 @@ pub enum CrashPoint {
 }
 
 impl CrashPoint {
-    pub const ALL: [CrashPoint; 11] = [
+    pub const ALL: [CrashPoint; 12] = [
         CrashPoint::AfterWalWrite,
         CrashPoint::AfterDispatch,
+        CrashPoint::BeforeCommitOwnerCheck,
         CrashPoint::MidBatchCommit,
         CrashPoint::AfterCreateNode,
         CrashPoint::BeforeWalDelete,
@@ -116,6 +124,7 @@ impl CrashPoint {
         match self {
             Self::AfterWalWrite => "AfterWalWrite",
             Self::AfterDispatch => "AfterDispatch",
+            Self::BeforeCommitOwnerCheck => "BeforeCommitOwnerCheck",
             Self::MidBatchCommit => "MidBatchCommit",
             Self::AfterCreateNode => "AfterCreateNode",
             Self::BeforeWalDelete => "BeforeWalDelete",
@@ -294,6 +303,8 @@ where
     slots_drain: tokio::task::JoinHandle<()>,
     retry: RetryPolicy,
     bringup: BringupOutcome,
+    metrics: Arc<MetricsRegistry>,
+    pipeline_gauges: Option<Arc<Gauges>>,
 
     control_rx: mpsc::UnboundedReceiver<Control>,
     status_tx: watch::Sender<StatusSnapshot>,
@@ -355,8 +366,36 @@ where
         sink: E,
         crash: Option<Box<dyn CrashPolicy>>,
     ) -> ClientResult<(Self, RunnerHandle, StartMode)> {
+        Self::start_with_metrics(
+            cfg,
+            sources,
+            hypervisor,
+            scorer,
+            store,
+            synth,
+            sink,
+            crash,
+            Arc::new(MetricsRegistry::default()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_metrics(
+        cfg: RunnerConfig,
+        sources: ExperimentSources,
+        hypervisor: H,
+        scorer: S,
+        store: St,
+        synth: Sy,
+        sink: E,
+        crash: Option<Box<dyn CrashPolicy>>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> ClientResult<(Self, RunnerHandle, StartMode)> {
+        let mut cfg = cfg;
         let retry = RetryPolicy::from_scheduling(&cfg.config.scheduling);
-        let emitter = EventEmitter::new(sink, cfg.run_id.clone(), cfg.producer_id.clone());
+        let emitter = EventEmitter::new(sink, cfg.run_id.clone(), cfg.producer_id.clone())
+            .with_metrics(Arc::clone(&metrics));
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let (status_tx, status_rx) = watch::channel(StatusSnapshot::initial());
         let handle = RunnerHandle {
@@ -407,6 +446,13 @@ where
             &synth,
         )
         .await?;
+        cfg.config.decoded_features = materialize_decoded_features(&cfg.config, &bringup.compiled)
+            .map_err(|error| {
+                ClientError::new(
+                    ClientErrorKind::InvalidRequest,
+                    config_validation_failed_detail(&[error]),
+                )
+            })?;
         if let Some((checkpoint, _)) = &checkpoint {
             if checkpoint.feature_map_hash != bringup.feature_map_hash {
                 return Err(ClientError::new(
@@ -464,6 +510,8 @@ where
             control_rx,
             status_tx,
             crash,
+            metrics,
+            pipeline_gauges: None,
             commit_state: CommitState::from_root(placeholder_payload),
             runtimes: BTreeMap::new(),
             node_bursts: BTreeMap::new(),
@@ -523,6 +571,43 @@ where
         Ok(())
     }
 
+    async fn ensure_checkpoint_owner(&mut self, window: &'static str) -> ClientResult<()> {
+        let Some(expected_generation) = self.ckpt_generation else {
+            return Ok(());
+        };
+        let store = self.store.clone();
+        let key = MetadataKey::checkpoint(&self.cfg.experiment_id);
+        match retry_rpc(&self.retry, || {
+            store.get_metadata(GetMetadataRequest { key: key.clone() })
+        })
+        .await
+        {
+            Ok(response) if response.generation == expected_generation => Ok(()),
+            Ok(response) => Err(ClientError::new(
+                ClientErrorKind::FailedPrecondition,
+                format!(
+                    "{REASON_CAS_OWNERSHIP_LOST}: {window}: checkpoint generation {} != owned {}",
+                    response.generation.get(),
+                    expected_generation.get()
+                ),
+            )),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ClientErrorKind::NotFound
+                        | ClientErrorKind::FailedPrecondition
+                        | ClientErrorKind::AlreadyExists
+                ) =>
+            {
+                Err(ClientError::new(
+                    ClientErrorKind::FailedPrecondition,
+                    format!("{REASON_CAS_OWNERSHIP_LOST}: {window}: {}", error.message()),
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn publish_status(&self) {
         let _ = self.status_tx.send(StatusSnapshot {
             state: self.status,
@@ -541,6 +626,22 @@ where
             goal_nodes: self.goal_nodes.clone(),
             failure_reason: self.failure_reason.clone(),
         });
+        self.metrics.update_status(MetricsStatus {
+            expansions_total: self.expansions,
+            nodes_kept: self.commit_state.tree.len() as u64,
+            nodes_dup: self.discarded_dup,
+            nodes_regression: self.discarded_regression,
+            best_score: self.best_score.unwrap_or_default(),
+            frontier_size: self.commit_state.frontier.len() as u64,
+            archive_cells: 0,
+            escalation_level: self.ladder.level().get(),
+            slot_utilization: 0.0,
+        });
+        if let Some(gauges) = &self.pipeline_gauges {
+            self.metrics.update_pipeline_gauges(gauges);
+        }
+        self.metrics
+            .set_observatory_dropped_total(self.emitter.dropped_total());
     }
 
     // ── fresh bootstrap (API.md §2.1) ───────────────────────────────────────
@@ -959,6 +1060,7 @@ where
             },
             first_seq,
         );
+        self.pipeline_gauges = Some(pipeline.gauges());
         let mut inflight: BTreeMap<u64, ExpansionIntent> = BTreeMap::new();
 
         let result = self.run_phases(&mut pipeline, &mut inflight).await;
@@ -977,10 +1079,16 @@ where
         }
 
         // Final checkpoint (stop / budgets / goal / failure all land here).
-        if let Err(error) = self.checkpoint().await {
-            if self.failure_reason.is_none() {
-                self.status = ExperimentState::Failed;
-                self.failure_reason = Some(error.message().to_owned());
+        let ownership_lost = self
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(REASON_CAS_OWNERSHIP_LOST));
+        if !ownership_lost {
+            if let Err(error) = self.checkpoint().await {
+                if self.failure_reason.is_none() {
+                    self.status = ExperimentState::Failed;
+                    self.failure_reason = Some(error.message().to_owned());
+                }
             }
         }
         self.publish_status();
@@ -1030,7 +1138,10 @@ where
             let done = pipeline.next_completed().await?.ok_or_else(|| {
                 ClientError::new(ClientErrorKind::Internal, "pipeline ended during replay")
             })?;
+            let commit_started = tokio::time::Instant::now();
             let goal = self.commit_replayed(done, &intent).await?;
+            self.metrics
+                .observe_batch_latency(BatchLatencyStage::Commit, commit_started.elapsed());
             self.publish_status();
             self.crash_check(CrashPoint::AfterCommitBeforeCheckpoint)?;
             if let Some(goal_node) = goal {
@@ -1073,7 +1184,10 @@ where
                 let Some(intent) = self.build_intent()? else {
                     break;
                 };
+                let select_started = tokio::time::Instant::now();
                 self.dispatch_intent(pipeline, inflight, intent).await?;
+                self.metrics
+                    .observe_batch_latency(BatchLatencyStage::Select, select_started.elapsed());
             }
 
             if inflight.is_empty() {
@@ -1091,7 +1205,10 @@ where
             let intent = inflight.remove(&done.seq).ok_or_else(|| {
                 ClientError::new(ClientErrorKind::Internal, "completed unknown batch")
             })?;
+            let commit_started = tokio::time::Instant::now();
             let goal = self.commit_completed(done, &intent).await?;
+            self.metrics
+                .observe_batch_latency(BatchLatencyStage::Commit, commit_started.elapsed());
             self.publish_status();
 
             self.crash_check(CrashPoint::AfterCommitBeforeCheckpoint)?;
@@ -1165,7 +1282,10 @@ where
             let intent = inflight.remove(&done.seq).ok_or_else(|| {
                 ClientError::new(ClientErrorKind::Internal, "completed unknown batch")
             })?;
+            let commit_started = tokio::time::Instant::now();
             self.commit_completed(done, &intent).await?;
+            self.metrics
+                .observe_batch_latency(BatchLatencyStage::Commit, commit_started.elapsed());
         }
         Ok(())
     }
@@ -1429,6 +1549,9 @@ where
             }
             children.push(child);
         }
+
+        self.crash_check(CrashPoint::BeforeCommitOwnerCheck)?;
+        self.ensure_checkpoint_owner("node-commit").await?;
 
         let rules = CommitRules::from_config(&self.cfg.config);
         let outcome = commit_batch(&mut self.commit_state, done.parent, &children, &rules)
@@ -1727,6 +1850,9 @@ where
             )
             .await?
         };
+
+        self.crash_check(CrashPoint::BeforeCommitOwnerCheck)?;
+        self.ensure_checkpoint_owner("node-commit").await?;
 
         let rules = CommitRules::from_config(&self.cfg.config);
         let parent = done.parent;

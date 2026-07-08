@@ -6,6 +6,8 @@ use core::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::config_rejections;
+
 pub const DIGEST_LEN: usize = 32;
 pub const EXPERIMENT_CONFIG_VERSION: u32 = 1;
 
@@ -572,6 +574,9 @@ impl ExperimentConfig {
         if self.version != EXPERIMENT_CONFIG_VERSION {
             errors.push(ConfigError::InvalidVersion(self.version));
         }
+        if self.seed == 0 {
+            errors.push(ConfigError::MissingRequiredField("seed"));
+        }
 
         if let Err(error) = require_non_empty("workload_image_ref", &self.workload_image_ref) {
             errors.push(error);
@@ -691,24 +696,36 @@ impl ExperimentConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     InvalidVersion(u32),
     MissingRequiredField(&'static str),
     OutOfRange(&'static str),
+    UnknownEnumValue(&'static str),
     InvalidStagedInnerPolicy,
+    DecodedFeatureNotInFeatureMap(String),
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidVersion(version) => write!(formatter, "invalid config version {version}"),
-            Self::MissingRequiredField(field) => {
-                write!(formatter, "missing required field {field}")
+            Self::InvalidVersion(version) => {
+                formatter.write_str(&config_rejections::invalid_config_version(*version))
             }
-            Self::OutOfRange(field) => write!(formatter, "field out of range {field}"),
+            Self::MissingRequiredField(field) => {
+                formatter.write_str(&config_rejections::missing_required_field(field))
+            }
+            Self::OutOfRange(field) => {
+                formatter.write_str(&config_rejections::field_out_of_range(field))
+            }
+            Self::UnknownEnumValue(field) => {
+                formatter.write_str(&config_rejections::unknown_enum_value(field))
+            }
             Self::InvalidStagedInnerPolicy => {
-                write!(formatter, "staged inner policy cannot be staged")
+                formatter.write_str(config_rejections::INVALID_STAGED_INNER_POLICY)
+            }
+            Self::DecodedFeatureNotInFeatureMap(name) => {
+                formatter.write_str(&config_rejections::decoded_feature_not_in_feature_map(name))
             }
         }
     }

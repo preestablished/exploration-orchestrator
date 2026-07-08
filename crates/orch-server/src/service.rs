@@ -14,10 +14,11 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     bringup::{ExperimentSources, SynthBringupPort},
-    config::{config_hash, effective_config},
+    config::{config_hash, config_validation_failed_detail, validated_effective_config},
     experiment::{
         Control, ExperimentRunner, RunnerConfig, RunnerHandle, StartMode, StatusSnapshot,
     },
+    metrics::{render_prometheus, MetricsRegistry},
     SyncStoreAccess,
 };
 
@@ -45,6 +46,7 @@ where
     sink: E,
     sources: SourcesFactory,
     producer_id: String,
+    metrics: Arc<MetricsRegistry>,
     experiments: Mutex<HashMap<String, ExperimentEntry>>,
     /// Ids currently in bring-up (registry lock is not held across
     /// ExperimentRunner::start, which can take a while).
@@ -76,9 +78,20 @@ where
             sink,
             sources,
             producer_id: producer_id.into(),
+            metrics: Arc::new(MetricsRegistry::default()),
             experiments: Mutex::new(HashMap::new()),
             starting: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    #[must_use]
+    pub fn metrics_registry(&self) -> Arc<MetricsRegistry> {
+        Arc::clone(&self.metrics)
+    }
+
+    #[must_use]
+    pub fn metrics_text(&self) -> String {
+        render_prometheus(&self.metrics.snapshot())
     }
 
     /// Drains every running experiment: sends Stop and awaits a terminal
@@ -188,18 +201,9 @@ where
         };
 
         // Validation lists EVERY bad field (API.md §1).
-        let effective = effective_config(config);
-        let violations = effective.validate_all();
-        if !violations.is_empty() {
-            let details: Vec<String> = violations
-                .iter()
-                .map(|violation| violation.to_string())
-                .collect();
-            return Err(Status::invalid_argument(format!(
-                "config validation failed: {}",
-                details.join("; ")
-            )));
-        }
+        let effective = validated_effective_config(config).map_err(|violations| {
+            Status::invalid_argument(config_validation_failed_detail(&violations))
+        })?;
 
         {
             let experiments = self.experiments.lock().await;
@@ -256,7 +260,7 @@ where
             config: effective,
         };
 
-        let started = ExperimentRunner::start(
+        let started = ExperimentRunner::start_with_metrics(
             runner_config,
             (self.sources)(&request.experiment_id),
             self.hypervisor.clone(),
@@ -265,6 +269,7 @@ where
             self.synth.clone(),
             self.sink.clone(),
             None,
+            Arc::clone(&self.metrics),
         )
         .await;
         let (runner, handle, mode) = match started {

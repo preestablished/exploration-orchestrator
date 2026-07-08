@@ -7,10 +7,12 @@
 //! wall-clock-derived in production and injected deterministically by test
 //! harnesses.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use orch_clients::observatory::{EventEnvelope, EventSink, Payload, PayloadValue};
 use orch_core::types::{FiniteF64, NodeId};
+
+use crate::metrics::MetricsRegistry;
 
 pub const SOURCE_SERVICE: &str = "EXPLORATION_ORCHESTRATOR";
 pub const DEFAULT_RING_CAPACITY: usize = 1024;
@@ -47,6 +49,7 @@ pub struct EventEmitter<S> {
     ring: VecDeque<EventEnvelope>,
     capacity: usize,
     dropped_total: u64,
+    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl<S: EventSink> EventEmitter<S> {
@@ -59,12 +62,19 @@ impl<S: EventSink> EventEmitter<S> {
             ring: VecDeque::new(),
             capacity: DEFAULT_RING_CAPACITY,
             dropped_total: 0,
+            metrics: None,
         }
     }
 
     #[must_use]
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -107,6 +117,9 @@ impl<S: EventSink> EventEmitter<S> {
         if self.ring.len() == self.capacity {
             self.ring.pop_front();
             self.dropped_total += 1;
+            if let Some(metrics) = &self.metrics {
+                metrics.set_observatory_dropped_total(self.dropped_total);
+            }
         }
         self.ring.push_back(envelope);
         self.flush();

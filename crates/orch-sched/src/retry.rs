@@ -21,7 +21,7 @@
 use std::{future::Future, time::Duration};
 
 use orch_clients::{ClientError, ClientErrorKind, ClientResult};
-use orch_core::types::SchedulingConfig;
+use orch_core::{runtime_reasons::REASON_JOB_RETRIES_EXHAUSTED, types::SchedulingConfig};
 
 use crate::{
     driver::{JobResult, JobSpec, WorkerDriver},
@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Grep-able FAILED reason when a deterministic run exhausts job retries.
-pub const DETERMINISTIC_RETRIES_EXHAUSTED_REASON: &str = "job-retries-exhausted";
+pub const DETERMINISTIC_RETRIES_EXHAUSTED_REASON: &str = REASON_JOB_RETRIES_EXHAUSTED;
 
 /// Ceiling on exponential backoff.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(10);

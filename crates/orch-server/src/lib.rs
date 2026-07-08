@@ -6,6 +6,7 @@ pub mod bringup;
 pub mod config;
 pub mod events;
 pub mod experiment;
+pub mod metrics;
 pub mod service;
 
 use orch_clients::{

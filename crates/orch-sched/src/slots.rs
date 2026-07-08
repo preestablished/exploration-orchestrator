@@ -32,7 +32,7 @@ use crate::ports::AsyncHypervisor;
 
 /// Grep-able FAILED-reason prefix for determinism-class refusals (M5
 /// runbook forward-design; keep the string stable).
-pub const CLASS_MISMATCH_REASON: &str = "determinism-class-mismatch";
+pub const CLASS_MISMATCH_REASON: &str = orch_core::runtime_reasons::REASON_CLASS_MISMATCH;
 
 #[derive(Clone, Debug)]
 pub struct SlotViewConfig {

@@ -34,9 +34,12 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use orch_proto::orchestrator_v1 as wire;
-use orch_server::config::{config_hash, effective_config, wire_config_from_yaml};
+use orch_server::config::{
+    config_hash, config_validation_failed_detail, validated_effective_config, wire_config_from_yaml,
+};
 use orch_server::events::SharedSink;
 use orch_server::experiment::{CrashPoint, CrashPolicy, ExperimentRunner, RunnerConfig};
+use orch_server::metrics::{render_prometheus, MetricsRegistry};
 use orch_server::service::OrchestratorService;
 use orch_simstate::world::BreakMode;
 use tonic::transport::Server;
@@ -196,12 +199,8 @@ fn main() -> ExitCode {
 async fn run_standalone(args: &Args, path: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     let sparse = wire_config_from_yaml(&bytes)?;
-    let effective = effective_config(&sparse);
-    let violations = effective.validate_all();
-    if !violations.is_empty() {
-        let details: Vec<String> = violations.iter().map(ToString::to_string).collect();
-        return Err(format!("config validation failed: {}", details.join("; ")));
-    }
+    let effective = validated_effective_config(&sparse)
+        .map_err(|violations| config_validation_failed_detail(&violations))?;
     let experiment_id = args
         .experiment_id
         .clone()
@@ -233,7 +232,7 @@ async fn run_standalone(args: &Args, path: &str) -> Result<(), String> {
         hang_policy_from_env()?,
     )
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.message().to_owned())?;
     let outcome = runner.run().await.map_err(|error| error.to_string())?;
     info!(
         state = ?outcome.state,
@@ -272,7 +271,7 @@ async fn serve_simulate(args: &Args) -> Result<(), String> {
         producer_id(),
     ));
 
-    tokio::spawn(serve_http(http));
+    tokio::spawn(serve_http(http, service.metrics_registry()));
 
     info!(%listen, %http, "orchestratord --simulate serving");
     // SIGTERM/SIGINT drain: stop every running experiment and wait for its
@@ -302,8 +301,8 @@ async fn serve_simulate(args: &Args) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Minimal /healthz + /metrics responder (full Prometheus surface is M5).
-async fn serve_http(addr: SocketAddr) {
+/// Minimal /healthz + /metrics responder.
+async fn serve_http(addr: SocketAddr, metrics: std::sync::Arc<MetricsRegistry>) {
     let Ok(listener) = tokio::net::TcpListener::bind(addr).await else {
         error!(%addr, "http listener failed to bind");
         return;
@@ -312,6 +311,7 @@ async fn serve_http(addr: SocketAddr) {
         let Ok((mut stream, _peer)) = listener.accept().await else {
             continue;
         };
+        let metrics = std::sync::Arc::clone(&metrics);
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             // Read until the end of the request headers (bounded at 8 KiB)
@@ -335,10 +335,7 @@ async fn serve_http(addr: SocketAddr) {
             let (status, body) = if request.starts_with("GET /healthz") {
                 ("200 OK", "ok\n".to_owned())
             } else if request.starts_with("GET /metrics") {
-                (
-                    "200 OK",
-                    "# TYPE orchestratord_up gauge\norchestratord_up 1\n".to_owned(),
-                )
+                ("200 OK", render_prometheus(&metrics.snapshot()))
             } else {
                 ("404 Not Found", "not found\n".to_owned())
             };

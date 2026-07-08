@@ -1,6 +1,9 @@
 //! Fake hypervisor worker surface over the deterministic grid world.
 
-use std::{cell::Cell, collections::BTreeMap};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use orch_clients::{
     hypervisor::{
@@ -121,6 +124,24 @@ impl FakeHypervisor {
     #[must_use]
     pub fn world(&self) -> &GridWorld {
         &self.world
+    }
+
+    #[must_use]
+    pub fn live_snapshot_refs(&self) -> BTreeSet<SnapshotRef> {
+        self.snapshots.keys().copied().collect()
+    }
+
+    pub fn retain_live_snapshots(
+        &mut self,
+        committed_refs: &BTreeSet<SnapshotRef>,
+    ) -> BTreeSet<SnapshotRef> {
+        let before = self.live_snapshot_refs();
+        self.snapshots
+            .retain(|snapshot, _record| committed_refs.contains(snapshot));
+        before
+            .into_iter()
+            .filter(|snapshot| !committed_refs.contains(snapshot))
+            .collect()
     }
 
     /// Changes the advertised slot pool size mid-run (shrink/grow drills).
@@ -1573,6 +1594,44 @@ mod tests {
         assert_eq!(first.input_log_id, second.input_log_id);
         assert_eq!(first.feature_bytes, second.feature_bytes);
         assert_eq!(first.fb_lz4, second.fb_lz4);
+    }
+
+    #[test]
+    fn hypervisor_retains_only_committed_snapshot_refs() {
+        let mut fake = FakeHypervisor::new();
+        let created = create_sample_vm(&mut fake, 0x61);
+        let first = fake
+            .take_snapshot(TakeSnapshotRequest {
+                lease: created.lease,
+                seal_input_log: true,
+                capture: Some(grid_capture(false)),
+            })
+            .expect("first");
+        fake.inject_inputs(InjectInputsRequest {
+            lease: created.lease,
+            events: vec![pad_event(1, BUTTON_RIGHT)],
+        })
+        .expect("inject");
+        fake.run(RunRequest {
+            lease: created.lease,
+            until: RunUntil::FrameBudget(FrameCount::new(2)),
+            hard_icount_cap: None,
+            capture: None,
+        })
+        .expect("run");
+        let second = fake
+            .take_snapshot(TakeSnapshotRequest {
+                lease: created.lease,
+                seal_input_log: true,
+                capture: Some(grid_capture(false)),
+            })
+            .expect("second");
+
+        let committed = BTreeSet::from([first.snapshot]);
+        let orphans = fake.retain_live_snapshots(&committed);
+
+        assert_eq!(fake.live_snapshot_refs(), committed);
+        assert!(orphans.contains(&second.snapshot));
     }
 
     fn decode_fake_fb_lz4(bytes: &[u8]) -> Vec<u8> {

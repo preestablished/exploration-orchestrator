@@ -13,8 +13,8 @@ use orch_clients::{
     ClientError, ClientErrorKind, ClientResult,
 };
 use orch_core::{
-    compile::{compile_feature_map, CompiledFeatureMap, FeatureMap, RegionLayouts},
-    types::{ExperimentConfig, GuestInstructions},
+    compile::{compile_feature_map, CompiledFeatureMap, Discretize, FeatureMap, RegionLayouts},
+    types::{ConfigError, ExperimentConfig, GuestInstructions},
 };
 use orch_driver::{
     input_synth::{SynthBringup, SynthBringupReport},
@@ -55,6 +55,48 @@ pub struct BringupOutcome {
     pub stage_names: Vec<String>,
     pub synth: SynthBringup,
     pub synth_report: SynthBringupReport,
+}
+
+pub fn materialize_decoded_features(
+    config: &ExperimentConfig,
+    compiled: &CompiledFeatureMap,
+) -> Result<Vec<String>, ConfigError> {
+    let known: std::collections::BTreeSet<&str> = compiled
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+
+    if !config.decoded_features.is_empty() {
+        for name in &config.decoded_features {
+            if !known.contains(name.as_str()) {
+                return Err(ConfigError::DecodedFeatureNotInFeatureMap(name.clone()));
+            }
+        }
+        return Ok(config.decoded_features.clone());
+    }
+
+    let mut selected = std::collections::BTreeSet::new();
+    for field in &compiled.fields {
+        if matches!(
+            field.semantics.0.as_str(),
+            "position_x" | "position_y" | "room_id"
+        ) {
+            selected.insert(field.name.as_str());
+        }
+        if let Discretize::Grid { x, y, room, .. } = &field.discretize {
+            selected.insert(x.as_str());
+            selected.insert(y.as_str());
+            selected.insert(room.as_str());
+        }
+    }
+
+    Ok(compiled
+        .fields
+        .iter()
+        .filter(|field| selected.contains(field.name.as_str()))
+        .map(|field| field.name.clone())
+        .collect())
 }
 
 /// Startup-time sync access to the synthesizer so `SynthBringup::run` (the

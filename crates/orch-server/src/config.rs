@@ -7,8 +7,9 @@
 //! effective config, identical for the gRPC and standalone-YAML paths.
 
 use orch_core::types::{
-    Budgets, BurstConfig, CheckpointConfig, ExperimentConfig, LadderConfig, OnGoal, PlateauConfig,
-    PolicyKind, PruneAction, SchedMode, SchedulingConfig, SelectionConfig, StagedConfig,
+    Budgets, BurstConfig, CheckpointConfig, ConfigError, ExperimentConfig, LadderConfig, OnGoal,
+    PlateauConfig, PolicyKind, PruneAction, SchedMode, SchedulingConfig, SelectionConfig,
+    StagedConfig,
 };
 use orch_proto::orchestrator_v1 as wire;
 
@@ -48,6 +49,70 @@ fn policy_kind(value: i32) -> PolicyKind {
         Ok(wire::PolicyKind::Staged) => PolicyKind::Staged,
         _ => PolicyKind::Softmax,
     }
+}
+
+fn enum_is_unknown<T>(value: i32) -> bool
+where
+    T: TryFrom<i32>,
+{
+    T::try_from(value).is_err()
+}
+
+/// Validates sparse proto fields whose invalid values would otherwise be lost
+/// during proto3 default materialization.
+pub fn validate_sparse_wire_config(config: &wire::ExperimentConfig) -> Vec<ConfigError> {
+    let mut errors = Vec::new();
+
+    if let Some(selection) = config.selection.as_ref() {
+        if enum_is_unknown::<wire::PolicyKind>(selection.policy) {
+            errors.push(ConfigError::UnknownEnumValue("selection.policy"));
+        }
+        if let Some(staged) = selection.staged.as_ref() {
+            if enum_is_unknown::<wire::PolicyKind>(staged.inner) {
+                errors.push(ConfigError::UnknownEnumValue("selection.staged.inner"));
+            }
+        }
+    }
+    if let Some(scheduling) = config.scheduling.as_ref() {
+        if enum_is_unknown::<wire::SchedMode>(scheduling.mode) {
+            errors.push(ConfigError::UnknownEnumValue("scheduling.mode"));
+        }
+    }
+    if enum_is_unknown::<wire::PruneAction>(config.prune_action) {
+        errors.push(ConfigError::UnknownEnumValue("prune_action"));
+    }
+    if enum_is_unknown::<wire::OnGoal>(config.on_goal) {
+        errors.push(ConfigError::UnknownEnumValue("on_goal"));
+    }
+
+    errors
+}
+
+pub fn validate_wire_config(config: &wire::ExperimentConfig) -> Vec<ConfigError> {
+    let mut errors = validate_sparse_wire_config(config);
+    errors.extend(effective_config(config).validate_all());
+    errors
+}
+
+pub fn validated_effective_config(
+    config: &wire::ExperimentConfig,
+) -> Result<ExperimentConfig, Vec<ConfigError>> {
+    let effective = effective_config(config);
+    let mut errors = validate_sparse_wire_config(config);
+    errors.extend(effective.validate_all());
+    if errors.is_empty() {
+        Ok(effective)
+    } else {
+        Err(errors)
+    }
+}
+
+pub fn config_validation_failed_detail(violations: &[ConfigError]) -> String {
+    let details: Vec<String> = violations
+        .iter()
+        .map(|violation| violation.to_string())
+        .collect();
+    format!("config validation failed: {}", details.join("; "))
 }
 
 /// Materializes the effective core config from the wire message. Zero /

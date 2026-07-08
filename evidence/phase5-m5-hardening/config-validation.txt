@@ -1,0 +1,24 @@
+# M5 Config Validation Evidence
+
+captured_at_utc: 2026-07-08T17:58:03Z
+commit: de48ff3ca244184db54182472c361960d6be0a3d
+rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
+
+## orch-core config matrix
+$ cargo test -p orch-core --test config_matrix -- --nocapture
+running 3 tests
+test materialized_config_documents_non_rejectable_v1_shapes ... ok
+test config_rejection_doc_matches_code_catalog ... ok
+test materialized_config_rejects_api_section_7_invalid_shapes ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## orch-server config validation surface
+$ cargo test -p orch-server --test config_validation_surface -- --nocapture
+running 5 tests
+test decoded_features_validate_against_compiled_feature_map_and_default_subset ... ok
+test grpc_and_yaml_paths_share_validator_detail ... ok
+test wire_validation_matrix_covers_api_section_7_shapes ... ok
+test wire_validation_rejects_unknown_enums_before_defaulting ... ok
+test grpc_rejects_unknown_decoded_feature_after_feature_map_compile ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
