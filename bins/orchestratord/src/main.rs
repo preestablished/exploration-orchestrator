@@ -11,6 +11,22 @@
 //! Also serves `/healthz` and `/metrics` over plain HTTP. SIGTERM drains:
 //! every running experiment is stopped (final checkpoint) before exit;
 //! SIGKILL is the chaos case the resume path covers.
+//!
+//! `--state-dir <dir>` (both modes): the fake world persists through a
+//! crash-consistent journal (`orch-simstate`); an existing journal is
+//! reloaded, otherwise one is created. Absent flag = journal-less
+//! passthrough, zero behavior change.
+//!
+//! Test-only chaos hooks (the Tier-2 harness's, plan D-T3 — not for
+//! production use):
+//! - `ORCH_CHAOS_HANG_AT=<CrashPoint>:<nth>` (`--experiment` mode only):
+//!   on the nth arrival at the named crash point, print
+//!   `TIER2_CHAOS_HANG point=<point>` and park so the harness can land a
+//!   real SIGKILL there. The gRPC-served path keeps no crash policy (D-T4).
+//! - `ORCH_SIM_TORN_AT=<wal-append|ckpt-put>:<nth>` (read by
+//!   `orch-simstate`): torn journal-frame prefix + marker + park.
+//! - `ORCH_SIM_BREAK=perturb-node|drop-scorer-replay`: reload through a
+//!   deliberately divergent replay (the negative control, plan W2.5).
 
 mod simulate;
 
@@ -20,8 +36,9 @@ use std::process::ExitCode;
 use orch_proto::orchestrator_v1 as wire;
 use orch_server::config::{config_hash, effective_config, wire_config_from_yaml};
 use orch_server::events::SharedSink;
-use orch_server::experiment::{ExperimentRunner, RunnerConfig};
+use orch_server::experiment::{CrashPoint, CrashPolicy, ExperimentRunner, RunnerConfig};
 use orch_server::service::OrchestratorService;
+use orch_simstate::world::BreakMode;
 use tonic::transport::Server;
 use tracing::{error, info};
 
@@ -32,6 +49,7 @@ struct Args {
     experiment_id: Option<String>,
     listen: Option<SocketAddr>,
     http: Option<SocketAddr>,
+    state_dir: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -58,6 +76,9 @@ fn parse_args() -> Result<Args, String> {
                 let value = iter.next().ok_or("--http needs an address")?;
                 args.http = Some(value.parse().map_err(|error| format!("--http: {error}"))?);
             }
+            "--state-dir" => {
+                args.state_dir = Some(iter.next().ok_or("--state-dir needs a directory")?);
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -65,6 +86,68 @@ fn parse_args() -> Result<Args, String> {
         return Err("one of --simulate or --experiment <file.yaml> is required".to_owned());
     }
     Ok(args)
+}
+
+/// `ORCH_SIM_BREAK` (test-only): reload through a deliberately divergent
+/// replay for the negative control.
+fn break_mode_from_env() -> Result<Option<BreakMode>, String> {
+    match std::env::var("ORCH_SIM_BREAK") {
+        Err(_) => Ok(None),
+        Ok(value) => match value.as_str() {
+            "perturb-node" => Ok(Some(BreakMode::PerturbNode)),
+            "drop-scorer-replay" => Ok(Some(BreakMode::DropScorerReplay)),
+            other => Err(format!("ORCH_SIM_BREAK: unknown mode '{other}'")),
+        },
+    }
+}
+
+/// The Tier-2 lattice hook: parks at the named crash point so the harness
+/// can land a real SIGKILL there (plan D-T3). Never returns `true` — the
+/// park *is* the crash site.
+struct HangAt {
+    point: CrashPoint,
+    nth: u32,
+    seen: u32,
+}
+
+impl CrashPolicy for HangAt {
+    fn should_crash(&mut self, point: CrashPoint) -> bool {
+        if point != self.point {
+            return false;
+        }
+        self.seen += 1;
+        if self.seen < self.nth {
+            return false;
+        }
+        println!("TIER2_CHAOS_HANG point={}", point.as_str());
+        use std::io::Write as _;
+        std::io::stdout().flush().expect("stdout flush");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+}
+
+/// `ORCH_CHAOS_HANG_AT=<CrashPoint>:<nth>` (test-only, `--experiment` mode).
+fn hang_policy_from_env() -> Result<Option<Box<dyn CrashPolicy>>, String> {
+    let Ok(value) = std::env::var("ORCH_CHAOS_HANG_AT") else {
+        return Ok(None);
+    };
+    let (point, nth) = value
+        .split_once(':')
+        .ok_or_else(|| format!("ORCH_CHAOS_HANG_AT: expected <point>:<nth>, got '{value}'"))?;
+    let point: CrashPoint = point.parse()?;
+    let nth: u32 = nth
+        .parse()
+        .map_err(|error| format!("ORCH_CHAOS_HANG_AT: bad nth: {error}"))?;
+    if nth == 0 {
+        return Err("ORCH_CHAOS_HANG_AT: nth must be >= 1".to_owned());
+    }
+    Ok(Some(Box::new(HangAt {
+        point,
+        nth,
+        seen: 0,
+    })))
 }
 
 fn producer_id() -> String {
@@ -129,7 +212,7 @@ async fn run_standalone(args: &Args, path: &str) -> Result<(), String> {
         })
         .ok_or("could not derive an experiment id; pass --experiment-id")?;
 
-    let world = simulate::SimulatedWorld::new();
+    let world = simulate::world(args.state_dir.as_deref(), break_mode_from_env()?)?;
     let sources = simulate::sources(&experiment_id);
     let runner_config = RunnerConfig {
         run_id: experiment_id.clone(), // standalone: run_id = experiment_id
@@ -147,7 +230,7 @@ async fn run_standalone(args: &Args, path: &str) -> Result<(), String> {
         world.store.clone(),
         world.synth.clone(),
         world.observatory(),
-        None,
+        hang_policy_from_env()?,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -176,7 +259,9 @@ async fn serve_simulate(args: &Args) -> Result<(), String> {
         .http
         .unwrap_or_else(|| "127.0.0.1:7131".parse().expect("static addr"));
 
-    let world = simulate::SimulatedWorld::new();
+    // The served path keeps no crash policy (plan D-T4); it still honors
+    // --state-dir so a relaunch can resume against the same journal.
+    let world = simulate::world(args.state_dir.as_deref(), break_mode_from_env()?)?;
     let service = std::sync::Arc::new(OrchestratorService::new(
         world.hypervisor.clone(),
         world.scorer.clone(),

@@ -9,34 +9,48 @@ use orch_core::compile::{
     FeatureSemantics, FeatureStability, FeatureValueType, RegionLayout, RegionLayouts,
 };
 use orch_core::types::GuestInstructions;
-use orch_fakes::{
-    grid::GridWorld, hypervisor::FakeHypervisor, observatory::FakeObservatory, scorer::FakeScorer,
-    snapshot_store::InMemorySnapshotStore, synth::FakeSynth,
-};
-use orch_sched::ports::SyncAdapter;
 use orch_server::bringup::{ExperimentSources, WorkloadSpec};
+use orch_simstate::world::{BreakMode, PersistentServices, PersistentWorld};
 
-pub struct SimulatedWorld {
-    pub hypervisor: SyncAdapter<FakeHypervisor>,
-    pub scorer: SyncAdapter<FakeScorer>,
-    pub store: SyncAdapter<InMemorySnapshotStore>,
-    pub synth: SyncAdapter<FakeSynth>,
-}
+/// The `--simulate` world is always the persistent shape (plan W2.3): one
+/// concrete type for both modes, with the journal simply absent when
+/// `--state-dir` is not given.
+pub type SimulatedWorld = PersistentWorld;
 
-impl SimulatedWorld {
-    pub fn new() -> Self {
-        let world = GridWorld::three_room();
-        Self {
-            hypervisor: SyncAdapter::new(FakeHypervisor::with_world(world.clone())),
-            scorer: SyncAdapter::new(FakeScorer::with_world(world)),
-            store: SyncAdapter::new(InMemorySnapshotStore::new()),
-            synth: SyncAdapter::new(FakeSynth::new()),
+/// Builds the fake world: journal-less without a state dir; otherwise
+/// reload-or-create against `<dir>/journal.v1`. `break_mode` is the
+/// negative-control mutation (`ORCH_SIM_BREAK`, test-only) and requires an
+/// existing journal.
+pub fn world(
+    state_dir: Option<&str>,
+    break_mode: Option<BreakMode>,
+) -> Result<SimulatedWorld, String> {
+    let Some(dir) = state_dir else {
+        if break_mode.is_some() {
+            return Err("ORCH_SIM_BREAK requires --state-dir".to_owned());
         }
-    }
-
-    pub fn observatory(&self) -> FakeObservatory {
-        FakeObservatory::new()
-    }
+        return Ok(PersistentServices::ephemeral().into_world());
+    };
+    let dir = std::path::Path::new(dir);
+    let journal_exists = dir.join(orch_simstate::journal::JOURNAL_FILE).exists();
+    let services = match (journal_exists, break_mode) {
+        (true, Some(mode)) => {
+            PersistentServices::reload_broken(dir, mode)
+                .map_err(|error| format!("reload {dir:?}: {error}"))?
+                .0
+        }
+        (true, None) => {
+            PersistentServices::reload(dir)
+                .map_err(|error| format!("reload {dir:?}: {error}"))?
+                .0
+        }
+        (false, Some(_)) => {
+            return Err("ORCH_SIM_BREAK requires an existing journal to corrupt".to_owned())
+        }
+        (false, None) => PersistentServices::create(dir)
+            .map_err(|error| format!("create state dir {dir:?}: {error}"))?,
+    };
+    Ok(services.into_world())
 }
 
 fn machine_config() -> MachineConfig {

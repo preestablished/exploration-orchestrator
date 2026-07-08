@@ -108,6 +108,36 @@ impl CrashPoint {
         CrashPoint::BeforeCasPut,
         CrashPoint::AfterCasPut,
     ];
+
+    /// The variant name, as parsed by [`CrashPoint::from_str`] (the Tier-2
+    /// harness's `ORCH_CHAOS_HANG_AT` hook names points this way).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AfterWalWrite => "AfterWalWrite",
+            Self::AfterDispatch => "AfterDispatch",
+            Self::MidBatchCommit => "MidBatchCommit",
+            Self::AfterCreateNode => "AfterCreateNode",
+            Self::BeforeWalDelete => "BeforeWalDelete",
+            Self::AfterWalDelete => "AfterWalDelete",
+            Self::AfterCommitBeforeCheckpoint => "AfterCommitBeforeCheckpoint",
+            Self::BeforeCheckpointArchive => "BeforeCheckpointArchive",
+            Self::AfterCheckpointArchive => "AfterCheckpointArchive",
+            Self::BeforeCasPut => "BeforeCasPut",
+            Self::AfterCasPut => "AfterCasPut",
+        }
+    }
+}
+
+impl std::str::FromStr for CrashPoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|point| point.as_str() == value)
+            .ok_or_else(|| format!("unknown crash point '{value}'"))
+    }
 }
 
 pub trait CrashPolicy: Send {

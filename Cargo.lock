@@ -715,6 +715,7 @@ dependencies = [
  "orch-proto",
  "orch-sched",
  "orch-server",
+ "orch-simstate",
  "tokio",
  "tonic",
  "tracing",
