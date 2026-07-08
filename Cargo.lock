@@ -194,6 +194,7 @@ version = "0.2.0"
 dependencies = [
  "prost",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "tonic",
  "tonic-prost",
@@ -645,13 +646,6 @@ name = "orch-proto"
 version = "0.1.0"
 dependencies = [
  "determinism-proto",
- "prost",
- "prost-build",
- "prost-types",
- "protoc-bin-vendored",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
 ]
 
 [[package]]

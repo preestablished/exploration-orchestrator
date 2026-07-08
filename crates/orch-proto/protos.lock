@@ -1,11 +1,13 @@
 # Proto provenance
 #
-# determinism/orchestrator/v1/orchestrator.proto — AUTHORED LOCALLY in this
-# repo per API.md §1/§7 (plan decision D4; IMPLEMENTATION-PLAN §M0 sanctioned
-# fallback). Upstream determinism-proto's orchestrator::v1 is a hand-written
-# placeholder with a different StartExperimentRequest shape and no service;
-# reconciling and upstreaming this file into control-plane is a disclosed
-# follow-up bead at M4 handback.
+# determinism/orchestrator/v1/orchestrator.proto — canonical in the
+# control-plane sibling (proto/determinism/orchestrator/v1/), consumed via
+# the determinism-proto crate's `orchestrator` feature. Authored in this
+# repo per API.md §1/§7 (plan decision D4) and upstreamed 2026-07 per bead
+# exploration-orchestrator-777 (control-plane commit recorded in
+# .agents/requests/phase5-prep-proto-upstream-and-tier2-chaos/04-resolution.md).
+# This repo remains the source of truth for the package's contents; no
+# local proto sources remain here.
 #
 # determinism/inputsynth/v1 — consumed from the control-plane sibling
 # checkout via the determinism-proto crate (not vendored here).
