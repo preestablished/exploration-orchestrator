@@ -46,13 +46,13 @@ orchestrator file (see Cross-repo verification, below).
   random=15`** (80 ≥ 50; all 11 lattice points × 5 seeds = 55, both torn
   kinds × 5 = 10, 3 random × 5 = 15), all bit-identical, plus
   `TIER2_GRPC_SMOKE kills=1 resumed=1`. `test result: ok. 2 passed`
-  (`finished in 5933.31s` ≈ 99 min). Kill quota ≥ 50 asserted by the
+  (`finished in 5734.76s` ≈ 96 min). Kill quota ≥ 50 asserted by the
   harness (`TIER2_MIN_KILLS=50`).
 - `evidence/phase5-tier2-chaos/negative-control.txt` — the demonstrated
   negative: `TIER2_NEGATIVE mutation=perturb-node hash_diverged=true
   outcome_diverged=false` (the tree-hash arm of the comparator fired, so
   the demonstration is non-vacuous), `test result: ok. 1 passed`
-  (`finished in 664.14s`).
+  (`finished in 664.48s`).
 - Run manifest commit: `332cc76`, host `infra-control`, rustc 1.96.1.
 - Torn-write truncation proof: the `torn-{wal-append,ckpt-put}` rounds
   assert the relaunch's reload logs a nonzero `truncated_bytes`

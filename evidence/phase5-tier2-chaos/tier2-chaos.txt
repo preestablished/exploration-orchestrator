@@ -1,96 +1,96 @@
 == Tier-2 kill matrix + gRPC resume smoke ==
 test grpc_served_resume_survives_sigkill has been running for over 60 seconds
 test tier2_kill_matrix_resumes_bit_identically has been running for over 60 seconds
-TIER2_SIM_RELOAD frames=33627 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45021 truncated_bytes=0
-TIER2_SIM_RELOAD frames=65999 truncated_bytes=0
-TIER2_SIM_RELOAD frames=65999 truncated_bytes=0
-TIER2_SIM_RELOAD frames=10278 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79377 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79177 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66008 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33627 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45021 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=65999 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=65999 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=10274 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79177 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79377 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66007 truncated_bytes=0
 TIER2_GRPC_SMOKE kills=1 resumed=1
 test grpc_served_resume_survives_sigkill ... ok
-TIER2_SIM_RELOAD frames=66008 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66096 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66112 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66008 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66112 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66198 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66008 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66112 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66208 truncated_bytes=0
-TIER2_SIM_RELOAD frames=67630 truncated_bytes=0
-TIER2_SIM_RELOAD frames=67632 truncated_bytes=0
-TIER2_SIM_RELOAD frames=67632 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66022 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66123 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66009 truncated_bytes=0
-TIER2_SIM_RELOAD frames=66031 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79392 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79392 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79482 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79186 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79376 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79186 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79492 truncated_bytes=0
-TIER2_SIM_RELOAD frames=80820 truncated_bytes=0
-TIER2_SIM_RELOAD frames=80822 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79186 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79290 truncated_bytes=0
-TIER2_SIM_RELOAD frames=80822 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79200 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79249 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45032 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45033 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45122 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45124 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79315 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79235 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45030 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45030 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45132 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45042 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45044 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45044 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45030 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45134 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45044 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45039 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33738 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45049 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33739 truncated_bytes=0
-TIER2_SIM_RELOAD frames=45027 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33828 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33722 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33636 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33636 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33838 truncated_bytes=0
-TIER2_SIM_RELOAD frames=35262 truncated_bytes=0
-TIER2_SIM_RELOAD frames=35264 truncated_bytes=0
-TIER2_SIM_RELOAD frames=35264 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33636 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33738 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33650 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33683 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33725 truncated_bytes=0
-TIER2_SIM_RELOAD frames=33643 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79592 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79592 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79676 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79674 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79386 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79386 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79688 truncated_bytes=0
-TIER2_SIM_RELOAD frames=81020 truncated_bytes=0
-TIER2_SIM_RELOAD frames=81022 truncated_bytes=0
-TIER2_SIM_RELOAD frames=81022 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79386 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79490 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79400 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79383 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79395 truncated_bytes=0
-TIER2_SIM_RELOAD frames=79427 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66008 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66198 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66096 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66112 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66113 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66008 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66208 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66008 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66112 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=67632 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=67632 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=67630 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66022 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66015 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66103 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=66027 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79392 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79392 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79376 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79186 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79482 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79186 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79492 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=80820 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79186 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79290 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=80822 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=80822 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79200 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79265 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45032 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45032 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45122 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45124 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79291 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79287 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45030 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45030 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45132 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45042 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45044 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45044 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45030 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45134 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45044 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45035 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45043 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33738 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33738 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=45025 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33828 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33722 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33636 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33636 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33838 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=35262 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=35264 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=35264 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33636 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33738 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33650 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33693 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33707 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=33639 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79592 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79592 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79676 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79674 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79386 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79386 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79688 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=81020 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=81022 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=81022 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79386 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79490 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79400 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79385 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79395 truncated_bytes=0
+TIER2_SIM_RELOAD readonly frames=79411 truncated_bytes=0
 TIER2_SUMMARY seeds=5 kills=80 lattice=55 torn=10 random=15
 test tier2_kill_matrix_resumes_bit_identically ... ok
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 5933.31s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 5734.76s
