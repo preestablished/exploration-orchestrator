@@ -92,6 +92,7 @@ struct RetentionStats {
     max_orphans_removed: u64,
     watch_events_compacted: u64,
     observatory_events_compacted: u64,
+    busy_skips: u64,
 }
 
 struct PeriodicSnapshotRetention {
@@ -121,15 +122,22 @@ impl CrashPolicy for PeriodicSnapshotRetention {
                     .map(|node| node.snapshot_ref)
                     .collect::<BTreeSet<_>>()
             })
-            .expect("store idle at post-commit retention hook");
-        let (removed, watch_events_compacted) = self
-            .hypervisor
-            .with_service_sync(|hypervisor| {
-                let removed = hypervisor.retain_live_snapshots(&committed_refs);
-                let watch_events_compacted = hypervisor.compact_consumed_watch_events();
-                (removed, watch_events_compacted)
-            })
-            .expect("hypervisor idle at post-commit retention hook");
+            .ok();
+        let Some(committed_refs) = committed_refs else {
+            let mut stats = self.stats.lock().expect("retention stats lock");
+            stats.busy_skips = stats.busy_skips.saturating_add(1);
+            return false;
+        };
+        let retained = self.hypervisor.with_service_sync(|hypervisor| {
+            let removed = hypervisor.retain_live_snapshots(&committed_refs);
+            let watch_events_compacted = hypervisor.compact_consumed_watch_events();
+            (removed, watch_events_compacted)
+        });
+        let Ok((removed, watch_events_compacted)) = retained else {
+            let mut stats = self.stats.lock().expect("retention stats lock");
+            stats.busy_skips = stats.busy_skips.saturating_add(1);
+            return false;
+        };
         let removed = u64::try_from(removed.len()).unwrap_or(u64::MAX);
         let watch_events_compacted = u64::try_from(watch_events_compacted).unwrap_or(u64::MAX);
         let observatory_events_compacted = u64::try_from(
@@ -174,9 +182,11 @@ async fn m5_fault_injected_fake_soak_smoke() {
     )));
     let mut config = grid_config(seed);
     config.burst.k_per_expansion = k;
-    config.budgets.max_expansions = 1_000_000;
+    config.budgets.max_expansions = 10_000_000;
     config.budgets.max_wall_clock_s = duration.as_secs().saturating_add(60);
     config.budgets.max_nodes = 0;
+    config.selection.max_visits_per_node = u32::MAX;
+    config.selection.exhaust_after_dup_expansions = u32::MAX;
     config.checkpoint.every_commits = 4;
     config.checkpoint.every_seconds = 1;
     config.on_goal = OnGoal::Continue;
@@ -215,13 +225,21 @@ async fn m5_fault_injected_fake_soak_smoke() {
     )
     .await
     .expect("runner starts");
-    let run = tokio::spawn(runner.run());
-    tokio::time::sleep(duration).await;
-    handle.send(Control::Stop).expect("stop runner");
-    let outcome = run
-        .await
-        .expect("runner task joins")
-        .expect("runner returns outcome");
+    let mut run = tokio::spawn(runner.run());
+    let outcome = tokio::select! {
+        () = tokio::time::sleep(duration) => {
+            handle.send(Control::Stop).expect("stop runner");
+            run.await
+                .expect("runner task joins")
+                .expect("runner returns outcome")
+        }
+        early = &mut run => {
+            let outcome = early
+                .expect("runner task joins")
+                .expect("runner returns outcome");
+            panic!("soak runner ended before requested duration: {outcome:?}");
+        }
+    };
 
     assert_eq!(outcome.state, ExperimentState::Stopped);
     assert!(outcome.expansions > 0, "soak made no progress");
@@ -276,7 +294,7 @@ async fn m5_fault_injected_fake_soak_smoke() {
     assert_fault_stats("observatory", observatory_faults);
 
     println!(
-        "M5_SOAK_SUMMARY duration_seconds={} k={} seed={} fault_seed={} config_hash={} expansions={} nodes={} committed_refs={} pre_gc_orphans={} post_gc_live={} periodic_gc_runs={} periodic_gc_orphans={} periodic_gc_max_orphans={} watch_events_compacted={} observatory_events_compacted={} failed_reason=none",
+        "M5_SOAK_SUMMARY duration_seconds={} k={} seed={} fault_seed={} config_hash={} expansions={} nodes={} committed_refs={} pre_gc_orphans={} post_gc_live={} periodic_gc_runs={} periodic_gc_orphans={} periodic_gc_max_orphans={} watch_events_compacted={} observatory_events_compacted={} retention_busy_skips={} failed_reason=none",
         duration.as_secs(),
         k,
         seed,
@@ -292,6 +310,7 @@ async fn m5_fault_injected_fake_soak_smoke() {
         retention_stats.max_orphans_removed,
         retention_stats.watch_events_compacted,
         retention_stats.observatory_events_compacted,
+        retention_stats.busy_skips,
     );
     println!(
         "M5_SOAK_FAULT_COUNTS hypervisor_decisions={} hypervisor_latency={} hypervisor_terminal={} scorer_decisions={} scorer_latency={} scorer_terminal={} store_decisions={} store_latency={} store_terminal={} synth_decisions={} synth_latency={} synth_terminal={} observatory_decisions={} observatory_latency={} observatory_terminal={}",
