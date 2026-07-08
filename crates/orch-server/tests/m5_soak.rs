@@ -16,7 +16,7 @@ use orch_clients::{
 use orch_core::types::{NodeStatus, OnGoal, SchedMode};
 use orch_fakes::{
     fault::{FaultPlan, FaultStats, LatencyFault},
-    grid::GridWorld,
+    grid::{GridPos, GridWorld, Room, GRID_HEIGHT, GRID_WIDTH},
     hypervisor::FakeHypervisor,
     observatory::FakeObservatory,
     snapshot_store::InMemorySnapshotStore,
@@ -83,6 +83,30 @@ fn assert_fault_stats(target: &str, stats: FaultStats) {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn soak_world() -> GridWorld {
+    let mut walls = Vec::new();
+    for x in 0..GRID_WIDTH {
+        for y in 0..GRID_HEIGHT {
+            if !(y == 0 && (x == 0 || x == 1)) {
+                walls.push(GridPos::new(Room::Start, x, y));
+            }
+        }
+    }
+    GridWorld {
+        name: "m5-soak-two-cell".to_owned(),
+        start: GridPos::new(Room::Start, 0, 0),
+        walls,
+        doors: Vec::new(),
+        key: None,
+        boss: None,
+        goal: GridPos::new(Room::Boss, 4, 4),
+        room_base_score: [0.0, 0.0, 0.0],
+        room_x_weight: [1.0, 0.0, 0.0],
+        room_y_weight: [0.0, 0.0, 0.0],
+        prune_cell: None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -171,7 +195,7 @@ async fn m5_fault_injected_fake_soak_smoke() {
     let gc_every_commits = env_u64("M5_SOAK_GC_EVERY_COMMITS", 64);
 
     let world = FakeWorld::with_service_plans(
-        GridWorld::three_room(),
+        soak_world(),
         service_fault_plan(fault_seed.wrapping_add(1), "run"),
         service_fault_plan(fault_seed.wrapping_add(2), "score_batch"),
         service_fault_plan(fault_seed.wrapping_add(3), "put_metadata"),
