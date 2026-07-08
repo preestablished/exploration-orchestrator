@@ -272,7 +272,25 @@ struct Fingerprints {
 }
 
 fn fingerprints(dir: &Path, cfg_hash: &[u8; 32]) -> Fingerprints {
-    let (services, _stats) = PersistentServices::reload(dir).expect("offline reload");
+    fingerprints_with(dir, cfg_hash, None)
+}
+
+/// End-state fingerprints, reading the state-dir with an optional break
+/// mode. A clean (unbroken) dir uses plain `reload` — digest checks on, the
+/// hidden-nondeterminism tripwire live. A deliberately-broken dir must be
+/// read with the SAME break mode via `reload_broken`: its post-resume ops
+/// were journaled reflecting the perturbed trajectory, so an unbroken
+/// replay would (correctly) trip the digest check on those ops. Re-applying
+/// the same mutation reconstructs the exact divergent committed state.
+fn fingerprints_with(
+    dir: &Path,
+    cfg_hash: &[u8; 32],
+    break_mode: Option<orch_simstate::world::BreakMode>,
+) -> Fingerprints {
+    let (services, _stats) = match break_mode {
+        None => PersistentServices::reload(dir).expect("offline reload"),
+        Some(mode) => PersistentServices::reload_broken(dir, mode).expect("offline broken reload"),
+    };
     let store = services.store.inner();
     assert_no_stranded_frontier(store, EXPERIMENT_ID);
     let checkpoint_bytes = store
@@ -573,8 +591,9 @@ fn negative_control_detects_divergence() {
     let base = tempfile::tempdir().expect("tempdir");
     let context = seed_context(base.path(), 0x5EED);
 
-    // Kill at BeforeCasPut:1 — 16 commits have happened, so >=1 committed
-    // node exists for the perturbation to land on.
+    // Kill at BeforeCasPut:1 — the initial (bootstrap) checkpoint's CAS
+    // put. The root node is already committed by then, so >=1 create_node
+    // exists in the journal for the perturbation to land on during replay.
     let dir = context.root.join("negative");
     let mut launched = launch(
         &context.yaml,
@@ -613,7 +632,16 @@ fn negative_control_detects_divergence() {
         WaitOutcome::CleanExit | WaitOutcome::FailedExit(_) => {}
         WaitOutcome::Marker => panic!("no chaos hook set on the broken relaunch"),
     }
-    let state = fingerprints(&dir, &context.cfg_hash);
+    // Read the broken end-state by re-applying the same mutation: the
+    // perturbed run's post-resume ops were journaled against perturbed
+    // state, so a plain unbroken reload would (rightly) trip the digest
+    // tripwire. reload_broken skips digest checks and reproduces the exact
+    // divergent committed tree.
+    let state = fingerprints_with(
+        &dir,
+        &context.cfg_hash,
+        Some(orch_simstate::world::BreakMode::PerturbNode),
+    );
     let hash_diverged = state.tree != context.control.tree;
     let outcome_diverged = state.status != ExperimentState::GoalReached;
     println!(
@@ -723,8 +751,15 @@ fn grpc_served_resume_survives_sigkill() {
                 .into_inner();
             assert_eq!(response.resumed_at_batch_seq, 0, "fresh start");
 
-            // Poll past the first checkpoint boundary (every_commits = 16)
-            // before killing, so resumed_at_batch_seq > 0 is not flaky.
+            // Poll well past the first real (post-bootstrap) checkpoint
+            // before killing. bootstrap_fresh writes an INITIAL checkpoint
+            // at batch_seq 0; the wire status exposes only the current
+            // batch_seq (not checkpointed_batch_seq), and grid-world
+            // duplicates make real commits (every_commits = 16) accrue
+            // slower than batch_seq — so a low threshold can leave only the
+            // seq-0 checkpoint durable, making a resumed_at > 0 assertion
+            // flaky. The offline guard below is the real gate; this just
+            // gets us comfortably into batch territory.
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let status = client
@@ -741,7 +776,7 @@ fn grpc_served_resume_survives_sigkill() {
                     // Finished before we killed: no resume to prove here.
                     return false;
                 }
-                if batch_seq >= 8 {
+                if batch_seq >= 96 {
                     return true;
                 }
             }
@@ -753,18 +788,23 @@ fn grpc_served_resume_survives_sigkill() {
         }
 
         // Offline guard: the kill must have landed after a persisted
-        // checkpoint, else retry (poll raced the checkpoint write).
+        // *post-bootstrap* checkpoint (batch_seq > 0) — the seq-0 initial
+        // checkpoint alone would make the resumed_at > 0 assertion fail
+        // legitimately. Retry on a fresh dir if the poll raced the first
+        // real checkpoint write.
         {
             let (services, _stats) =
                 PersistentServices::reload(&state_dir).expect("offline reload");
-            if services
-                .store
-                .inner()
-                .get_metadata(GetMetadataRequest {
-                    key: MetadataKey::checkpoint(EXPERIMENT_ID),
-                })
-                .is_err()
-            {
+            let checkpoint = services.store.inner().get_metadata(GetMetadataRequest {
+                key: MetadataKey::checkpoint(EXPERIMENT_ID),
+            });
+            let real_checkpoint = match checkpoint {
+                Ok(response) => decode_checkpoint(&response.value, EXPERIMENT_ID, &cfg_hash)
+                    .map(|checkpoint| checkpoint.batch_seq > 0)
+                    .unwrap_or(false),
+                Err(_) => false,
+            };
+            if !real_checkpoint {
                 continue 'smoke;
             }
         }
