@@ -109,6 +109,31 @@ impl FakeScorer {
             .map(|archive| archive.archive_seq)
     }
 
+    /// Comparator accessor (Tier-2): the archive fields that define committed
+    /// scorer state — `(archive_seq, cell_counts, feature_map_hash,
+    /// program_hash)`. `orch-simstate`'s `scorer_archive_fingerprint` hashes
+    /// these; batch caches and fault state are deliberately excluded.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn archive_parts(
+        &self,
+        experiment_id: &str,
+    ) -> Option<(
+        u64,
+        &BTreeMap<CellKey, u32>,
+        Option<Digest32>,
+        Option<Digest32>,
+    )> {
+        self.experiments.get(experiment_id).map(|archive| {
+            (
+                archive.archive_seq,
+                &archive.cell_counts,
+                archive.feature_map_hash,
+                archive.program_hash,
+            )
+        })
+    }
+
     fn archive_mut(&mut self, experiment_id: &str) -> &mut ExperimentArchive {
         self.experiments
             .entry(experiment_id.to_owned())

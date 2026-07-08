@@ -16,8 +16,6 @@
 mod support;
 
 use orch_checkpoint::ExperimentState;
-use orch_clients::snapshot_store::{OrderBy, QueryNodesRequest, SnapshotStoreClient};
-use orch_driver::node_attrs::decode_node_attrs;
 use orch_fakes::{grid::GridWorld, snapshot_store::InMemorySnapshotStore};
 use orch_server::experiment::{
     CrashPoint, CrashPolicy, ExperimentRunner, RunOutcome, CRASHED_MARKER,
@@ -40,84 +38,14 @@ impl CrashPolicy for CrashOnce {
     }
 }
 
+// The comparator is shared with the Tier-2 harness (extracted to
+// orch-simstate in W2.2; assertions identical).
 fn store_tree_hash(store: &InMemorySnapshotStore) -> [u8; 32] {
-    let mut nodes = store
-        .query_nodes(QueryNodesRequest {
-            experiment_id: EXPERIMENT_ID.to_owned(),
-            statuses: Vec::new(),
-            min_progress: None,
-            max_progress: None,
-            min_novelty: None,
-            min_depth: None,
-            max_depth: None,
-            created_after: None,
-            updated_after: None,
-            order_by: OrderBy::CreatedAt,
-            limit: None,
-        })
-        .expect("query nodes")
-        .nodes;
-    nodes.sort_by_key(|node| node.node_id);
-
-    let mut hasher = blake3::Hasher::new();
-    let mut previous_id: Option<u64> = None;
-    for node in &nodes {
-        // Zero id reuse / dense ids: strictly increasing by exactly one.
-        if let Some(previous) = previous_id {
-            assert_eq!(
-                node.node_id.get(),
-                previous + 1,
-                "node ids must stay dense (no reuse, no gaps)"
-            );
-        }
-        previous_id = Some(node.node_id.get());
-        let attrs = decode_node_attrs(&node.attrs).expect("node attrs decode");
-        hasher.update(&node.node_id.get().to_le_bytes());
-        hasher.update(
-            &node
-                .parent_node_id
-                .map_or(u64::MAX, |parent| parent.get())
-                .to_le_bytes(),
-        );
-        hasher.update(attrs.synth.state_hash.as_bytes());
-        hasher.update(&node.progress_score.get().to_le_bytes());
-        hasher.update(&attrs.synth.cell_key.get().to_le_bytes());
-    }
-    *hasher.finalize().as_bytes()
+    orch_simstate::compare::store_tree_hash(store, EXPERIMENT_ID)
 }
 
 fn assert_no_stranded_frontier(store: &InMemorySnapshotStore) {
-    // Every FRONTIER row must be adoptable: parent chain intact and attrs
-    // decodable (what §8.2 step 4 needs). Nothing may reference a missing
-    // node.
-    let nodes = store
-        .query_nodes(QueryNodesRequest {
-            experiment_id: EXPERIMENT_ID.to_owned(),
-            statuses: Vec::new(),
-            min_progress: None,
-            max_progress: None,
-            min_novelty: None,
-            min_depth: None,
-            max_depth: None,
-            created_after: None,
-            updated_after: None,
-            order_by: OrderBy::CreatedAt,
-            limit: None,
-        })
-        .expect("query nodes")
-        .nodes;
-    let ids: std::collections::BTreeSet<_> = nodes.iter().map(|node| node.node_id).collect();
-    for node in &nodes {
-        if let Some(parent) = node.parent_node_id {
-            assert!(
-                ids.contains(&parent),
-                "node {} references missing parent {}",
-                node.node_id.get(),
-                parent.get()
-            );
-        }
-        decode_node_attrs(&node.attrs).expect("attrs decode");
-    }
+    orch_simstate::compare::assert_no_stranded_frontier(store, EXPERIMENT_ID);
 }
 
 async fn uninterrupted_run(seed: u64) -> ([u8; 32], RunOutcome) {

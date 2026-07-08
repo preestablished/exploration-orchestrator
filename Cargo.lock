@@ -676,6 +676,7 @@ dependencies = [
  "orch-fakes",
  "orch-proto",
  "orch-sched",
+ "orch-simstate",
  "postcard",
  "proptest",
  "prost",
@@ -685,6 +686,21 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "orch-simstate"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "orch-clients",
+ "orch-core",
+ "orch-driver",
+ "orch-fakes",
+ "orch-sched",
+ "postcard",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

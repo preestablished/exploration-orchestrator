@@ -35,6 +35,7 @@ optional = true
 
 [dev-dependencies]
 orch-fakes = { path = "../orch-fakes" }
+orch-simstate = { path = "../orch-simstate" }
 tokio-stream = { version = "0.1", features = ["net"] }
 proptest.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "test-util"] }
