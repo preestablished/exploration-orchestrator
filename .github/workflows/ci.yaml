@@ -40,3 +40,32 @@ jobs:
       # event-sequence hashes) on both matrix arms.
       - run: cargo test -p orch-server --test seed_gate
         working-directory: repo
+  # Tier-2 true-SIGKILL chaos smoke (plan D-T5): reduced matrix — 1 seed,
+  # 3 lattice points, both torn-write kinds, 2 random kills, the served-gRPC
+  # resume smoke, and the negative control. Every mechanism exercised on
+  # every push; the full matrix is the evidence lane
+  # (scripts/evidence-tier2.sh). Separate job so its runtime stays visible
+  # and its failure names itself.
+  tier2-chaos-smoke:
+    name: tier2-chaos-smoke (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/control-plane
+          path: control-plane
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p orchestratord --test tier2_chaos -- --nocapture
+        working-directory: repo
+        env:
+          TIER2_ENABLE: "1"

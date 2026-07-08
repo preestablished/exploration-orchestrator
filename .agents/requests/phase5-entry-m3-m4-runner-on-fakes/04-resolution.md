@@ -125,6 +125,20 @@ Filed in the tracker at close:
   control-plane and reconcile `ExperimentSpec` vs `ExperimentConfig`.
 - Tier-2 true-SIGKILL harness (whole-fake-world persistence wrapper,
   crash-consistent journal) — descoped per the D5 trigger.
+  **Addendum 2026-07-08: gap closed.** Bead `exploration-orchestrator-6ft`
+  is closed by the phase5-prep plan
+  (`.agents/plans/phase5-prep-proto-upstream-and-tier2-chaos/`): the
+  `orch-simstate` crash-consistent journal + `PersistentWorld` wrappers,
+  `orchestratord --state-dir`, and the true-SIGKILL harness
+  `bins/orchestratord/tests/tier2_chaos.rs` (11-point lattice + forced
+  torn-WAL/torn-checkpoint writes + random kills + served-gRPC resume
+  smoke + demonstrated negative control), with the full-matrix evidence
+  in `evidence/phase5-tier2-chaos/` and the reduced smoke in CI
+  (`tier2-chaos-smoke`). The Phase 5 gate-run checklist should cite this
+  closure, not the descope. The proto-upstream bead
+  (`exploration-orchestrator-777`) above is likewise closed —
+  `determinism.orchestrator.v1` is canonical in control-plane and
+  `orch-proto` is a re-export shim (see that plan's `04-resolution.md`).
 - Fake lease-reclamation semantics (`reclaim_session`) pending the
   hypervisor owner-doc confirmation; re-verify at M6.
 - M6 constraint: `GeneratedInputSynthClient`'s internal block_on Runtime
