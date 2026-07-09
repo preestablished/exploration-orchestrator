@@ -1,7 +1,7 @@
 # M5 FAILED Reason Census
 
-captured_at_utc: 2026-07-08T18:49:43Z
-lane: smoke
+captured_at_utc: 2026-07-09T23:00:43Z
+lane: 24h
 observed_failed_reasons: none observed
 
 Runbook: docs/runtime-terminal-reasons.md
