@@ -1,27 +1,33 @@
 # M5 Soak smoke Evidence
 
-start_utc: 2026-07-08T21:35:40Z
-commit: af8b2dd1edf009295b33ddf4588724bc987269d7
+start_utc: 2026-07-10T02:49:17Z
+commit: d38fce153bb9718e193956b68755547b57aeb7a3
 host: infra-control
 rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
-duration_seconds: 2
+duration_seconds: 10
 seed: 24069
 fault_seed: 1024369
 k: 64
-gc_every_commits: 64
+gc_every_commits: 4
 scrape_interval_seconds: 1
 rss_tolerance_percent: 50
 rss_warmup_samples: 2
-fault_plan: deterministic latency base=1 jitter=3 plus one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit
+rss_required: 0
+rss_min_evaluated_samples: 4
+fault_plan: deterministic latency base=1 jitter=3 charged by async adapters for hypervisor/scorer/store/synth; one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit
 tier2: not used in this lane
 
 ## command
-$ M5_SOAK_DURATION_SECONDS=2 M5_SOAK_SEED=24069 M5_SOAK_FAULT_SEED=1024369 M5_SOAK_K=64 M5_SOAK_GC_EVERY_COMMITS=64 cargo test -p orch-server --test m5_soak -- --nocapture
-end_utc: 2026-07-08T21:35:43Z
-elapsed_wall_seconds: 3
-M5_SOAK_SUMMARY duration_seconds=2 k=64 seed=24069 fault_seed=1024369 config_hash=7b84be83174bb395084bd3d1e4363ffa729ba5c89f2e14f6cac6060fbe0c16d7 expansions=21 nodes=2 committed_refs=2 pre_gc_orphans=591 post_gc_live=2 periodic_gc_runs=0 periodic_gc_orphans=0 periodic_gc_max_orphans=0 watch_events_compacted=0 observatory_events_compacted=0 retention_busy_skips=0 failed_reason=none
-M5_SOAK_FAULT_COUNTS hypervisor_decisions=7306 hypervisor_latency=7306 hypervisor_terminal=1 scorer_decisions=34 scorer_latency=34 scorer_terminal=1 store_decisions=1489 store_latency=1489 store_terminal=1 synth_decisions=22 synth_latency=22 synth_terminal=1 observatory_decisions=1375 observatory_latency=1375 observatory_terminal=1
+$ M5_SOAK_DURATION_SECONDS=10 M5_SOAK_SEED=24069 M5_SOAK_FAULT_SEED=1024369 M5_SOAK_K=64 M5_SOAK_GC_EVERY_COMMITS=4 M5_SOAK_REQUIRE_RSS_EVIDENCE=0 M5_SOAK_MIN_RSS_EVALUATED_SAMPLES=4 cargo test -p orch-server --test m5_soak -- --nocapture
+end_utc: 2026-07-10T02:49:29Z
+elapsed_wall_seconds: 12
+running 2 tests
+test fake_latency_probe_consumes_the_same_attempt_stream_shape ... ok
+M5_SOAK_SUMMARY duration_seconds=10 k=64 seed=24069 fault_seed=1024369 config_hash=92e96be9d3244b110e530e38a113c4132bcfb38fcfdaf4b4f60f128835eea584 expansions=19 nodes=2 committed_refs=2 pre_gc_orphans=137 post_gc_live=2 checkpoint_generation=9 checkpoint_min_generation=6 checkpoint_every_commits=4 periodic_gc_runs=4 periodic_gc_orphans=665 periodic_gc_max_orphans=172 watch_events_compacted=4102 observatory_events_compacted=1049 retention_busy_skips=0 failed_reason=none
+M5_SOAK_LATENCY_CHARGED hypervisor_calls=7528 hypervisor_charged_calls=7528 hypervisor_charged_ticks=18747 scorer_calls=34 scorer_charged_calls=34 scorer_charged_ticks=84 store_calls=1304 store_charged_calls=1304 store_charged_ticks=3247 synth_calls=20 synth_charged_calls=20 synth_charged_ticks=42
+M5_SOAK_FAULT_COUNTS hypervisor_decisions=7527 hypervisor_latency=7527 hypervisor_terminal=1 scorer_decisions=34 scorer_latency=34 scorer_terminal=1 store_decisions=1353 store_latency=1353 store_terminal=1 synth_decisions=20 synth_latency=20 synth_terminal=1 observatory_decisions=1247 observatory_latency=1247 observatory_terminal=1
 test m5_fault_injected_fake_soak_smoke ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
-RSS_SUMMARY samples=2 warmup_omitted=2 evaluated_samples=0 min_kib=0 max_kib=0 delta_percent=0.00
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.27s
+RSS_SUMMARY samples=9 warmup_omitted=2 evaluated_samples=7 min_kib=65584 max_kib=66084 delta_percent=0.76
+RSS_EVIDENCE required=0 min_evaluated_samples=4
 

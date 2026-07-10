@@ -1,7 +1,7 @@
 # M5 Metrics Evidence
 
-captured_at_utc: 2026-07-08T18:06:24Z
-commit: de48ff3ca244184db54182472c361960d6be0a3d
+captured_at_utc: 2026-07-10T02:48:54Z
+commit: d38fce153bb9718e193956b68755547b57aeb7a3
 rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
 
 ## Before metric families
@@ -39,5 +39,5 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ## orchestratord HTTP metrics endpoint
 $ cargo test -p orchestratord --test http_metrics -- --nocapture
 test simulate_metrics_endpoint_serves_catalog_and_live_counters ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
 

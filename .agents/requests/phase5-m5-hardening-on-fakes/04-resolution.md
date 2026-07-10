@@ -96,6 +96,25 @@ Final gates run after adding the resolution:
 
 All passed on 2026-07-09. The workspace suite included the M5 smoke, config validation surface, metrics surface, CAS ownership-loss, seed gate, and Tier-2 chaos tests.
 
+## Post-Review Follow-Up
+
+On 2026-07-10, two review agents found evidence-harness gaps after the 24 h closeout. Follow-up plan: `./.agents/plans/phase5-m5-review-followups/00-plan.md`.
+
+Follow-up implementation commit: `d38fce153bb9718e193956b68755547b57aeb7a3`.
+
+Follow-up evidence:
+
+- `evidence/phase5-m5-hardening/config-validation.txt`
+- `evidence/phase5-m5-hardening/metrics-diff.txt`
+- `evidence/phase5-m5-hardening/cas-ownership.txt`
+- `evidence/phase5-m5-hardening/soak-smoke.txt`
+- `evidence/phase5-m5-hardening/run-manifest-smoke.md`
+- `evidence/phase5-m5-hardening/failed-reason-census-smoke.txt`
+
+The regenerated config, metrics, and CAS evidence now stamps `d38fce153bb9718e193956b68755547b57aeb7a3`, which contains the referenced tests. The follow-up smoke lane proves real charged adapter latency for hypervisor/scorer/store/synth via `M5_SOAK_LATENCY_CHARGED`, checkpoint cadence via `checkpoint_generation >= checkpoint_min_generation`, and periodic retention/compaction via nonzero periodic counters. Smoke RSS is explicitly classified as not required (`RSS_EVIDENCE required=0`); the 24 h lane remains the RSS-bounded lane.
+
+This follow-up does not replace the 24 h lane at `af8b2dd1edf009295b33ddf4588724bc987269d7`. It narrows the old latency claim: the 24 h evidence proves fake latency decisions and retry behavior under service faults, while the 2026-07-10 smoke evidence proves the harness now charges adapter sleeps for those latency decisions on the async fake service adapters.
+
 ## Observatory Handoff
 
 - The canonical orchestrator-side event stream surface remains the external docs snapshot at `/home/infra-admin/.agents/projects/determinism/docs/exploration-orchestrator/API.md` section 6 plus the local transport-free boundary in `crates/orch-clients/src/observatory.rs`.
