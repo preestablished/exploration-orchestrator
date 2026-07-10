@@ -15,15 +15,21 @@ use orch_clients::{
 };
 use orch_core::types::{NodeStatus, OnGoal, SchedMode};
 use orch_fakes::{
-    fault::{FaultPlan, FaultStats, LatencyFault},
+    fault::{
+        FaultInjector, FaultPlan, FaultRequest, FaultStats, FaultTarget, FaultTerminal,
+        LatencyFault,
+    },
     grid::{GridPos, GridWorld, Room, GRID_HEIGHT, GRID_WIDTH},
     hypervisor::FakeHypervisor,
     observatory::FakeObservatory,
     snapshot_store::InMemorySnapshotStore,
 };
-use orch_sched::ports::SyncAdapter;
+use orch_sched::ports::{LatencyProbe, SyncAdapter};
 use orch_server::experiment::{Control, CrashPoint, CrashPolicy, ExperimentRunner};
-use support::{grid_config, sources, FakeWorld, SharedSink, EXPERIMENT_ID};
+use support::{
+    grid_config, sources, FakeLatencyProbe, FakeWorld, LatencyChargeStats, SharedLatencyStats,
+    SharedSink, EXPERIMENT_ID,
+};
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -78,6 +84,21 @@ fn assert_fault_stats(target: &str, stats: FaultStats) {
     assert!(
         stats.terminal_faults_total > 0,
         "{target} one-shot transient error never fired: {stats:?}"
+    );
+}
+
+fn assert_charged_latency(target: &str, stats: LatencyChargeStats) {
+    assert!(
+        stats.calls_total > 0,
+        "{target} adapter latency probe was never exercised"
+    );
+    assert!(
+        stats.charged_calls_total > 0,
+        "{target} adapter latency was never charged: {stats:?}"
+    );
+    assert!(
+        stats.charged_ticks_total > 0,
+        "{target} adapter latency charged zero ticks: {stats:?}"
     );
 }
 
@@ -186,13 +207,37 @@ impl CrashPolicy for PeriodicSnapshotRetention {
     }
 }
 
+#[test]
+fn fake_latency_probe_consumes_the_same_attempt_stream_shape() {
+    let plan = service_fault_plan(0x51A7, "run");
+    let stats = SharedLatencyStats::default();
+    let mut probe = FakeLatencyProbe::new(FaultTarget::Hypervisor, plan.clone(), stats.clone());
+    let fake = FaultInjector::new(plan);
+    let request = FaultRequest::new(FaultTarget::Hypervisor, "run", b"same-request");
+
+    for _ in 0..4 {
+        let pending = probe.pending_call("run", b"same-request");
+        let decision = fake.decide(request, 0);
+        assert_eq!(pending.latency_ticks, decision.latency_ticks);
+        assert_eq!(
+            pending.timeout,
+            matches!(decision.terminal, FaultTerminal::Timeout)
+        );
+    }
+
+    let stats = stats.snapshot();
+    assert_eq!(stats.calls_total, 4);
+    assert!(stats.charged_calls_total > 0);
+    assert!(stats.charged_ticks_total > 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m5_fault_injected_fake_soak_smoke() {
-    let duration = Duration::from_secs(env_u64("M5_SOAK_DURATION_SECONDS", 2));
+    let duration = Duration::from_secs(env_u64("M5_SOAK_DURATION_SECONDS", 10));
     let seed = env_u64("M5_SOAK_SEED", 0x5E05);
     let fault_seed = env_u64("M5_SOAK_FAULT_SEED", 0xFA171);
     let k = env_u32("M5_SOAK_K", 64);
-    let gc_every_commits = env_u64("M5_SOAK_GC_EVERY_COMMITS", 64);
+    let gc_every_commits = env_u64("M5_SOAK_GC_EVERY_COMMITS", 4);
 
     let world = FakeWorld::with_service_plans(
         soak_world(),
@@ -213,6 +258,7 @@ async fn m5_fault_injected_fake_soak_smoke() {
     config.selection.exhaust_after_dup_expansions = u32::MAX;
     config.checkpoint.every_commits = 4;
     config.checkpoint.every_seconds = 1;
+    let checkpoint_every_commits = config.checkpoint.every_commits;
     config.on_goal = OnGoal::Continue;
     config.scheduling.mode = SchedMode::Deterministic;
     config.scheduling.max_inflight_batches = 1;
@@ -278,6 +324,7 @@ async fn m5_fault_injected_fake_soak_smoke() {
             key: MetadataKey::checkpoint(EXPERIMENT_ID),
         })
         .expect("final checkpoint metadata exists");
+    let checkpoint_generation = checkpoint_response.generation.get();
     drop(store);
     let checkpoint =
         decode_checkpoint(&checkpoint_response.value, EXPERIMENT_ID, &hash).expect("checkpoint");
@@ -288,6 +335,11 @@ async fn m5_fault_injected_fake_soak_smoke() {
     assert_eq!(
         checkpoint.batch_seq, outcome.expansions,
         "final checkpoint covers every completed expansion"
+    );
+    let checkpoint_min_generation = 2 + outcome.expansions / u64::from(checkpoint_every_commits);
+    assert!(
+        checkpoint_generation >= checkpoint_min_generation,
+        "checkpoint generation {checkpoint_generation} below commit-cadence lower bound {checkpoint_min_generation}"
     );
 
     let hypervisor = world.hypervisor.service();
@@ -308,17 +360,37 @@ async fn m5_fault_injected_fake_soak_smoke() {
         .expect("observatory lock")
         .fault_stats();
     let retention_stats = *retention_stats.lock().expect("retention stats lock");
+    let hypervisor_latency = world.latency.hypervisor.snapshot();
+    let scorer_latency = world.latency.scorer.snapshot();
+    let store_latency = world.latency.store.snapshot();
+    let synth_latency = world.latency.synth.snapshot();
 
     assert_eq!(removed, pre_gc_orphans);
     assert_eq!(post_gc_live, committed_refs);
+    assert!(
+        retention_stats.runs > 0,
+        "periodic snapshot retention never ran"
+    );
+    assert!(
+        retention_stats.watch_events_compacted > 0,
+        "periodic retention compacted no hypervisor watch events"
+    );
+    assert!(
+        retention_stats.observatory_events_compacted > 0,
+        "periodic retention compacted no observatory events"
+    );
     assert_fault_stats("hypervisor", hypervisor_faults);
     assert_fault_stats("scorer", scorer_faults);
     assert_fault_stats("store", store_faults);
     assert_fault_stats("synth", synth_faults);
     assert_fault_stats("observatory", observatory_faults);
+    assert_charged_latency("hypervisor", hypervisor_latency);
+    assert_charged_latency("scorer", scorer_latency);
+    assert_charged_latency("store", store_latency);
+    assert_charged_latency("synth", synth_latency);
 
     println!(
-        "M5_SOAK_SUMMARY duration_seconds={} k={} seed={} fault_seed={} config_hash={} expansions={} nodes={} committed_refs={} pre_gc_orphans={} post_gc_live={} periodic_gc_runs={} periodic_gc_orphans={} periodic_gc_max_orphans={} watch_events_compacted={} observatory_events_compacted={} retention_busy_skips={} failed_reason=none",
+        "M5_SOAK_SUMMARY duration_seconds={} k={} seed={} fault_seed={} config_hash={} expansions={} nodes={} committed_refs={} pre_gc_orphans={} post_gc_live={} checkpoint_generation={} checkpoint_min_generation={} checkpoint_every_commits={} periodic_gc_runs={} periodic_gc_orphans={} periodic_gc_max_orphans={} watch_events_compacted={} observatory_events_compacted={} retention_busy_skips={} failed_reason=none",
         duration.as_secs(),
         k,
         seed,
@@ -329,12 +401,30 @@ async fn m5_fault_injected_fake_soak_smoke() {
         committed_refs.len(),
         pre_gc_orphans.len(),
         post_gc_live.len(),
+        checkpoint_generation,
+        checkpoint_min_generation,
+        checkpoint_every_commits,
         retention_stats.runs,
         retention_stats.total_orphans_removed,
         retention_stats.max_orphans_removed,
         retention_stats.watch_events_compacted,
         retention_stats.observatory_events_compacted,
         retention_stats.busy_skips,
+    );
+    println!(
+        "M5_SOAK_LATENCY_CHARGED hypervisor_calls={} hypervisor_charged_calls={} hypervisor_charged_ticks={} scorer_calls={} scorer_charged_calls={} scorer_charged_ticks={} store_calls={} store_charged_calls={} store_charged_ticks={} synth_calls={} synth_charged_calls={} synth_charged_ticks={}",
+        hypervisor_latency.calls_total,
+        hypervisor_latency.charged_calls_total,
+        hypervisor_latency.charged_ticks_total,
+        scorer_latency.calls_total,
+        scorer_latency.charged_calls_total,
+        scorer_latency.charged_ticks_total,
+        store_latency.calls_total,
+        store_latency.charged_calls_total,
+        store_latency.charged_ticks_total,
+        synth_latency.calls_total,
+        synth_latency.charged_calls_total,
+        synth_latency.charged_ticks_total,
     );
     println!(
         "M5_SOAK_FAULT_COUNTS hypervisor_decisions={} hypervisor_latency={} hypervisor_terminal={} scorer_decisions={} scorer_latency={} scorer_terminal={} store_decisions={} store_latency={} store_terminal={} synth_decisions={} synth_latency={} synth_terminal={} observatory_decisions={} observatory_latency={} observatory_terminal={}",

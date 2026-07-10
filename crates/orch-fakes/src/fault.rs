@@ -401,6 +401,11 @@ impl FaultPlan {
         self
     }
 
+    /// Injects one transient error on the second call of an operation stream.
+    ///
+    /// The stream key is `(target, operation)`, not request identity. This is
+    /// intentionally later than the first call so tests can let startup paths
+    /// create their initial service state before proving retry behavior.
     #[must_use]
     pub fn with_one_shot_error(
         mut self,
@@ -749,6 +754,26 @@ mod tests {
 
         assert_ne!(seed_a, seed_b);
         assert_ne!(seed_a, request_b);
+    }
+
+    #[test]
+    fn fault_one_shot_error_fires_on_second_target_operation_call() {
+        let injector = FaultInjector::new(
+            FaultPlan::disabled(0x5eed)
+                .with_one_shot_error("propose_bursts", ClientErrorKind::Unavailable),
+        );
+
+        let first = injector.decide(REQUEST_A, 16);
+        let second = injector.decide(REQUEST_B, 16);
+        let third = injector.decide(REQUEST_A, 16);
+
+        assert_eq!(first.terminal, FaultTerminal::None);
+        assert_eq!(
+            second.terminal,
+            FaultTerminal::Error(ClientErrorKind::Unavailable)
+        );
+        assert_eq!(third.terminal, FaultTerminal::None);
+        assert_eq!(injector.stats().terminal_faults_total, 1);
     }
 
     #[test]

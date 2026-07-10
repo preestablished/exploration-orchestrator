@@ -8,6 +8,11 @@ trap 'rm -f "$TMP"' EXIT
 
 mkdir -p "$(dirname "$OUT")"
 
+if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all -- . ':!evidence/phase5-m5-hardening')" ]]; then
+  echo "source tree has uncommitted non-evidence changes; commit before capturing evidence" >&2
+  exit 10
+fi
+
 {
   echo "# M5 CAS Ownership Evidence"
   echo

@@ -9,21 +9,37 @@ trap 'rm -f "$TMP" "$RSS_TMP"' EXIT
 
 mkdir -p "$EVIDENCE_DIR"
 
+if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=all -- . ':!evidence/phase5-m5-hardening')" ]]; then
+  echo "source tree has uncommitted non-evidence changes; commit before capturing evidence" >&2
+  exit 10
+fi
+
 M5_SOAK_DURATION_SECONDS="${M5_SOAK_DURATION_SECONDS:-300}"
 M5_SOAK_SEED="${M5_SOAK_SEED:-24069}"
 M5_SOAK_FAULT_SEED="${M5_SOAK_FAULT_SEED:-1024369}"
 M5_SOAK_K="${M5_SOAK_K:-64}"
-M5_SOAK_GC_EVERY_COMMITS="${M5_SOAK_GC_EVERY_COMMITS:-64}"
+M5_SOAK_GC_EVERY_COMMITS="${M5_SOAK_GC_EVERY_COMMITS:-4}"
 M5_SOAK_SCRAPE_INTERVAL_SECONDS="${M5_SOAK_SCRAPE_INTERVAL_SECONDS:-30}"
 M5_SOAK_RSS_TOLERANCE_PERCENT="${M5_SOAK_RSS_TOLERANCE_PERCENT:-50}"
 M5_SOAK_RSS_WARMUP_SAMPLES="${M5_SOAK_RSS_WARMUP_SAMPLES:-2}"
+M5_SOAK_MIN_RSS_EVALUATED_SAMPLES="${M5_SOAK_MIN_RSS_EVALUATED_SAMPLES:-4}"
 
 if [[ "$M5_SOAK_DURATION_SECONDS" -ge 86400 ]]; then
   SOAK_OUT="$EVIDENCE_DIR/soak-24h.txt"
   LANE="24h"
+  M5_SOAK_REQUIRE_RSS_EVIDENCE="${M5_SOAK_REQUIRE_RSS_EVIDENCE:-1}"
 else
   SOAK_OUT="$EVIDENCE_DIR/soak-smoke.txt"
   LANE="smoke"
+  M5_SOAK_REQUIRE_RSS_EVIDENCE="${M5_SOAK_REQUIRE_RSS_EVIDENCE:-0}"
+fi
+
+if [[ "$LANE" == "24h" ]]; then
+  MANIFEST_OUT="$EVIDENCE_DIR/run-manifest.md"
+  CENSUS_OUT="$EVIDENCE_DIR/failed-reason-census.txt"
+else
+  MANIFEST_OUT="$EVIDENCE_DIR/run-manifest-$LANE.md"
+  CENSUS_OUT="$EVIDENCE_DIR/failed-reason-census-$LANE.txt"
 fi
 
 rss_tree_kib() {
@@ -68,11 +84,13 @@ START_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "scrape_interval_seconds: $M5_SOAK_SCRAPE_INTERVAL_SECONDS"
   echo "rss_tolerance_percent: $M5_SOAK_RSS_TOLERANCE_PERCENT"
   echo "rss_warmup_samples: $M5_SOAK_RSS_WARMUP_SAMPLES"
-  echo "fault_plan: deterministic latency base=1 jitter=3 plus one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit"
+  echo "rss_required: $M5_SOAK_REQUIRE_RSS_EVIDENCE"
+  echo "rss_min_evaluated_samples: $M5_SOAK_MIN_RSS_EVALUATED_SAMPLES"
+  echo "fault_plan: deterministic latency base=1 jitter=3 charged by async adapters for hypervisor/scorer/store/synth; one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit"
   echo "tier2: not used in this lane"
   echo
   echo "## command"
-  echo "\$ M5_SOAK_DURATION_SECONDS=$M5_SOAK_DURATION_SECONDS M5_SOAK_SEED=$M5_SOAK_SEED M5_SOAK_FAULT_SEED=$M5_SOAK_FAULT_SEED M5_SOAK_K=$M5_SOAK_K M5_SOAK_GC_EVERY_COMMITS=$M5_SOAK_GC_EVERY_COMMITS cargo test -p orch-server --test m5_soak -- --nocapture"
+  echo "\$ M5_SOAK_DURATION_SECONDS=$M5_SOAK_DURATION_SECONDS M5_SOAK_SEED=$M5_SOAK_SEED M5_SOAK_FAULT_SEED=$M5_SOAK_FAULT_SEED M5_SOAK_K=$M5_SOAK_K M5_SOAK_GC_EVERY_COMMITS=$M5_SOAK_GC_EVERY_COMMITS M5_SOAK_REQUIRE_RSS_EVIDENCE=$M5_SOAK_REQUIRE_RSS_EVIDENCE M5_SOAK_MIN_RSS_EVALUATED_SAMPLES=$M5_SOAK_MIN_RSS_EVALUATED_SAMPLES cargo test -p orch-server --test m5_soak -- --nocapture"
 } >"$SOAK_OUT"
 
 M5_SOAK_DURATION_SECONDS="$M5_SOAK_DURATION_SECONDS" \
@@ -125,11 +143,20 @@ if [[ "$STATUS" -eq 0 ]]; then
     } >>"$SOAK_OUT"
     exit 5
   fi
+  if ! grep -q '^M5_SOAK_LATENCY_CHARGED ' "$TMP"; then
+    {
+      echo "end_utc: $END_UTC"
+      echo "elapsed_wall_seconds: $ELAPSED_SECONDS"
+      echo "missing M5_SOAK_LATENCY_CHARGED line"
+      tail -n 120 "$TMP"
+    } >>"$SOAK_OUT"
+    exit 6
+  fi
   {
     echo "end_utc: $END_UTC"
     echo "elapsed_wall_seconds: $ELAPSED_SECONDS"
   } >>"$SOAK_OUT"
-  grep -E '^(running [0-9]+ tests|M5_SOAK_SUMMARY|M5_SOAK_FAULT_COUNTS|test [A-Za-z0-9_]+ \.\.\. ok|test result:)' "$TMP" >>"$SOAK_OUT" || true
+  grep -E '^(running [0-9]+ tests|M5_SOAK_SUMMARY|M5_SOAK_LATENCY_CHARGED|M5_SOAK_FAULT_COUNTS|test [A-Za-z0-9_]+ \.\.\. ok|test result:)' "$TMP" >>"$SOAK_OUT" || true
   if [[ -s "$RSS_TMP" ]]; then
     awk -v warmup="$M5_SOAK_RSS_WARMUP_SAMPLES" '
       {
@@ -150,7 +177,8 @@ if [[ "$STATUS" -eq 0 ]]; then
         }
       }
     ' "$RSS_TMP" >>"$SOAK_OUT"
-    awk -v tol="$M5_SOAK_RSS_TOLERANCE_PERCENT" -v warmup="$M5_SOAK_RSS_WARMUP_SAMPLES" '
+    echo "RSS_EVIDENCE required=$M5_SOAK_REQUIRE_RSS_EVIDENCE min_evaluated_samples=$M5_SOAK_MIN_RSS_EVALUATED_SAMPLES" >>"$SOAK_OUT"
+    awk -v tol="$M5_SOAK_RSS_TOLERANCE_PERCENT" -v warmup="$M5_SOAK_RSS_WARMUP_SAMPLES" -v required="$M5_SOAK_REQUIRE_RSS_EVIDENCE" -v min_eval="$M5_SOAK_MIN_RSS_EVALUATED_SAMPLES" '
       {
         count += 1;
         if (count > warmup) {
@@ -160,7 +188,11 @@ if [[ "$STATUS" -eq 0 ]]; then
         }
       }
       END {
-        if (evaluated >= 4 && min > 0) {
+        if (required == 1 && evaluated < min_eval) {
+          printf "RSS evaluated samples %d below required minimum %d\n", evaluated, min_eval > "/dev/stderr";
+          exit 2;
+        }
+        if (required == 1 && evaluated >= min_eval && min > 0) {
           pct = ((max - min) * 100.0 / min);
           if (pct > tol) {
             printf "RSS delta %.2f%% exceeds tolerance %.2f%%\n", pct, tol > "/dev/stderr";
@@ -169,6 +201,9 @@ if [[ "$STATUS" -eq 0 ]]; then
         }
       }
     ' "$RSS_TMP"
+  elif [[ "$M5_SOAK_REQUIRE_RSS_EVIDENCE" -eq 1 ]]; then
+    echo "RSS evidence required but no RSS samples were captured" >&2
+    exit 2
   fi
   echo >>"$SOAK_OUT"
 else
@@ -197,15 +232,17 @@ CONFIG_HASH="$(grep -Eo 'config_hash=[0-9a-f]+' "$SOAK_OUT" | head -n1 | cut -d=
   echo "gc_every_commits: $M5_SOAK_GC_EVERY_COMMITS"
   echo "rss_tolerance_percent: $M5_SOAK_RSS_TOLERANCE_PERCENT"
   echo "rss_warmup_samples: $M5_SOAK_RSS_WARMUP_SAMPLES"
+  echo "rss_required: $M5_SOAK_REQUIRE_RSS_EVIDENCE"
+  echo "rss_min_evaluated_samples: $M5_SOAK_MIN_RSS_EVALUATED_SAMPLES"
   echo
   echo "| Lane | Duration seconds | K | Seed | Fault seed | GC every commits | Evidence |"
   echo "|---|---:|---:|---:|---:|---:|---|"
   echo "| $LANE | $M5_SOAK_DURATION_SECONDS | $M5_SOAK_K | $M5_SOAK_SEED | $M5_SOAK_FAULT_SEED | $M5_SOAK_GC_EVERY_COMMITS | $(basename "$SOAK_OUT") |"
   echo
-  echo "Fault settings: deterministic latency base=1 jitter=3 plus one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit."
+  echo "Fault settings: deterministic latency base=1 jitter=3 charged by async adapters for hypervisor/scorer/store/synth; one-shot Unavailable on hypervisor:run, scorer:score_batch, store:put_metadata, synth:propose_bursts, observatory:emit."
   echo "Fake snapshot retention: post-commit every $M5_SOAK_GC_EVERY_COMMITS commits; final retention asserts live refs equal committed refs."
   echo "Tier-2 persistence/kill hooks: not used in this lane."
-} >"$EVIDENCE_DIR/run-manifest.md"
+} >"$MANIFEST_OUT"
 
 {
   echo "# M5 FAILED Reason Census"
@@ -220,6 +257,6 @@ CONFIG_HASH="$(grep -Eo 'config_hash=[0-9a-f]+' "$SOAK_OUT" | head -n1 | cut -d=
   fi
   echo
   echo "Runbook: docs/runtime-terminal-reasons.md"
-} >"$EVIDENCE_DIR/failed-reason-census.txt"
+} >"$CENSUS_OUT"
 
 cat "$SOAK_OUT"

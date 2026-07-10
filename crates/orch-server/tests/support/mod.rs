@@ -3,7 +3,10 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use orch_clients::hypervisor::{BootSpec, Digest32, ElfBoot, HashEpochs, MachineConfig};
 use orch_core::{
@@ -14,10 +17,15 @@ use orch_core::{
     types::{ExperimentConfig, GuestInstructions, SchedMode},
 };
 use orch_fakes::{
-    fault::FaultPlan, grid::GridWorld, hypervisor::FakeHypervisor, observatory::FakeObservatory,
-    scorer::FakeScorer, snapshot_store::InMemorySnapshotStore, synth::FakeSynth,
+    fault::{FaultInjector, FaultPlan, FaultRequest, FaultTarget, FaultTerminal},
+    grid::GridWorld,
+    hypervisor::FakeHypervisor,
+    observatory::FakeObservatory,
+    scorer::FakeScorer,
+    snapshot_store::InMemorySnapshotStore,
+    synth::FakeSynth,
 };
-use orch_sched::ports::SyncAdapter;
+use orch_sched::ports::{LatencyProbe, PendingCall, SyncAdapter};
 use orch_server::{
     bringup::{ExperimentSources, WorkloadSpec},
     experiment::RunnerConfig,
@@ -173,6 +181,77 @@ pub struct FakeWorld {
     pub scorer: SyncAdapter<FakeScorer>,
     pub store: SyncAdapter<InMemorySnapshotStore>,
     pub synth: SyncAdapter<FakeSynth>,
+    pub latency: FakeWorldLatencyStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LatencyChargeStats {
+    pub calls_total: u64,
+    pub charged_calls_total: u64,
+    pub charged_ticks_total: u64,
+    pub timeout_charges_total: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SharedLatencyStats(Arc<Mutex<LatencyChargeStats>>);
+
+impl SharedLatencyStats {
+    fn record(&self, pending: PendingCall) {
+        let mut stats = self.0.lock().expect("latency stats lock");
+        stats.calls_total = stats.calls_total.saturating_add(1);
+        if pending.latency_ticks > 0 || pending.timeout {
+            stats.charged_calls_total = stats.charged_calls_total.saturating_add(1);
+        }
+        stats.charged_ticks_total = stats
+            .charged_ticks_total
+            .saturating_add(u64::from(pending.latency_ticks));
+        if pending.timeout {
+            stats.timeout_charges_total = stats.timeout_charges_total.saturating_add(1);
+        }
+    }
+
+    pub fn snapshot(&self) -> LatencyChargeStats {
+        *self.0.lock().expect("latency stats lock")
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FakeWorldLatencyStats {
+    pub hypervisor: SharedLatencyStats,
+    pub scorer: SharedLatencyStats,
+    pub store: SharedLatencyStats,
+    pub synth: SharedLatencyStats,
+}
+
+pub struct FakeLatencyProbe {
+    target: FaultTarget,
+    injector: FaultInjector,
+    stats: SharedLatencyStats,
+}
+
+impl FakeLatencyProbe {
+    pub fn new(target: FaultTarget, plan: FaultPlan, stats: SharedLatencyStats) -> Self {
+        Self {
+            target,
+            injector: FaultInjector::new(plan),
+            stats,
+        }
+    }
+}
+
+impl LatencyProbe for FakeLatencyProbe {
+    fn pending_call(&mut self, operation: &'static str, request_identity: &[u8]) -> PendingCall {
+        let decision = self.injector.decide(
+            FaultRequest::new(self.target, operation, request_identity),
+            0,
+        );
+        let pending = PendingCall {
+            latency_ticks: decision.latency_ticks,
+            timeout: matches!(decision.terminal, FaultTerminal::Timeout),
+        };
+        self.stats.record(pending);
+        pending
+    }
 }
 
 impl FakeWorld {
@@ -197,15 +276,37 @@ impl FakeWorld {
         store_plan: FaultPlan,
         synth_plan: FaultPlan,
     ) -> Self {
+        let latency = FakeWorldLatencyStats::default();
         Self {
             hypervisor: SyncAdapter::new(FakeHypervisor::with_world_slots_and_fault_plan(
                 world.clone(),
                 8,
+                hypervisor_plan.clone(),
+            ))
+            .with_probe(FakeLatencyProbe::new(
+                FaultTarget::Hypervisor,
                 hypervisor_plan,
+                latency.hypervisor.clone(),
             )),
-            scorer: SyncAdapter::new(FakeScorer::with_world_and_fault_plan(world, scorer_plan)),
-            store: SyncAdapter::new(InMemorySnapshotStore::with_fault_plan(store_plan)),
-            synth: SyncAdapter::new(FakeSynth::with_fault_plan(synth_plan)),
+            scorer: SyncAdapter::new(FakeScorer::with_world_and_fault_plan(
+                world,
+                scorer_plan.clone(),
+            ))
+            .with_probe(FakeLatencyProbe::new(
+                FaultTarget::Scorer,
+                scorer_plan,
+                latency.scorer.clone(),
+            )),
+            store: SyncAdapter::new(InMemorySnapshotStore::with_fault_plan(store_plan.clone()))
+                .with_probe(FakeLatencyProbe::new(
+                    FaultTarget::SnapshotStore,
+                    store_plan,
+                    latency.store.clone(),
+                )),
+            synth: SyncAdapter::new(FakeSynth::with_fault_plan(synth_plan.clone())).with_probe(
+                FakeLatencyProbe::new(FaultTarget::Synth, synth_plan, latency.synth.clone()),
+            ),
+            latency,
         }
     }
 
