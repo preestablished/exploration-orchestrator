@@ -130,3 +130,55 @@ The phase README correction from D5.8 was applied outside this repository at `/h
 - The repo/phase matrix now lists `exploration-orchestrator` as `(M1-M5)` under P3.
 
 That docs tree is not a git repository, so this repo commit records the external edit but cannot include it.
+
+## Second Review Pass (2026-07-16)
+
+Two further review subagents audited the closeout (bead
+`exploration-orchestrator-x6o`). The evidence audit found no blocking
+findings; the plan-vs-implementation audit found one unmet acceptance
+criterion and several documentation gaps. Fix commit:
+`2efeccd3551e441c31d0389801719fc878723e5b`.
+
+Applied:
+
+- **Uncataloged FAILED passthrough (plan W5.15):** the generic terminal arm
+  copied raw `error.message()` into `failure_reason`. Uncataloged messages
+  are now wrapped as `runtime-error: <message>` via
+  `orch_core::runtime_reasons::cataloged_failed_reason` (idempotent;
+  cataloged prefixes pass through unchanged). The prefix is in the code
+  catalog, `docs/runtime-terminal-reasons.md`, the doc drift test, and new
+  wrap unit tests.
+- **Soak census capture:** the soak harness now prints an
+  `M5_SOAK_TERMINAL ... failed_reason=` line before panicking on early exit
+  or a non-Stopped outcome, so `scripts/evidence-m5-soak.sh`'s FAILED-reason
+  census can record findings instead of losing them to the panic.
+- **Evidence host stamp:** the config/metrics/CAS evidence scripts now emit
+  the `host:` line required by the plan's evidence rules.
+- **`budgets.max_wall_clock_s = 0`:** the frozen accepted semantics (zero
+  disables the wall-clock budget, guarded by `> 0` at the budget check) are
+  now recorded in `docs/config-validation-rejections.md`.
+
+Recorded interpretations (no code change):
+
+- **CI gates:** M5 did not add the focused CI steps listed in
+  `06-verification.md`; all four test suites plus the 10 s soak smoke run
+  under the existing `cargo test --workspace --all-features` CI step. The
+  evidence scripts (duration/RSS/census assertion layer) remain manual
+  evidence lanes, matching the plan's "script or CI wrapper" option only in
+  the workspace-test interpretation.
+- **Soak entrypoint substitution:** both soak lanes drive the in-process
+  `m5_soak` test via `scripts/evidence-m5-soak.sh`, not
+  `orchestratord --experiment` over HTTP. Monotone `orch_expansions_total`
+  growth is evidenced indirectly (end-state expansions, checkpoint
+  `batch_seq` cross-check, generation lower bound), and RSS sampling reads
+  the test process, not `/metrics`.
+- **24 h lane caveats:** the two-cell fake world (`af8b2dd`) bounds the
+  24 h tree to `nodes=2`, so committed-ref invariants are correspondingly
+  narrow even though orphan GC churned 467k snapshots. Charged-call vs
+  decision counters may skew slightly (e.g. off-by-one on one-shot terminal
+  decisions); the evidence claims only nonzero charged calls/ticks.
+
+Config, metrics, CAS, and soak-smoke evidence were regenerated from
+`2efeccd` (rustc 1.97.1). The 24 h closeout files (`soak-24h.txt`,
+`run-manifest.md`, `failed-reason-census.txt`) are unchanged and still
+stamp the `af8b2dd` lane.

@@ -1,8 +1,9 @@
 # M5 Metrics Evidence
 
-captured_at_utc: 2026-07-10T02:48:54Z
-commit: d38fce153bb9718e193956b68755547b57aeb7a3
-rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
+captured_at_utc: 2026-07-16T16:15:12Z
+commit: 2efeccd3551e441c31d0389801719fc878723e5b
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+host: infra-control
 
 ## Before metric families
 
@@ -31,13 +32,13 @@ rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
 ## orch-server metrics surface
 $ cargo test -p orch-server --test metrics_surface -- --nocapture
 running 3 tests
-test live_status_values_are_exported ... ok
 test metrics_catalog_is_complete ... ok
+test live_status_values_are_exported ... ok
 test observatory_drops_are_exported ... ok
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
 ## orchestratord HTTP metrics endpoint
 $ cargo test -p orchestratord --test http_metrics -- --nocapture
 test simulate_metrics_endpoint_serves_catalog_and_live_counters ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
 

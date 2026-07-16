@@ -1,12 +1,12 @@
 # M5 Run Manifest
 
-updated_at_utc: 2026-07-10T02:49:29Z
-commit: d38fce153bb9718e193956b68755547b57aeb7a3
+updated_at_utc: 2026-07-16T16:20:50Z
+commit: 2efeccd3551e441c31d0389801719fc878723e5b
 host: infra-control
-rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
-start_utc: 2026-07-10T02:49:17Z
-end_utc: 2026-07-10T02:49:29Z
-elapsed_wall_seconds: 12
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+start_utc: 2026-07-16T16:20:17Z
+end_utc: 2026-07-16T16:20:49Z
+elapsed_wall_seconds: 32
 config_hash: 92e96be9d3244b110e530e38a113c4132bcfb38fcfdaf4b4f60f128835eea584
 gc_every_commits: 4
 rss_tolerance_percent: 50

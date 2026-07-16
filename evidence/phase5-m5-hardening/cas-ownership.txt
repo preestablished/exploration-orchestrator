@@ -1,18 +1,23 @@
 # M5 CAS Ownership Evidence
 
-captured_at_utc: 2026-07-10T02:49:12Z
-commit: d38fce153bb9718e193956b68755547b57aeb7a3
-rustc: rustc 1.96.1 (31fca3adb 2026-06-26)
+captured_at_utc: 2026-07-16T16:20:10Z
+commit: 2efeccd3551e441c31d0389801719fc878723e5b
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+host: infra-control
 
 ## orch-server CAS ownership loss windows
 $ cargo test -p orch-server --test cas_ownership_loss -- --nocapture
 running 2 tests
 test node_commit_window_loser_fails_before_tree_writes ... ok
 test checkpoint_cas_window_loser_fails_without_overwriting_winner ... ok
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.28s
 
 ## runtime terminal reason runbook drift
 $ cargo test -p orch-core --test runtime_reasons -- --nocapture
+running 4 tests
+test cataloged_prefixes_pass_through_unchanged ... ok
+test cataloged_failed_reason_is_idempotent ... ok
 test runtime_failed_reason_doc_matches_code_catalog ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test uncataloged_messages_wrap_under_runtime_error ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
