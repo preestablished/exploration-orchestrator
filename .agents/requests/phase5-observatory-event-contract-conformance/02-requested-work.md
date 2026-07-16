@@ -41,9 +41,11 @@ change DTO semantics unilaterally" — the adapter can supply these):
 
 The canonical proto now exists in full in
 `control-plane/proto/determinism/observatory/v1/events.proto` — pin:
-see `04-resolution.md` placeholder below; observatory records the merge
-SHA + blake3 in `observatory/docs/event-contract-reconciliation-v1.md`
-(proto-pin section) once landed. The generated client is
+control-plane merge commit `853a0b200df3b7cd4770393f408997414536bf7f`
+(PR #4), file blake3
+`144f8cc6f413a88d6c39a3d77415a0eb6597939381503ec4a99881edf8e4ccc2`; also
+recorded in `observatory/docs/event-contract-reconciliation-v1.md`
+(proto-pin section). The generated client is
 `determinism_proto::observatory::v1::event_ingest_client::EventIngestClient`
 behind the `observatory` feature.
 
