@@ -77,9 +77,10 @@ use crate::{
 
 // ── fixed grep-able terminal reasons ────────────────────────────────────────
 
+use orch_core::runtime_reasons::cataloged_failed_reason;
 pub use orch_core::runtime_reasons::{
     REASON_ARCHIVE_SEQ_MISMATCH, REASON_CAS_OWNERSHIP_LOST, REASON_FINGERPRINT_MISMATCH,
-    REASON_FRONTIER_EXHAUSTED,
+    REASON_FRONTIER_EXHAUSTED, REASON_RUNTIME_ERROR,
 };
 
 /// In-process crash lattice (plan D5 Tier 1): every point in the loop where
@@ -1074,7 +1075,7 @@ where
             }
             Err(error) => {
                 self.status = ExperimentState::Failed;
-                self.failure_reason = Some(error.message().to_owned());
+                self.failure_reason = Some(cataloged_failed_reason(error.message()));
             }
         }
 
@@ -1087,7 +1088,7 @@ where
             if let Err(error) = self.checkpoint().await {
                 if self.failure_reason.is_none() {
                     self.status = ExperimentState::Failed;
-                    self.failure_reason = Some(error.message().to_owned());
+                    self.failure_reason = Some(cataloged_failed_reason(error.message()));
                 }
             }
         }

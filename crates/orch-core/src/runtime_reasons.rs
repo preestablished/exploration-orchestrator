@@ -21,6 +21,7 @@ pub const REASON_FINGERPRINT_MISMATCH: &str = "synth-fingerprint-mismatch";
 pub const REASON_FRONTIER_EXHAUSTED: &str = "frontier-exhausted";
 pub const REASON_JOB_RETRIES_EXHAUSTED: &str = "job-retries-exhausted";
 pub const REASON_CLASS_MISMATCH: &str = "determinism-class-mismatch";
+pub const REASON_RUNTIME_ERROR: &str = "runtime-error";
 
 pub const CATALOG: &[RuntimeReason] = &[
     RuntimeReason {
@@ -44,6 +45,10 @@ pub const CATALOG: &[RuntimeReason] = &[
         status: TerminalStatus::Failed,
     },
     RuntimeReason {
+        prefix: REASON_RUNTIME_ERROR,
+        status: TerminalStatus::Failed,
+    },
+    RuntimeReason {
         prefix: REASON_FRONTIER_EXHAUSTED,
         status: TerminalStatus::BudgetExhausted,
     },
@@ -55,4 +60,21 @@ pub const FAILED_REASON_PREFIXES: &[&str] = &[
     REASON_FINGERPRINT_MISMATCH,
     REASON_JOB_RETRIES_EXHAUSTED,
     REASON_CLASS_MISMATCH,
+    REASON_RUNTIME_ERROR,
 ];
+
+/// Classify an arbitrary terminal runtime error message under the catalog.
+///
+/// Messages that already carry a cataloged FAILED prefix pass through
+/// unchanged; anything else is wrapped as `runtime-error: <message>` so no
+/// terminal FAILED string can land outside the runbook catalog.
+pub fn cataloged_failed_reason(message: &str) -> String {
+    if FAILED_REASON_PREFIXES
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+    {
+        message.to_owned()
+    } else {
+        format!("{REASON_RUNTIME_ERROR}: {message}")
+    }
+}

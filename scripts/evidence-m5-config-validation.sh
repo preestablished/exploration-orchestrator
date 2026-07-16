@@ -19,6 +19,7 @@ fi
   echo "captured_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "commit: $(git -C "$ROOT" rev-parse HEAD)"
   echo "rustc: $(rustc --version)"
+  echo "host: $(hostname)"
   echo
 } >"$OUT"
 

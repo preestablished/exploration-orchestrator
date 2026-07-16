@@ -10,6 +10,7 @@ They are not config validation rejection strings.
 - `synth-fingerprint-mismatch`
 - `job-retries-exhausted`
 - `determinism-class-mismatch`
+- `runtime-error`
 
 ## Catalog
 
@@ -20,4 +21,5 @@ They are not config validation rejection strings.
 | `synth-fingerprint-mismatch` | `FAILED` | Synth config fingerprint diverged from the checkpointed bring-up fingerprint. | Stop and compare synth config and macro-pack inputs. | Fingerprint guard tests. |
 | `job-retries-exhausted` | `FAILED` | Deterministic job retry budget exhausted. | Inspect worker and fault logs; rerun after fixing deterministic worker faults. | Scheduler retry tests. |
 | `determinism-class-mismatch` | `FAILED` | Worker class is incompatible and mismatch is disallowed. | Route to a matching worker or explicitly allow mismatch only when safe. | SlotView and driver class-mismatch tests. |
+| `runtime-error` | `FAILED` | Documented passthrough class: a terminal client error whose message matches no dedicated prefix is wrapped as `runtime-error: <message>`. | Inspect the wrapped message; recurring shapes are candidates for a dedicated cataloged prefix. | orch-core `runtime_reasons` wrap tests. |
 | `frontier-exhausted` | `BUDGET_EXHAUSTED` | No frontier nodes remain. | Check config, pruning, and scoring; this may be legitimate terminal exhaustion. | Existing frontier exhaustion path. |

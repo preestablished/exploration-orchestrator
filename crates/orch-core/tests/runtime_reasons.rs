@@ -34,3 +34,25 @@ fn runtime_failed_reason_doc_matches_code_catalog() {
 
     assert_eq!(entries, runtime_reasons::FAILED_REASON_PREFIXES);
 }
+
+#[test]
+fn cataloged_prefixes_pass_through_unchanged() {
+    for prefix in runtime_reasons::FAILED_REASON_PREFIXES {
+        let message = format!("{prefix}: detail");
+        assert_eq!(runtime_reasons::cataloged_failed_reason(&message), message);
+    }
+}
+
+#[test]
+fn uncataloged_messages_wrap_under_runtime_error() {
+    assert_eq!(
+        runtime_reasons::cataloged_failed_reason("scorer stream reset by fake"),
+        "runtime-error: scorer stream reset by fake"
+    );
+}
+
+#[test]
+fn cataloged_failed_reason_is_idempotent() {
+    let wrapped = runtime_reasons::cataloged_failed_reason("boom");
+    assert_eq!(runtime_reasons::cataloged_failed_reason(&wrapped), wrapped);
+}

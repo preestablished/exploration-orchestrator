@@ -25,7 +25,7 @@ use orch_fakes::{
     snapshot_store::InMemorySnapshotStore,
 };
 use orch_sched::ports::{LatencyProbe, SyncAdapter};
-use orch_server::experiment::{Control, CrashPoint, CrashPolicy, ExperimentRunner};
+use orch_server::experiment::{Control, CrashPoint, CrashPolicy, ExperimentRunner, RunOutcome};
 use support::{
     grid_config, sources, FakeLatencyProbe, FakeWorld, LatencyChargeStats, SharedLatencyStats,
     SharedSink, EXPERIMENT_ID,
@@ -99,6 +99,18 @@ fn assert_charged_latency(target: &str, stats: LatencyChargeStats) {
     assert!(
         stats.charged_ticks_total > 0,
         "{target} adapter latency charged zero ticks: {stats:?}"
+    );
+}
+
+/// Emit a census-visible `failed_reason=` line before the harness panics, so
+/// the evidence script's FAILED-reason census can capture non-Stopped
+/// outcomes instead of losing them to the panic.
+fn print_terminal_census(outcome: &RunOutcome) {
+    let reason = outcome.failure_reason.as_deref().unwrap_or("none");
+    println!(
+        "M5_SOAK_TERMINAL state={:?} failed_reason={}",
+        outcome.state,
+        reason.replace(char::is_whitespace, "_")
     );
 }
 
@@ -307,11 +319,18 @@ async fn m5_fault_injected_fake_soak_smoke() {
             let outcome = early
                 .expect("runner task joins")
                 .expect("runner returns outcome");
+            print_terminal_census(&outcome);
             panic!("soak runner ended before requested duration: {outcome:?}");
         }
     };
 
-    assert_eq!(outcome.state, ExperimentState::Stopped);
+    if outcome.state != ExperimentState::Stopped {
+        print_terminal_census(&outcome);
+        panic!(
+            "soak ended {:?} instead of Stopped: {:?}",
+            outcome.state, outcome.failure_reason
+        );
+    }
     assert!(outcome.expansions > 0, "soak made no progress");
     assert!(outcome.nodes > 1, "soak committed no children");
 

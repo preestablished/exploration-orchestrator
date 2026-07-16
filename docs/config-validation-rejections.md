@@ -12,3 +12,10 @@ standalone config errors. They are not runtime terminal failure reasons.
 - `invalid config version <version>`
 - `staged inner policy cannot be staged`
 - `decoded feature not in feature_map <name>`
+
+## Accepted zero-value shapes
+
+`budgets.max_wall_clock_s = 0` is accepted, not rejected: zero disables the
+wall-clock budget. This behavior is frozen by the core matrix
+(`config_matrix.rs` non-rejectable shapes) and the wire surface test
+(`config_validation_surface.rs`).
